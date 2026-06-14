@@ -1,0 +1,45 @@
+[
+  {
+    "id": "100001",
+    "conditionId": "0xaaa000000000000000000000000000000000000000000000000000000000aa01",
+    "slug": "presidential-election-winner-2024",
+    "question": "Who will win the 2024 US Presidential Election?",
+    "volume": "125000000",
+    "closed": true,
+    "endDate": "2024-11-05T23:59:59Z",
+    "tags": [{"id": 1, "label": "Politics", "slug": "politics"}, {"id": 2, "label": "Elections"}],
+    "clobTokenIds": "[\"1111111111111111111111\", \"2222222222222222222222\"]"
+  },
+  {
+    "id": "100002",
+    "conditionId": "0xbbb000000000000000000000000000000000000000000000000000000000bb02",
+    "slug": "senate-control-2024",
+    "question": "Which party will control the Senate after the 2024 election?",
+    "volume": "8500000",
+    "closed": true,
+    "endDate": "2024-11-05T23:59:59Z",
+    "tags": ["Politics"],
+    "clobTokenIds": "[\"3333333333333333333333\", \"4444444444444444444444\"]"
+  },
+  {
+    "id": "100003",
+    "conditionId": "0xccc000000000000000000000000000000000000000000000000000000000cc03",
+    "slug": "low-volume-side-market",
+    "question": "An obscure market we want filtered out.",
+    "volume": "1234",
+    "closed": true,
+    "endDate": "2024-11-05T23:59:59Z",
+    "tags": ["Politics"],
+    "clobTokenIds": "[\"5555\", \"6666\"]"
+  },
+  {
+    "id": "100004",
+    "conditionId": "",
+    "slug": "no-condition-id-market",
+    "question": "A market with no conditionId yet, should be skipped.",
+    "volume": "999999",
+    "closed": true,
+    "endDate": null,
+    "tags": ["Politics"]
+  }
+]
