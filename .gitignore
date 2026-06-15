@@ -1,4 +1,7 @@
 .venv/
-data/
+/data/
 results/
 .pytest_cache/
+__pycache__/
+*.py[cod]
+.claude/
