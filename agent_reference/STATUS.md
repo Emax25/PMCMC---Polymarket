@@ -49,7 +49,7 @@ Newest first. One line per meaningful change.
 | Date | Change |
 |------|--------|
 | 2026-06-14 | `agent_reference/` trimmed to ARCHITECTURE.md + STATUS.md only. |
-| 2026-06-14 | Post-submission pivot: speed P0, trading path, half-prod canonical. `notebooks/` deprecated (delete when ready). Split living status into this file. |
+| 2026-06-14 | Post-submission pivot: speed P0, trading path, half-prod canonical. Split living status into this file. |
 | 2026-06-14 | Created `ARCHITECTURE.md` as agent-canonical doc. |
 
 ---
@@ -63,4 +63,4 @@ Newest first. One line per meaningful change.
 | Data source | Polymarket Data API only (no Goldsky) |
 | CSMC reference index | 0 (code authoritative) |
 | Doc hierarchy | `ARCHITECTURE.md` + this file for agents |
-| Notebooks | **Removed / removing** — use `scripts/` CLIs only |
+| Entrypoints | `scripts/` CLIs only |

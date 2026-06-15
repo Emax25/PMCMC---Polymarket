@@ -35,7 +35,7 @@
 - **ARCHITECTURE.md** = stable reference (edit when structure changes).
 - Append to STATUS changelog; don't rewrite history.
 - Use status tokens: `PLANNED` | `WIP` | `DONE`.
-- After deleting `notebooks/`, do not re-add notebook workflows — **`scripts/` is the only entrypoint.**
+- **`scripts/` is the only entrypoint** — do not add alternative workflows.
 
 ### Section index
 
@@ -66,7 +66,7 @@
 3. **Optimize speed** — **highest immediate priority** (see [STATUS.md](STATUS.md))
 4. **Future: trading algorithm** — real-time insider scoring on live Polymarket trades
 
-**Workflow:** All execution goes through **`scripts/`** CLIs (`pull_data`, `run_pg`, `run_ipmcmc`, `make_figures`). The `notebooks/` directory is **deprecated and slated for deletion** — do not depend on it or recreate it.
+**Workflow:** All execution goes through **`scripts/`** CLIs (`pull_data`, `run_pg`, `run_ipmcmc`, `make_figures`). This is the only supported entrypoint.
 
 ---
 
@@ -109,7 +109,7 @@ python -m scripts.run_ipmcmc --config prod \
 | 8 | γ / s₀² sweeps | In scope (P5), not cut |
 | 9 | Goldsky / CLOB | Not used; Data API only |
 | 10 | Course scope cuts | No longer apply |
-| 11 | Notebooks | **Removed** — scripts only |
+| 11 | Alternative entrypoints | None — `scripts/` CLIs only |
 
 Model is a **baseline spec** (§5), not immutable — changes OK if synthetic tests pass.
 
@@ -266,10 +266,8 @@ src/analysis/{results,plots}.py
 scripts/{_shortlist,_runner,pull_data,run_pg,run_ipmcmc,make_figures}.py
 tests/
 Monte_Carlo_Simulation/       # LaTeX paper
-agent_reference/              # This doc + STATUS.md
+agent_reference/              # ARCHITECTURE.md + STATUS.md + CODE_QUALITY.md
 ```
-
-**Removed / not present:** `notebooks/` (delete), `src/model/` (never built).
 
 ### Key interfaces
 
@@ -353,7 +351,7 @@ python -m pytest tests/ -q
 | 7 | N | 50 / 250 / 500 |
 | 8 | Multi-market | K independent SMC; pooled Gibbs |
 | 9 | Data | Data API only |
-| 10 | Entrypoints | scripts/ only (no notebooks) |
+| 10 | Entrypoints | `scripts/` CLIs only |
 
 ---
 
@@ -379,7 +377,7 @@ Correct **iff** synthetic injection passes:
 | RNG | `default_rng(seed)`; pass `rng` explicitly |
 | Weights | Log-space + `logsumexp` |
 | Vectorization | Particle dim = NumPy, not Python loops |
-| Logic location | `src/` only — not notebooks |
+| Logic location | `src/` only (`scripts/` is a thin CLI layer) |
 | Persistence | Pickle chains; Parquet data |
 | Style / docstrings | PEP 8 + Google docstrings — see [CODE_QUALITY.md](CODE_QUALITY.md) |
 
@@ -423,7 +421,7 @@ Correct **iff** synthetic injection passes:
 2. P0 speed is default when user says "optimize" without specifics.
 3. Update STATUS.md when completing roadmap items.
 4. Update this file when architecture/modules/model change.
-5. Do not recreate `notebooks/` or wire Goldsky without explicit request.
+5. Do not wire Goldsky / CLOB without explicit request — Data API only.
 6. Model changes need synthetic validation.
 
 | Task | Start here |

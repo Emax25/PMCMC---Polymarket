@@ -1,18 +1,20 @@
 # Polymarket PMCMC
 
-Independent project for STAT 31511 (Monte Carlo Simulation) at UChicago, built around Chapter 9 (particle filters) from the Sanz-Alonso and Al-Ghattas lecture notes. The deliverables are a ~10-page paper in the course LaTeX template and a companion notebook (`notebooks/final_writeup.ipynb`) that runs the method on real Polymarket data.
+This project asks one fairly narrow question of Polymarket politics markets: do any individual trades look like they were placed with information the rest of the market didn't have yet?
 
-The statistical hook: use Particle Markov Chain Monte Carlo (PMCMC), including Particle Gibbs and Interacting Particle MCMC (iPMCMC), to fit a switching state-space model and flag trades that look inconsistent with public-information price dynamics.
+To get at that, it fits a switching state-space model to each market's trade history using Particle Markov Chain Monte Carlo (PMCMC) — Particle Gibbs and Interacting Particle MCMC (iPMCMC) — and scores each trade for how inconsistent it looks with ordinary, public-information price dynamics.
+
+The accompanying paper lives in `Monte_Carlo_Simulation/`. Everything runs from the command line via `scripts/`.
 
 ---
 
 ## The problem
 
-Polymarket politics markets settle on Polygon, so every trade comes with a timestamp, price, size, and pseudonymous wallet address. The question is whether any of those trades look like they were placed with private information.
+Polymarket politics markets settle on Polygon, so every trade comes with a timestamp, price, size, and pseudonymous wallet address. Given only that, can we pick out trades that look like someone knew something?
 
-Politics is a better testbed than sports here. Sports has parallel markets (Vegas) that tend to arbitrage information away; politics often has genuinely private information (campaign internals, scheduled announcements) that can be traded on before it is public.
+Politics turns out to be a better testbed than sports. Sports has parallel markets (Vegas lines) that arbitrage information away quickly. Politics often has genuinely private information — campaign internals, announcements scheduled but not yet public — that someone can trade on before everyone else catches up.
 
-We never observe the "true" probability of an event. We only see noisy prices and trades as information arrives over time. That is the usual hidden Markov / state-space setup.
+The catch is that we never see the "true" probability of an event. We only see noisy prices and a stream of trades as information arrives. That's the classic hidden-Markov / state-space situation, which is what makes the particle-filtering machinery a natural fit.
 
 ---
 
@@ -32,24 +34,24 @@ Across markets, each wallet $w$ gets a baseline insider propensity $\theta_w \si
 
 The generative story in plain terms:
 
-1. $V$ follows a two-state Markov chain (calm periods vs news spikes).
+1. $V$ follows a two-state Markov chain — calm stretches versus news spikes.
 2. $X$ is a Gaussian random walk whose variance switches with $V$.
-3. $Z$ depends on the wallet ($\theta_w$), trade size, and whether the previous trade was flagged.
-4. Observations $Y_i$ are Gaussian around $X_{t_i}$, with tighter noise when $Z_i = 1$ (informed trade) and when size is large.
+3. $Z$ depends on the wallet ($\theta_w$), the trade size, and whether the previous trade was already flagged.
+4. Observations $Y_i$ are Gaussian around $X_{t_i}$, with tighter noise when the trade is informed ($Z_i = 1$) and when the size is large.
 
-After inference we care about $\mathbb{P}(Z_i = 1 \mid \mathcal{D})$ per trade, wallet rankings via $\mathbb{E}[\theta_w \mid \mathcal{D}]$, and whether flagged windows line up with news regimes rather than ordinary volatility.
+What we actually want out of inference is $\mathbb{P}(Z_i = 1 \mid \mathcal{D})$ per trade, wallet rankings via $\mathbb{E}[\theta_w \mid \mathcal{D}]$, and a sanity check that flagged windows line up with genuine news regimes rather than ordinary volatility.
 
-Full notation and equations are in the paper (`Monte_Carlo_Simulation/`) and in [agent_reference/ARCHITECTURE.md](agent_reference/ARCHITECTURE.md).
+The full notation and equations are in the paper (`Monte_Carlo_Simulation/`) and in [agent_reference/ARCHITECTURE.md](agent_reference/ARCHITECTURE.md).
 
 ---
 
 ## Inference
 
-Plain Gibbs sampling would work (the conditionals are mostly conjugate), but that would be a Chapter 5 project, not Chapter 9.
+Most of the conditionals here are conjugate, so plain Gibbs would sample the parameters perfectly well. The hard part is the joint latent trajectory $(X, V, Z)$ — and that's exactly where the particle methods earn their keep.
 
-Instead we use Particle Gibbs: a Conditional SMC step samples the joint $(X, V, Z)$ trajectory. Because $X$ is linear-Gaussian given the discrete states, we Rao-Blackwellize it with a Kalman filter inside each particle. Only $(V, Z)$ are stored per particle.
+We use Particle Gibbs: a Conditional SMC step samples the whole $(X, V, Z)$ trajectory at once. Because $X$ is linear-Gaussian given the discrete states, we Rao-Blackwellize it with a Kalman filter inside each particle, so only $(V, Z)$ have to be carried around per particle.
 
-iPMCMC (Rainforth et al., 2016) runs several SMC chains in parallel and swaps reference trajectories to fight path degeneracy, the usual PG failure mode where all particles collapse onto one path. The implementation parallelizes across chains with `joblib`.
+iPMCMC (Rainforth et al., 2016) runs several SMC chains side by side and swaps reference trajectories between them. This fights path degeneracy — the usual Particle Gibbs failure mode where every particle collapses onto a single trajectory. The chains run in parallel via `joblib`.
 
 Core modules:
 
@@ -57,10 +59,10 @@ Core modules:
 |--------|------|
 | `src/inference/kalman.py` | Kalman filter for $X \mid V, Z$ |
 | `src/inference/smc.py` | Bootstrap SMC (sanity check) |
-| `src/inference/csmc.py` | Conditional SMC (PG engine) |
+| `src/inference/csmc.py` | Conditional SMC (the Particle Gibbs engine) |
 | `src/inference/particle_gibbs.py` | Vanilla PG sampler |
-| `src/inference/ipmcmc.py` | iPMCMC with swap step |
-| `src/inference/parameter_updates.py` | Gibbs / MH for hyperparameters |
+| `src/inference/ipmcmc.py` | iPMCMC with the swap step |
+| `src/inference/parameter_updates.py` | Gibbs / MH for the hyperparameters |
 
 Key references: Andrieu, Doucet & Holenstein (2010) for PG; Rainforth et al. (2016) for iPMCMC; Doucet, de Freitas & Gordon (2001) for SMC.
 
@@ -70,19 +72,19 @@ Key references: Andrieu, Doucet & Holenstein (2010) for PG; Rainforth et al. (20
 
 ```
 polymarket_pmcmc/
-├── config/default_params.py      # ModelParams, InferenceConfig
+├── config/default_params.py   # ModelParams, InferenceConfig, presets
 ├── src/
-│   ├── data/                     # API clients, preprocessing, synthetic data
-│   ├── inference/                # SMC, CSMC, PG, iPMCMC, Kalman, diagnostics
-│   ├── analysis/                 # Posterior summaries and plots
-│   └── utils/                    # logit, log-weight helpers
-├── scripts/                      # CLI: pull_data, run_pg, run_ipmcmc, make_figures
-├── notebooks/final_writeup.ipynb # Submission notebook (thin layer over src/)
-├── tests/                        # pytest suite (~190 tests)
-└── results/                      # chains, figures, tables
+│   ├── data/                  # API clients, preprocessing, synthetic data
+│   ├── inference/             # SMC, CSMC, PG, iPMCMC, Kalman, diagnostics
+│   ├── analysis/              # posterior summaries and plots
+│   └── utils/                 # logit, log-weight helpers
+├── scripts/                   # CLI: pull_data, run_pg, run_ipmcmc, make_figures
+├── tests/                     # pytest suite (~190 tests)
+├── Monte_Carlo_Simulation/    # the LaTeX paper
+└── agent_reference/           # architecture, status, and coding-style docs
 ```
 
-The notebook is presentation only. Inference lives in `src/`.
+Data and results directories (`data/processed/`, `results/chains/`, `results/figures/`) are created on the first run. All inference logic lives in `src/`; `scripts/` is just a thin command-line layer over it.
 
 ---
 
@@ -103,43 +105,43 @@ python -m scripts.run_ipmcmc --config prod
 # Regenerate figures from a saved chain
 python -m scripts.make_figures --chain results/chains/pg_dev.pkl
 
-pytest   # run tests
+pytest   # run the test suite
 ```
 
-Development preset uses $N = 50$ particles and 200 iterations (~minutes). Production preset uses $N = 500$, 3000 iterations, and can take many hours on a laptop. A practical overnight target is half-prod: `--n-iter 1500 --n-burnin 300 --n-particles 250`.
+The `dev` preset uses $N = 50$ particles and 200 iterations and finishes in minutes — good for checking that something runs. The `prod` preset uses $N = 500$ and 3000 iterations and can take many hours on a laptop. In practice the sweet spot is "half-prod": `--n-iter 1500 --n-burnin 300 --n-particles 250`, which is the default target for the paper's chains.
 
 ---
 
 ## Data notes
 
-Trade history comes from the Polymarket Data API (`data-api.polymarket.com`), paginated newest-first with a hard cap at `offset=3000`. That cap is actually useful: we mostly want the last few thousand trades near resolution, where insider behavior is most plausible.
+Trade history comes from the Polymarket Data API (`data-api.polymarket.com`), paginated newest-first with a hard cap at `offset=3000`. That cap is actually convenient — we mostly care about the last few thousand trades near resolution, which is where insider behavior is most plausible.
 
-Market metadata uses the Gamma API. A few quirks matter in practice (`tag_slug` is ignored; use keyword filtering on the question text; `order=volume` should be `order=volumeNum`). Details are in [agent_reference/ARCHITECTURE.md](agent_reference/ARCHITECTURE.md).
+Market metadata comes from the Gamma API, which has a few quirks worth knowing: `tag_slug` is silently ignored (so we keyword-filter on the question text instead), and `order=volume` needs to be `order=volumeNum`. The full list is in [agent_reference/ARCHITECTURE.md](agent_reference/ARCHITECTURE.md).
 
-The §5 shortlist is ten politics slugs pinned in `scripts/_shortlist.py`, chosen for cross-market wallet overlap so the hierarchical $\theta_w$ prior has something to learn from.
+The shortlist is ten politics slugs pinned in `scripts/_shortlist.py`, picked for cross-market wallet overlap so the hierarchical $\theta_w$ prior actually has something to learn from.
 
 ---
 
 ## Validation
 
 1. Unit tests on each module (`tests/`).
-2. Synthetic injection: generate markets with known insider trades and wallets; target ROC AUC > 0.85 on $\mathbb{P}(Z_i = 1 \mid \mathcal{D})$.
-3. Real data: check whether flagged trades line up with known news (qualitative).
+2. Synthetic injection: generate markets with known insider trades and wallets, then check we recover them — target ROC AUC > 0.85 on $\mathbb{P}(Z_i = 1 \mid \mathcal{D})$.
+3. Real data: a qualitative check that flagged trades line up with known news.
 
-If a change passes unit tests but fails the synthetic injection test, it is wrong.
+The synthetic injection test is the one that matters most: if a change passes the unit tests but fails it, the change is wrong.
 
 ---
 
 ## Status
 
-All implementation phases (setup through notebook) are complete. Active work is documented in [agent_reference/STATUS.md](agent_reference/STATUS.md): speed (`numba`, `joblib`), pre-resolution filtering, half-prod inference runs for the paper, and a few numerical fixes discovered on real data.
+The core implementation is complete and the method runs end to end on real data. Current work, tracked in [agent_reference/STATUS.md](agent_reference/STATUS.md), is mostly about speed (`numba`, `joblib`), filtering out the post-resolution window that tends to over-flag, running longer half-prod chains for the paper, and a few numerical fixes that only surfaced on live data.
 
-For design decisions, API quirks, compute budgets, and coding conventions, see [agent_reference/ARCHITECTURE.md](agent_reference/ARCHITECTURE.md).
+For design decisions, API quirks, compute budgets, and coding conventions, see [agent_reference/ARCHITECTURE.md](agent_reference/ARCHITECTURE.md) and [agent_reference/CODE_QUALITY.md](agent_reference/CODE_QUALITY.md).
 
 ---
 
 ## Scope
 
-This is a 10-page course project, not production software. The model already sits at the upper edge of what fits in that space. Deliberately out of scope: ancestor sampling, news covariates, multi-regime insiders, and putting inference code in the notebook.
+The model is deliberately about as elaborate as it needs to be and no more — the goal is something you can actually fit and reason about, not the most complicated thing possible. A few extensions were left out on purpose: ancestor sampling in the CSMC, explicit news covariates, and more than two insider regimes.
 
-If time runs short, cut in this order: iPMCMC (PG only), wallet hierarchy, then multi-market joint inference.
+A real-time trading signal built on the same inference kernels is a plausible future direction (it's on the roadmap in [agent_reference/STATUS.md](agent_reference/STATUS.md)), but it's outside the current scope.
