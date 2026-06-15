@@ -1,7 +1,9 @@
-.venv/
+/.venv/
 /data/
-results/
-.pytest_cache/
+/results/
+/.pytest_cache/
 __pycache__/
 *.py[cod]
 .claude/
+/pyproject.toml
+.cursor/

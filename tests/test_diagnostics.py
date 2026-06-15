@@ -1,5 +1,8 @@
+"""Tests for src.inference.diagnostics: R-hat, ESS, and particle degeneracy."""
+
+from __future__ import annotations
+
 import numpy as np
-import pytest
 
 from config.default_params import InferenceConfig, ModelParams
 from src.data.synthetic import generate_market
@@ -18,33 +21,43 @@ from src.inference.smc import bootstrap_smc
 
 
 def _to_market_data(mkt):
+    """Convert a synthetic market to a MarketData input struct."""
     return MarketData(
-        Y=mkt.Y, delta=mkt.delta,
+        Y=mkt.Y,
+        delta=mkt.delta,
         log_size_ratio=np.log(mkt.S / mkt.S_bar),
         wallet_ids=mkt.wallet_ids,
     )
 
 
 def _make_synth(*, T=80, n_wallets=10, seed=7):
+    """Generate a synthetic market with warm-start parameters."""
     rng = np.random.default_rng(0)
     Y_dummy = rng.standard_normal(200)
     p = ModelParams.warm_start(Y_dummy)
     return generate_market(
-        p, n_trades=T, n_wallets=n_wallets, n_insider_wallets=2,
-        mean_inter_trade_time=1.0, rng=np.random.default_rng(seed),
+        p,
+        n_trades=T,
+        n_wallets=n_wallets,
+        n_insider_wallets=2,
+        mean_inter_trade_time=1.0,
+        rng=np.random.default_rng(seed),
     )
 
 
 # ---------------- compute_rhat ----------------
 
+
 def test_rhat_iid_chains_close_to_one():
+    """R-hat ≈ 1 for i.i.d. Gaussian chains (well-mixed, same distribution)."""
     rng = np.random.default_rng(0)
-    samples = rng.standard_normal((2000, 4))   # (n_iter, P)
+    samples = rng.standard_normal((2000, 4))  # (n_iter, P)
     r = compute_rhat(samples)
     assert 0.99 < r < 1.05
 
 
 def test_rhat_single_chain_returns_nan():
+    """R-hat is undefined for a single chain and must return NaN."""
     rng = np.random.default_rng(0)
     samples = rng.standard_normal((500, 1))
     assert np.isnan(compute_rhat(samples))
@@ -65,8 +78,9 @@ def test_rhat_diverging_chains_exceeds_one():
 
 
 def test_rhat_handles_multi_dim_params():
+    """R-hat over a (n_iter, P, D) array returns a length-D vector."""
     rng = np.random.default_rng(0)
-    samples = rng.standard_normal((1000, 4, 5))   # 5 sub-params
+    samples = rng.standard_normal((1000, 4, 5))  # 5 sub-params
     r = compute_rhat(samples)
     assert r.shape == (5,)
     assert np.all((r > 0.95) & (r < 1.10))
@@ -74,7 +88,9 @@ def test_rhat_handles_multi_dim_params():
 
 # ---------------- compute_ess ----------------
 
+
 def test_ess_iid_samples_near_n_iter():
+    """ESS for i.i.d. Gaussian samples is close to the total sample count."""
     rng = np.random.default_rng(0)
     samples = rng.standard_normal((4000, 4))
     e = compute_ess(samples)
@@ -91,12 +107,13 @@ def test_ess_ar1_samples_below_n_iter():
     samples = np.empty((n_iter, P))
     samples[0] = rng.standard_normal(P)
     for t in range(1, n_iter):
-        samples[t] = phi * samples[t - 1] + np.sqrt(1 - phi ** 2) * rng.standard_normal(P)
+        samples[t] = phi * samples[t - 1] + np.sqrt(1 - phi**2) * rng.standard_normal(P)
     e = compute_ess(samples)
-    assert e < 0.2 * n_iter * P    # heavy correlation crushes ESS
+    assert e < 0.2 * n_iter * P  # heavy correlation crushes ESS
 
 
 def test_ess_accepts_1d_single_chain():
+    """ESS for a 1-D array (single chain) falls in a reasonable range."""
     rng = np.random.default_rng(0)
     samples = rng.standard_normal(2000)
     e = compute_ess(samples)
@@ -104,6 +121,7 @@ def test_ess_accepts_1d_single_chain():
 
 
 def test_ess_handles_multi_dim_params():
+    """ESS over a (n_iter, P, D) array returns a length-D vector."""
     rng = np.random.default_rng(0)
     samples = rng.standard_normal((1000, 4, 7))
     e = compute_ess(samples)
@@ -113,29 +131,35 @@ def test_ess_handles_multi_dim_params():
 
 # ---------------- particle_degeneracy_rate ----------------
 
+
 def test_particle_degeneracy_rate_all_above_threshold():
+    """No step below ESS threshold → degeneracy rate is 0."""
     ess = np.full(100, 30.0)
-    assert particle_degeneracy_rate(ess, N=50) == 0.0    # 30 >= 50/4
+    assert particle_degeneracy_rate(ess, N=50) == 0.0  # 30 >= 50/4
 
 
 def test_particle_degeneracy_rate_all_below_threshold():
+    """Every step below ESS threshold → degeneracy rate is 1."""
     ess = np.full(100, 5.0)
-    assert particle_degeneracy_rate(ess, N=50) == 1.0    # 5 < 50/4 = 12.5
+    assert particle_degeneracy_rate(ess, N=50) == 1.0  # 5 < 50/4 = 12.5
 
 
 def test_particle_degeneracy_rate_mixed():
+    """Half of steps below threshold → degeneracy rate is 0.5."""
     ess = np.array([20.0, 5.0, 5.0, 20.0])
     # threshold = 50/4 = 12.5 → 2/4 below
     assert particle_degeneracy_rate(ess, N=50) == 0.5
 
 
 def test_particle_degeneracy_rate_custom_threshold():
+    """Custom threshold_fraction is respected in the comparison."""
     ess = np.array([10.0, 20.0, 30.0, 40.0])
     # threshold = 0.5*50 = 25 → 2/4 below
     assert particle_degeneracy_rate(ess, N=50, threshold_fraction=0.5) == 0.5
 
 
 def test_smc_particle_degeneracy_on_real_smc_output():
+    """smc_particle_degeneracy returns a rate in [0, 1] on a live SMC run."""
     mkt = _make_synth(T=60, seed=3)
     md = _to_market_data(mkt)
     rng = np.random.default_rng(0)
@@ -144,14 +168,21 @@ def test_smc_particle_degeneracy_on_real_smc_output():
     theta_w = rng.beta(p.a, p.b, size=10)
     cfg = InferenceConfig(N=30, seed=0)
     out = bootstrap_smc(
-        md.Y, md.delta, md.log_size_ratio, md.wallet_ids,
-        theta_w, p, cfg, rng=np.random.default_rng(0),
+        md.Y,
+        md.delta,
+        md.log_size_ratio,
+        md.wallet_ids,
+        theta_w,
+        p,
+        cfg,
+        rng=np.random.default_rng(0),
     )
     rate = smc_particle_degeneracy(out, N=cfg.N)
     assert 0.0 <= rate <= 1.0
 
 
 # ---------------- diagnose_ipmcmc ----------------
+
 
 def test_diagnose_ipmcmc_end_to_end():
     """diagnose_ipmcmc returns a populated dataclass on a small iPMCMC run."""

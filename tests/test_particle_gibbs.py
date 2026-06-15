@@ -1,3 +1,7 @@
+"""Tests for src.inference.particle_gibbs: shapes, ranges, and recovery."""
+
+from __future__ import annotations
+
 import numpy as np
 import pytest
 
@@ -8,32 +12,41 @@ from src.inference.particle_gibbs import MarketData, PGOutput, particle_gibbs
 
 @pytest.fixture
 def warm_params():
+    """Warm-started ModelParams derived from a 200-step dummy series."""
     rng = np.random.default_rng(0)
     Y_dummy = rng.standard_normal(200)
     return ModelParams.warm_start(Y_dummy)
 
 
 def _to_market_data(mkt):
+    """Convert a synthetic market to a MarketData input struct."""
     return MarketData(
-        Y=mkt.Y, delta=mkt.delta,
+        Y=mkt.Y,
+        delta=mkt.delta,
         log_size_ratio=np.log(mkt.S / mkt.S_bar),
         wallet_ids=mkt.wallet_ids,
     )
 
 
 def _make_synth(*, T=100, n_wallets=10, n_insider=2, seed=7, params=None):
+    """Generate a synthetic market; creates warm-start params if none provided."""
     if params is None:
         rng = np.random.default_rng(0)
         Y_dummy = rng.standard_normal(200)
         params = ModelParams.warm_start(Y_dummy)
     mkt = generate_market(
-        params, n_trades=T, n_wallets=n_wallets, n_insider_wallets=n_insider,
-        mean_inter_trade_time=1.0, rng=np.random.default_rng(seed),
+        params,
+        n_trades=T,
+        n_wallets=n_wallets,
+        n_insider_wallets=n_insider,
+        mean_inter_trade_time=1.0,
+        rng=np.random.default_rng(seed),
     )
     return mkt
 
 
 def _roc_auc(y_true, y_score):
+    """Compute ROC AUC via the Wilcoxon rank-sum formula."""
     y_true = np.asarray(y_true, dtype=int)
     y_score = np.asarray(y_score, dtype=float)
     n_pos = int(y_true.sum())
@@ -48,6 +61,7 @@ def _roc_auc(y_true, y_score):
 
 
 def test_pg_runs_end_to_end():
+    """particle_gibbs completes and returns a PGOutput with correct array shapes."""
     mkt = _make_synth(T=80, n_wallets=10, n_insider=2, seed=3)
     md = _to_market_data(mkt)
     cfg = InferenceConfig(N=20, n_iter=15, n_burnin=5, seed=0)
@@ -63,6 +77,7 @@ def test_pg_runs_end_to_end():
 
 
 def test_pg_outputs_are_finite_and_in_range():
+    """All sampled parameters are finite, positive (variances), and in valid ranges."""
     mkt = _make_synth(T=60, n_wallets=10, seed=4)
     md = _to_market_data(mkt)
     cfg = InferenceConfig(N=20, n_iter=15, n_burnin=5, seed=0)
@@ -82,6 +97,7 @@ def test_pg_outputs_are_finite_and_in_range():
 
 
 def test_pg_z_at_step_0_always_zero():
+    """Z_0 := 0 by model construction; every sampled trajectory must obey this."""
     mkt = _make_synth(T=60, seed=4)
     md = _to_market_data(mkt)
     cfg = InferenceConfig(N=20, n_iter=10, n_burnin=2, seed=0)
@@ -90,6 +106,7 @@ def test_pg_z_at_step_0_always_zero():
 
 
 def test_pg_reproducibility():
+    """Identical seeds produce bit-exact identical chain outputs."""
     mkt = _make_synth(T=60, seed=5)
     md = _to_market_data(mkt)
     cfg = InferenceConfig(N=20, n_iter=12, n_burnin=4, seed=0)
@@ -105,19 +122,27 @@ def test_pg_does_not_mutate_caller_config():
     mkt = _make_synth(T=60, seed=5)
     md = _to_market_data(mkt)
     cfg = InferenceConfig(N=20, n_iter=50, n_burnin=20, seed=0)
-    cfg_steps_before = (cfg.mh_step_beta_S, cfg.mh_step_beta_Z,
-                        cfg.mh_step_log_tau2_0, cfg.mh_step_log_tau2_1)
+    cfg_steps_before = (
+        cfg.mh_step_beta_S,
+        cfg.mh_step_beta_Z,
+        cfg.mh_step_log_tau2_0,
+        cfg.mh_step_log_tau2_1,
+    )
     _ = particle_gibbs([md], cfg, rng=np.random.default_rng(0))
-    cfg_steps_after = (cfg.mh_step_beta_S, cfg.mh_step_beta_Z,
-                       cfg.mh_step_log_tau2_0, cfg.mh_step_log_tau2_1)
+    cfg_steps_after = (
+        cfg.mh_step_beta_S,
+        cfg.mh_step_beta_Z,
+        cfg.mh_step_log_tau2_0,
+        cfg.mh_step_log_tau2_1,
+    )
     assert cfg_steps_before == cfg_steps_after
 
 
 def test_pg_multi_market():
+    """Multi-market run produces one latent array per market and pooled theta_w."""
     mkts = [_make_synth(T=60, n_wallets=10, seed=s) for s in (1, 2, 3)]
     mds = [_to_market_data(m) for m in mkts]
     cfg = InferenceConfig(N=20, n_iter=10, seed=0)
-    # Force a shared wallet space across markets
     n_wallets = 10
     out = particle_gibbs(mds, cfg, rng=np.random.default_rng(0), n_wallets=n_wallets)
     assert len(out.X) == 3
@@ -139,11 +164,14 @@ def test_pg_respects_provided_initial_reference():
     Y_dummy = np.random.default_rng(0).standard_normal(200)
     p_init = ModelParams.warm_start(Y_dummy)
     out = particle_gibbs(
-        [md], cfg, rng=np.random.default_rng(0),
+        [md],
+        cfg,
+        rng=np.random.default_rng(0),
         n_wallets=10,
         params_init=p_init,
         theta_w_init=np.full(10, 0.05),
-        V_ref_init=[V_init], Z_ref_init=[Z_init],
+        V_ref_init=[V_init],
+        Z_ref_init=[Z_init],
     )
     assert out.V[0].shape == (1, md.T)
 
@@ -156,14 +184,18 @@ def test_pg_z_posterior_recovers_insider_trades():
     Y_dummy = rng.standard_normal(200)
     p_true = ModelParams.warm_start(Y_dummy)
     mkt = generate_market(
-        p_true, n_trades=200, n_wallets=20, n_insider_wallets=3,
-        mean_inter_trade_time=1.0, rng=np.random.default_rng(11),
+        p_true,
+        n_trades=200,
+        n_wallets=20,
+        n_insider_wallets=3,
+        mean_inter_trade_time=1.0,
+        rng=np.random.default_rng(11),
     )
     md = _to_market_data(mkt)
     cfg = InferenceConfig(N=50, n_iter=200, n_burnin=100, seed=0)
     out = particle_gibbs([md], cfg, rng=np.random.default_rng(42))
 
-    Z_prob = out.Z[0][cfg.n_burnin:].mean(axis=0)
+    Z_prob = out.Z[0][cfg.n_burnin :].mean(axis=0)
     auc = _roc_auc(mkt.Z, Z_prob)
     assert auc > 0.70, f"AUC = {auc:.3f}; expected > 0.70"
 
@@ -176,14 +208,18 @@ def test_pg_theta_w_recovers_insider_wallets():
     Y_dummy = rng.standard_normal(200)
     p_true = ModelParams.warm_start(Y_dummy)
     mkt = generate_market(
-        p_true, n_trades=200, n_wallets=20, n_insider_wallets=3,
-        mean_inter_trade_time=1.0, rng=np.random.default_rng(11),
+        p_true,
+        n_trades=200,
+        n_wallets=20,
+        n_insider_wallets=3,
+        mean_inter_trade_time=1.0,
+        rng=np.random.default_rng(11),
     )
     md = _to_market_data(mkt)
     cfg = InferenceConfig(N=50, n_iter=200, n_burnin=100, seed=0)
     out = particle_gibbs([md], cfg, rng=np.random.default_rng(42))
 
-    theta_post = out.theta_w[cfg.n_burnin:].mean(axis=0)
+    theta_post = out.theta_w[cfg.n_burnin :].mean(axis=0)
     insider_mean = theta_post[mkt.insider_wallet_ids].mean()
     regular_mean = np.delete(theta_post, mkt.insider_wallet_ids).mean()
     assert insider_mean > regular_mean

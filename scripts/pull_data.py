@@ -17,6 +17,7 @@ Usage:
 
 The script is idempotent over the output directory — re-running overwrites.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -42,30 +43,42 @@ log = logging.getLogger("pull_data")
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse CLI arguments for pull_data."""
     p = argparse.ArgumentParser(description="Pull §5 shortlist trade data.")
     p.add_argument(
-        "--output-dir", type=Path, default=Path("data/processed"),
+        "--output-dir",
+        type=Path,
+        default=Path("data/processed"),
         help="Directory to write <slug>.parquet + <slug>.meta.json files.",
     )
     p.add_argument(
-        "--tail-trades", type=int, default=None,
+        "--tail-trades",
+        type=int,
+        default=None,
         help="Keep only the last N trades per market (§8.2 target: 500-3000). "
-             "Default: keep all surviving trades.",
+        "Default: keep all surviving trades.",
     )
     p.add_argument(
-        "--max-pages", type=int, default=200,
+        "--max-pages",
+        type=int,
+        default=200,
         help="Polymarket /trades pagination cap per market (500 trades/page).",
     )
     p.add_argument(
-        "--sleep-between", type=float, default=0.1,
+        "--sleep-between",
+        type=float,
+        default=0.1,
         help="Seconds between paginated /trades calls (politeness).",
     )
     p.add_argument(
-        "--slugs", nargs="+", default=list(SLUGS),
+        "--slugs",
+        nargs="+",
+        default=list(SLUGS),
         help="Override the shortlist (debug). Defaults to the 10-market §5 set.",
     )
     p.add_argument(
-        "--log-level", default="INFO",
+        "--log-level",
+        default="INFO",
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
     )
     return p.parse_args(argv)
@@ -77,14 +90,18 @@ def _resolve_metadata(slugs: list[str]) -> list[MarketMeta]:
         meta = fetch_market_by_slug(slug)
         log.info(
             "%-70s vol=$%-12.0f condition=%s…",
-            slug, meta.volume, meta.condition_id[:14],
+            slug,
+            meta.volume,
+            meta.condition_id[:14],
         )
         metas.append(meta)
     return metas
 
 
 def _pull_trades(
-    metas: list[MarketMeta], max_pages: int, sleep_between: float,
+    metas: list[MarketMeta],
+    max_pages: int,
+    sleep_between: float,
 ) -> list[tuple[str, list]]:
     """Returns list of (slug, raw_trades) tuples in shortlist order."""
     out: list[tuple[str, list]] = []
@@ -97,7 +114,9 @@ def _pull_trades(
             sleep_between=sleep_between,
         )
         log.info(
-            "  -> %d raw trades in %.1fs", len(trades), time.monotonic() - t0,
+            "  -> %d raw trades in %.1fs",
+            len(trades),
+            time.monotonic() - t0,
         )
         out.append((meta.slug, trades))
     return out
@@ -125,6 +144,14 @@ def _tail(market: ProcessedMarket, n: int) -> ProcessedMarket:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Fetch, clean, and persist the §5 shortlist markets.
+
+    Args:
+        argv: Argument list passed to argparse; defaults to ``sys.argv[1:]``.
+
+    Returns:
+        Exit code (0 on success).
+    """
     args = _parse_args(argv)
     logging.basicConfig(
         level=args.log_level,
@@ -134,7 +161,9 @@ def main(argv: list[str] | None = None) -> int:
 
     metas = _resolve_metadata(args.slugs)
     trades_by_market = _pull_trades(
-        metas, max_pages=args.max_pages, sleep_between=args.sleep_between,
+        metas,
+        max_pages=args.max_pages,
+        sleep_between=args.sleep_between,
     )
 
     log.info("cleaning + indexing across %d markets …", len(trades_by_market))

@@ -15,6 +15,7 @@ Per decision #4, naive index-pinning is used (slot 0 always holds the
 reference); ancestor sampling for the reference is explicitly deferred to
 iPMCMC.
 """
+
 from __future__ import annotations
 
 import numpy as np
@@ -23,7 +24,13 @@ from scipy.special import logsumexp
 from config.default_params import InferenceConfig, ModelParams
 from src.inference.kalman import kalman_step
 from src.inference.smc import SMCOutput
-from src.utils.transforms import ess, log1pexp, logit, systematic_resample
+from src.utils.transforms import (
+    bounded_indicator_probability,
+    ess,
+    log1pexp,
+    logit,
+    systematic_resample,
+)
 
 REFERENCE_INDEX = 0
 
@@ -41,7 +48,27 @@ def conditional_smc(
     *,
     rng: np.random.Generator,
 ) -> SMCOutput:
-    """Run CSMC with locally-optimal proposal and index-0 reference pinning."""
+    """Run CSMC with locally-optimal proposal and index-0 reference pinning.
+
+    Args:
+        Y: Logit-price observations of shape ``(T,)``.
+        delta: Inter-trade times of shape ``(T,)`` with ``delta[0] == 0``.
+        log_size_ratio: ``log(S_i / S_bar)`` features of shape ``(T,)``.
+        wallet_ids: Wallet-index array of shape ``(T,)``.
+        theta_w: Per-wallet insider propensities indexed by ``wallet_ids``.
+        params: Model parameters for transitions, emissions, and behavior logits.
+        config: Inference configuration with particle count and ESS threshold.
+        V_ref: Reference regime trajectory of shape ``(T,)``.
+        Z_ref: Reference insider trajectory of shape ``(T,)`` with ``Z_ref[0] == 0``.
+        rng: Random generator used for proposal sampling and resampling.
+
+    Returns:
+        SMCOutput containing filtered summaries and full particle history.
+
+    Raises:
+        ValueError: If reference trajectories do not match ``T`` or are non-binary.
+        ValueError: If ``Z_ref[0]`` violates the model convention ``Z_0 := 0``.
+    """
     T = len(Y)
     N = config.N
 
@@ -51,8 +78,10 @@ def conditional_smc(
         raise ValueError("Z_ref[0] must be 0 (model convention).")
     V_ref = np.asarray(V_ref, dtype=np.int8)
     Z_ref = np.asarray(Z_ref, dtype=np.int8)
-    if not (set(np.unique(V_ref)).issubset({0, 1})
-            and set(np.unique(Z_ref)).issubset({0, 1})):
+    if not (
+        set(np.unique(V_ref)).issubset({0, 1})
+        and set(np.unique(Z_ref)).issubset({0, 1})
+    ):
         raise ValueError("Reference trajectories must be binary {0, 1}.")
 
     # Incoming particle state at step i (state at end of step i-1, post-resample)
@@ -87,11 +116,21 @@ def conditional_smc(
                 (N, 2),
             )
         else:
-            row_calm = np.array([np.log1p(-params.q_01),
-                                 np.log(params.q_01) if params.q_01 > 0 else -np.inf])
-            row_news = np.array([np.log(params.q_10) if params.q_10 > 0 else -np.inf,
-                                 np.log1p(-params.q_10)])
-            log_p_V = np.where(V_prev[:, None] == 0, row_calm[None, :], row_news[None, :])
+            row_calm = np.array(
+                [
+                    np.log1p(-params.q_01),
+                    np.log(params.q_01) if params.q_01 > 0 else -np.inf,
+                ]
+            )
+            row_news = np.array(
+                [
+                    np.log(params.q_10) if params.q_10 > 0 else -np.inf,
+                    np.log1p(-params.q_10),
+                ]
+            )
+            log_p_V = np.where(
+                V_prev[:, None] == 0, row_calm[None, :], row_news[None, :]
+            )
 
         # ---------- log p(Z_i = z | Z_prev, w, S, theta), shape (N, 2) ----------
         if i == 0:
@@ -101,7 +140,7 @@ def conditional_smc(
                 logit_theta[int(wallet_ids[i])]
                 + params.beta_S * float(log_size_ratio[i])
                 + params.beta_Z * Z_prev.astype(float)
-            )                                                   # (N,)
+            )  # (N,)
             lp = log1pexp(logit_pi_Z)
             log_p_Z = np.stack([-lp, logit_pi_Z - lp], axis=1)  # (N, 2)
 
@@ -116,24 +155,28 @@ def conditional_smc(
             for z in (0, 1):
                 k = 2 * v + z
                 mu_k, s2_k, ll_k = kalman_step(
-                    mu, sigma2, float(Y[i]),
+                    mu,
+                    sigma2,
+                    float(Y[i]),
                     np.full(N, v, dtype=np.int8),
                     np.full(N, z, dtype=np.int8),
-                    float(delta[i]), float(log_size_ratio[i]),
+                    float(delta[i]),
+                    float(log_size_ratio[i]),
                     params,
                 )
                 log_lik[:, k] = ll_k
                 mu_combos[:, k] = mu_k
                 sigma2_combos[:, k] = s2_k
 
-        # ---------- Locally-optimal proposal + per-particle normalizing constant ----------
-        log_joint = log_prior_joint + log_lik                   # (N, 4)
-        log_Z_per = logsumexp(log_joint, axis=1)                # (N,)
-        q = np.exp(log_joint - log_Z_per[:, None])              # (N, 4)
+        # ---------- Locally-optimal proposal ----------
+        # plus per-particle normalizing constant
+        log_joint = log_prior_joint + log_lik  # (N, 4)
+        log_Z_per = logsumexp(log_joint, axis=1)  # (N,)
+        q = np.exp(log_joint - log_Z_per[:, None])  # (N, 4)
 
         # Sample outcome ∈ {0,1,2,3} per particle (categorical from q)
         cum_q = np.cumsum(q, axis=1)
-        cum_q[:, -1] = 1.0                                       # float-overshoot guard
+        cum_q[:, -1] = 1.0  # float-overshoot guard
         u = rng.random(N)
         outcomes = (cum_q < u[:, None]).sum(axis=1).astype(np.int32)
 
@@ -159,8 +202,8 @@ def conditional_smc(
         mu_hist[i] = mu_new
         X_filt[i] = float(W @ mu_new)
         # Clip the indicator probabilities against ~1e-16 roundoff in W·V
-        V_prob_filt[i] = min(1.0, max(0.0, float(W @ V_new.astype(float))))
-        Z_prob_filt[i] = min(1.0, max(0.0, float(W @ Z_new.astype(float))))
+        V_prob_filt[i] = bounded_indicator_probability(W, V_new)
+        Z_prob_filt[i] = bounded_indicator_probability(W, Z_new)
         ess_per_step[i] = ess(log_W)
 
         # ---------- Adaptive resample, reference slot pinned ----------
@@ -187,8 +230,16 @@ def conditional_smc(
         log_marginal=log_marginal,
         ess_per_step=ess_per_step,
         resample_steps=resample_steps,
-        X_filt=X_filt, V_prob_filt=V_prob_filt, Z_prob_filt=Z_prob_filt,
-        final_V=V_prev, final_Z=Z_prev,
-        final_mu=mu, final_sigma2=sigma2, final_log_W=log_W,
-        V_hist=V_hist, Z_hist=Z_hist, mu_hist=mu_hist, ancestors=ancestors,
+        X_filt=X_filt,
+        V_prob_filt=V_prob_filt,
+        Z_prob_filt=Z_prob_filt,
+        final_V=V_prev,
+        final_Z=Z_prev,
+        final_mu=mu,
+        final_sigma2=sigma2,
+        final_log_W=log_W,
+        V_hist=V_hist,
+        Z_hist=Z_hist,
+        mu_hist=mu_hist,
+        ancestors=ancestors,
     )

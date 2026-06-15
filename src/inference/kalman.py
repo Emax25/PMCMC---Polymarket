@@ -12,6 +12,7 @@ variance:
 Each particle carries its own (mu, sigma2) — different (V, Z) trajectories
 accumulate different conditional variances (decision #1).
 """
+
 from __future__ import annotations
 
 import numpy as np
@@ -32,13 +33,39 @@ _LOG_LIK_FLOOR = -500.0
 
 
 def process_variance(V: np.ndarray, delta: float, params: ModelParams) -> np.ndarray:
-    """Q_i = sigma2_{V_i} * Delta_i. Vectorizes over V."""
+    """Compute process variance for each particle state.
+
+    Implements the random-walk transition variance
+    ``Q_i = sigma2_{V_i} * Delta_i``.
+
+    Args:
+        V: Particle regime indicators in ``{0, 1}``.
+        delta: Inter-trade time for the current step.
+        params: Model parameters providing ``sigma2_0`` and ``sigma2_1``.
+
+    Returns:
+        Per-particle transition variances with the same leading shape as ``V``.
+    """
     sigma2_v = np.where(np.asarray(V) == 0, params.sigma2_0, params.sigma2_1)
     return sigma2_v * delta
 
 
-def obs_variance(Z: np.ndarray, log_size_ratio: float, params: ModelParams) -> np.ndarray:
-    """R_i = tau2_{Z_i} / max(1 + gamma * log(S_i/S_bar), floor). Vectorizes over Z."""
+def obs_variance(
+    Z: np.ndarray, log_size_ratio: float, params: ModelParams
+) -> np.ndarray:
+    """Compute observation variance for each particle state.
+
+    Implements
+    ``R_i = tau2_{Z_i} / max(1 + gamma * log(S_i / S_bar), _DENOM_FLOOR)``.
+
+    Args:
+        Z: Particle insider indicators in ``{0, 1}``.
+        log_size_ratio: ``log(S_i / S_bar)`` at the current trade.
+        params: Model parameters providing ``tau2_0``, ``tau2_1``, and ``gamma``.
+
+    Returns:
+        Per-particle observation variances with the same leading shape as ``Z``.
+    """
     tau2_z = np.where(np.asarray(Z) == 0, params.tau2_0, params.tau2_1)
     denom = max(1.0 + params.gamma * log_size_ratio, _DENOM_FLOOR)
     return tau2_z / denom
@@ -62,17 +89,27 @@ def kalman_step(
     Q = sigma2_v * 0 = 0 collapses the predict, leaving the update of the
     t_0 prior with Y_0.
 
-    Returns (mu_new, sigma2_new, log_lik) where
-        log_lik_n = log p(y_i | y_{1:i-1}, V_{1:i}^{(n)}, Z_{1:i}^{(n)})
-                  = log N(y; mu_n, sigma2_pred_n + R_n)
-    is the per-particle predictive density that drives SMC weights.
+    Args:
+        mu: Prior filtered means for the incoming particles.
+        sigma2: Prior filtered variances aligned with ``mu``.
+        y: Current logit-price observation.
+        V: Current regime indicators per particle (0 calm, 1 news).
+        Z: Current insider indicators per particle (0 no insider, 1 insider).
+        delta: Inter-trade time for this update step.
+        log_size_ratio: Current ``log(S_i / S_bar)`` feature.
+        params: Model parameters controlling process and observation variances.
+
+    Returns:
+        Tuple ``(mu_new, sigma2_new, log_lik)`` for the updated filtering
+        moments and per-particle predictive log densities, where
+        ``log_lik_n = log p(y_i | y_{1:i-1}, V_{1:i}^{(n)}, Z_{1:i}^{(n)})``.
     """
     Q = process_variance(V, delta, params)
     R = obs_variance(Z, log_size_ratio, params)
 
     sigma2_pred = sigma2 + Q
     S = sigma2_pred + R
-    innov = y - mu                 # mu_pred = mu (random-walk transition)
+    innov = y - mu  # mu_pred = mu (random-walk transition)
     K = sigma2_pred / S
 
     mu_new = mu + K * innov
@@ -92,6 +129,14 @@ def kalman_filter(
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """Forward filter for a single (V, Z) trajectory.
 
+    Args:
+        Y: Logit-price observations of shape ``(T,)``.
+        V: Regime trajectory of shape ``(T,)`` with values in ``{0, 1}``.
+        Z: Insider trajectory of shape ``(T,)`` with values in ``{0, 1}``.
+        delta: Inter-trade times of shape ``(T,)`` with ``delta[0] == 0``.
+        log_size_ratio: ``log(S_i / S_bar)`` features of shape ``(T,)``.
+        params: Model parameters used by the transition and observation models.
+
     Returns:
         mu_filt:      (T,) E[X_i | Y_{1:i}, V_{1:i}, Z_{1:i}]
         sigma2_filt:  (T,) Var[X_i | Y_{1:i}, V_{1:i}, Z_{1:i}]
@@ -107,7 +152,8 @@ def kalman_filter(
 
     for i in range(T):
         mu, sigma2, log_lik = kalman_step(
-            mu, sigma2,
+            mu,
+            sigma2,
             float(Y[i]),
             np.array([V[i]]),
             np.array([Z[i]]),
@@ -135,6 +181,18 @@ def ffbs_sample(
 
     Uses the Rauch-Tung-Striebel backward recursion specialized to the
     random-walk transition (cross-covariance Cov(X_i, X_{i+1} | Y_{1:i}) = sigma2_i).
+
+    Args:
+        Y: Logit-price observations of shape ``(T,)``.
+        V: Regime trajectory of shape ``(T,)``.
+        Z: Insider trajectory of shape ``(T,)``.
+        delta: Inter-trade times of shape ``(T,)``.
+        log_size_ratio: ``log(S_i / S_bar)`` features of shape ``(T,)``.
+        params: Model parameters used by filtering and backward sampling.
+        rng: Random generator used for all normal draws in backward simulation.
+
+    Returns:
+        One sampled latent ``X`` trajectory of shape ``(T,)``.
     """
     T = len(Y)
     mu_filt, sigma2_filt, _ = kalman_filter(Y, V, Z, delta, log_size_ratio, params)

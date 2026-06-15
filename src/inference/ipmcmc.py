@@ -21,6 +21,7 @@ Decision #4: naive index-pinning inside each CSMC pass.
 Decision #11: shared adaptive MH step-size tuning across slots during early
 burn-in, applied to a local config copy.
 """
+
 from __future__ import annotations
 
 import copy
@@ -32,15 +33,19 @@ from scipy.special import logsumexp
 from config.default_params import InferenceConfig, ModelParams
 from src.inference.csmc import conditional_smc
 from src.inference.kalman import ffbs_sample
-from src.inference.parameter_updates import MarketLatents, gibbs_sweep
+from src.inference.parameter_updates import MarketLatents, adapt_mh_step, gibbs_sweep
 from src.inference.particle_gibbs import MarketData
 from src.inference.smc import bootstrap_smc, sample_path
 
 
 @dataclass
 class iPMCMCOutput:
-    """iPMCMC chain output. Parameter arrays have shape (n_iter, P) — one
-    column per conditional slot, ready for R-hat across the P chains."""
+    """Container for iPMCMC chains and diagnostics.
+
+    Parameter arrays use shape `(n_iter, P)`, one column per conditional slot,
+    so convergence metrics across slots are directly available.
+    """
+
     # Parameter chains
     sigma2_0: np.ndarray
     sigma2_1: np.ndarray
@@ -72,22 +77,6 @@ class iPMCMCOutput:
     final_mh_step_log_tau2_1: float
 
 
-def _adapt_step(
-    config: InferenceConfig,
-    attr: str,
-    rate: float,
-    *,
-    lo: float = 0.23,
-    hi: float = 0.44,
-    factor: float = 1.2,
-) -> None:
-    step = getattr(config, attr)
-    if rate > hi:
-        setattr(config, attr, step * factor)
-    elif rate < lo:
-        setattr(config, attr, step / factor)
-
-
 def ipmcmc(
     markets: list[MarketData],
     config: InferenceConfig,
@@ -110,6 +99,14 @@ def ipmcmc(
         adapt_step_sizes: enable the windowed MH step-size adaptation
             (decision #11) on a local config copy.
         progress: tqdm progress bar.
+
+    Returns:
+        Full iPMCMC output containing per-slot parameter chains, per-market
+        latent trajectories, marginal-likelihood traces, swap sources, MH
+        acceptance flags, and final adapted step sizes.
+
+    Raises:
+        ValueError: If `config.M < config.P`.
     """
     if config.M < config.P:
         raise ValueError(f"Need M >= P; got M={config.M}, P={config.P}.")
@@ -137,8 +134,14 @@ def ipmcmc(
         slot_refs: list[tuple[np.ndarray, np.ndarray]] = []
         for md in markets:
             out0 = bootstrap_smc(
-                md.Y, md.delta, md.log_size_ratio, md.wallet_ids,
-                theta_w_slots[p], params_slots[p], config, rng=rng,
+                md.Y,
+                md.delta,
+                md.log_size_ratio,
+                md.wallet_ids,
+                theta_w_slots[p],
+                params_slots[p],
+                config,
+                rng=rng,
             )
             V_p, Z_p = sample_path(out0, rng)
             slot_refs.append((V_p, Z_p))
@@ -173,11 +176,12 @@ def ipmcmc(
     iterator = range(n_iter)
     if progress:
         from tqdm.auto import tqdm
+
         iterator = tqdm(iterator, desc="iPMCMC")
 
     for it in iterator:
         # ---------- Step 1: Run M SMC passes ----------
-        smc_outputs: list[list] = []        # M-list of K-list of SMCOutput
+        smc_outputs: list[list] = []  # M-list of K-list of SMCOutput
         for m_idx in range(M):
             outputs_per_market = []
             lm_total = 0.0
@@ -186,9 +190,16 @@ def ipmcmc(
                 for k, md in enumerate(markets):
                     V_ref, Z_ref = refs_slots[slot][k]
                     out = conditional_smc(
-                        md.Y, md.delta, md.log_size_ratio, md.wallet_ids,
-                        theta_w_slots[slot], params_slots[slot], config,
-                        V_ref, Z_ref, rng=rng,
+                        md.Y,
+                        md.delta,
+                        md.log_size_ratio,
+                        md.wallet_ids,
+                        theta_w_slots[slot],
+                        params_slots[slot],
+                        config,
+                        V_ref,
+                        Z_ref,
+                        rng=rng,
                     )
                     outputs_per_market.append(out)
                     lm_total += out.log_marginal
@@ -196,8 +207,13 @@ def ipmcmc(
                 slot = (m_idx - P) % P
                 for k, md in enumerate(markets):
                     out = bootstrap_smc(
-                        md.Y, md.delta, md.log_size_ratio, md.wallet_ids,
-                        theta_w_slots[slot], params_slots[slot], config,
+                        md.Y,
+                        md.delta,
+                        md.log_size_ratio,
+                        md.wallet_ids,
+                        theta_w_slots[slot],
+                        params_slots[slot],
+                        config,
                         rng=rng,
                     )
                     outputs_per_market.append(out)
@@ -212,10 +228,10 @@ def ipmcmc(
                 log_w = log_marg[it, candidates]
                 log_w_norm = log_w - logsumexp(log_w)
                 probs = np.exp(log_w_norm)
-                probs /= probs.sum()                     # guard float
+                probs /= probs.sum()  # guard float
                 chain_indices[it, j] = int(rng.choice(candidates, p=probs))
             else:
-                chain_indices[it, j] = j                  # M == P → no swap
+                chain_indices[it, j] = j  # M == P → no swap
 
         # ---------- Step 3: Sample new reference per slot ----------
         for j in range(P):
@@ -232,20 +248,35 @@ def ipmcmc(
             for k, md in enumerate(markets):
                 V_p, Z_p = refs_slots[p][k]
                 X_p = ffbs_sample(
-                    md.Y, V_p, Z_p, md.delta, md.log_size_ratio,
-                    params_slots[p], rng,
+                    md.Y,
+                    V_p,
+                    Z_p,
+                    md.delta,
+                    md.log_size_ratio,
+                    params_slots[p],
+                    rng,
                 )
-                latents.append(MarketLatents(
-                    Y=md.Y, delta=md.delta, log_size_ratio=md.log_size_ratio,
-                    wallet_ids=md.wallet_ids,
-                    X=X_p, V=V_p, Z=Z_p,
-                ))
+                latents.append(
+                    MarketLatents(
+                        Y=md.Y,
+                        delta=md.delta,
+                        log_size_ratio=md.log_size_ratio,
+                        wallet_ids=md.wallet_ids,
+                        X=X_p,
+                        V=V_p,
+                        Z=Z_p,
+                    )
+                )
                 X_chains[k][it, p] = X_p
                 V_chains[k][it, p] = V_p
                 Z_chains[k][it, p] = Z_p
 
             params_slots[p], theta_w_slots[p], diag = gibbs_sweep(
-                params_slots[p], theta_w_slots[p], latents, config, rng,
+                params_slots[p],
+                theta_w_slots[p],
+                latents,
+                config,
+                rng,
             )
 
             sigma2_0[it, p] = params_slots[p].sigma2_0
@@ -265,22 +296,38 @@ def ipmcmc(
         # ---------- Adaptive step-size tuning (pooled across slots) ----------
         if adapt_step_sizes and 0 < it < adapt_until and (it + 1) % adapt_window == 0:
             lo, hi = it + 1 - adapt_window, it + 1
-            _adapt_step(config, "mh_step_beta_S", float(acc_beta_S[lo:hi].mean()))
-            _adapt_step(config, "mh_step_beta_Z", float(acc_beta_Z[lo:hi].mean()))
-            _adapt_step(config, "mh_step_log_tau2_0", float(acc_tau2_0[lo:hi].mean()))
-            _adapt_step(config, "mh_step_log_tau2_1", float(acc_tau2_1[lo:hi].mean()))
+            adapt_mh_step(config, "mh_step_beta_S", float(acc_beta_S[lo:hi].mean()))
+            adapt_mh_step(config, "mh_step_beta_Z", float(acc_beta_Z[lo:hi].mean()))
+            adapt_mh_step(
+                config,
+                "mh_step_log_tau2_0",
+                float(acc_tau2_0[lo:hi].mean()),
+            )
+            adapt_mh_step(
+                config,
+                "mh_step_log_tau2_1",
+                float(acc_tau2_1[lo:hi].mean()),
+            )
 
     return iPMCMCOutput(
-        sigma2_0=sigma2_0, sigma2_1=sigma2_1,
-        q_01=q_01, q_10=q_10,
-        beta_S=beta_S, beta_Z=beta_Z,
-        tau2_0=tau2_0, tau2_1=tau2_1,
+        sigma2_0=sigma2_0,
+        sigma2_1=sigma2_1,
+        q_01=q_01,
+        q_10=q_10,
+        beta_S=beta_S,
+        beta_Z=beta_Z,
+        tau2_0=tau2_0,
+        tau2_1=tau2_1,
         theta_w=theta_w_chain,
-        X=X_chains, V=V_chains, Z=Z_chains,
+        X=X_chains,
+        V=V_chains,
+        Z=Z_chains,
         log_marg=log_marg,
         chain_indices=chain_indices,
-        acc_beta_S=acc_beta_S, acc_beta_Z=acc_beta_Z,
-        acc_tau2_0=acc_tau2_0, acc_tau2_1=acc_tau2_1,
+        acc_beta_S=acc_beta_S,
+        acc_beta_Z=acc_beta_Z,
+        acc_tau2_0=acc_tau2_0,
+        acc_tau2_1=acc_tau2_1,
         final_mh_step_beta_S=config.mh_step_beta_S,
         final_mh_step_beta_Z=config.mh_step_beta_Z,
         final_mh_step_log_tau2_0=config.mh_step_log_tau2_0,

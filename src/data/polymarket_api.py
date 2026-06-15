@@ -19,6 +19,7 @@ Per §7 of the README, no module-level random state. HTTP retries are bounded
 and use exponential backoff on 429/5xx; everything else surfaces as a
 `PolymarketAPIError`.
 """
+
 from __future__ import annotations
 
 import time
@@ -30,20 +31,35 @@ import requests
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 DATA_BASE = "https://data-api.polymarket.com"
 
-DEFAULT_TIMEOUT = 30.0          # seconds per HTTP call
-DEFAULT_MAX_RETRIES = 4         # for 429 / 5xx
-DEFAULT_BACKOFF_BASE = 1.0      # seconds; doubles each retry
+DEFAULT_TIMEOUT = 30.0  # seconds per HTTP call
+DEFAULT_MAX_RETRIES = 4  # for 429 / 5xx
+DEFAULT_BACKOFF_BASE = 1.0  # seconds; doubles each retry
 
 # Politics-genre keyword bag for the post-hoc `question_keywords` filter.
 # Gamma's `tag_slug` query is silently ignored on the /markets endpoint and the
 # `tags` field is empty in the response, so we filter on question text instead.
 # Match is case-insensitive substring; one hit retains the market.
 POLITICS_KEYWORDS = (
-    "election", "president", "presidential", "senate", "congress",
-    "house of representatives", "governor", "primary",
-    "trump", "biden", "harris", "vance", "walz",
-    "republican", "democrat", "gop", "dnc",
-    "supreme court", "impeach", "vote",
+    "election",
+    "president",
+    "presidential",
+    "senate",
+    "congress",
+    "house of representatives",
+    "governor",
+    "primary",
+    "trump",
+    "biden",
+    "harris",
+    "vance",
+    "walz",
+    "republican",
+    "democrat",
+    "gop",
+    "dnc",
+    "supreme court",
+    "impeach",
+    "vote",
 )
 
 
@@ -53,6 +69,7 @@ class PolymarketAPIError(RuntimeError):
 
 # ---------------- Dataclasses ----------------
 
+
 @dataclass
 class MarketMeta:
     """Subset of Gamma API market metadata we use downstream.
@@ -60,6 +77,7 @@ class MarketMeta:
     `condition_id` is the 0x-prefixed identifier used to query trades on the
     Data API; `id` is Gamma's internal market id.
     """
+
     id: str
     condition_id: str
     slug: str
@@ -92,14 +110,15 @@ class RawTrade:
     `wallet` is the taker's proxy wallet (0x-prefixed Polygon address); this
     is what the model's hierarchical θ_w prior keys on (§3.2).
     """
-    timestamp: int                 # unix seconds
-    price: float                   # in (0, 1)
-    size: float                    # USDC notional
+
+    timestamp: int  # unix seconds
+    price: float  # in (0, 1)
+    size: float  # USDC notional
     wallet: str
-    side: str                      # 'BUY' or 'SELL'
+    side: str  # 'BUY' or 'SELL'
     transaction_hash: str
     condition_id: str
-    asset_id: str                  # YES/NO token id
+    asset_id: str  # YES/NO token id
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> RawTrade:
@@ -118,7 +137,11 @@ class RawTrade:
 
 
 def _extract_tags(tag_field: Any) -> list[str]:
-    """Gamma returns tags as either ['Politics', ...] or [{'label': 'Politics'}, ...]."""
+    """Parse Gamma's tags field: plain strings or label dicts are both accepted.
+
+    Handles both the ``['Politics', ...]`` and ``[{'label': 'Politics'}, ...]``
+    variants that the API has shipped at different points in time.
+    """
     if not tag_field:
         return []
     out: list[str] = []
@@ -133,6 +156,7 @@ def _extract_tags(tag_field: Any) -> list[str]:
 
 
 # ---------------- HTTP plumbing ----------------
+
 
 def _get_json(
     url: str,
@@ -153,14 +177,14 @@ def _get_json(
             last_err = e
             if attempt == max_retries:
                 raise PolymarketAPIError(f"{url}: {e}") from e
-            time.sleep(backoff_base * (2 ** attempt))
+            time.sleep(backoff_base * (2**attempt))
             continue
 
         if resp.status_code == 200:
             return resp.json()
 
         if resp.status_code in (429, 500, 502, 503, 504) and attempt < max_retries:
-            time.sleep(backoff_base * (2 ** attempt))
+            time.sleep(backoff_base * (2**attempt))
             continue
 
         raise PolymarketAPIError(
@@ -170,6 +194,7 @@ def _get_json(
 
 
 # ---------------- Gamma: markets ----------------
+
 
 def fetch_markets(
     *,
@@ -241,6 +266,7 @@ def fetch_markets(
 
 
 def _question_matches(question: str, keywords_lower: tuple[str, ...]) -> bool:
+    """Return True if question contains at least one keyword (pre-lowercased)."""
     q = question.lower()
     return any(k in q for k in keywords_lower)
 
@@ -274,6 +300,13 @@ def fetch_market_by_slug(
         scan_limit: hard cap on markets scanned per closed-state (4 pages of
             500 = top 2000 by volume).
         page_size: Gamma `limit` per call.
+        session: optional requests.Session for tests / connection pooling.
+
+    Returns:
+        MarketMeta for the first market whose slug matches exactly.
+
+    Raises:
+        PolymarketAPIError: If no match is found after exhausting both paths.
     """
     # 1) /events fast path
     payload = _get_json(
@@ -296,8 +329,10 @@ def fetch_market_by_slug(
             page = _get_json(
                 f"{GAMMA_BASE}/markets",
                 params={
-                    "limit": page_size, "offset": offset,
-                    "order": "volumeNum", "ascending": "false",
+                    "limit": page_size,
+                    "offset": offset,
+                    "order": "volumeNum",
+                    "ascending": "false",
                     "closed": closed_param,
                 },
                 session=session,
@@ -315,7 +350,7 @@ def fetch_market_by_slug(
 
 # ---------------- Data API: trades ----------------
 
-DATA_API_MAX_OFFSET = 3000   # Polymarket /trades cap on historical pagination
+DATA_API_MAX_OFFSET = 3000  # Polymarket /trades cap on historical pagination
 
 
 def fetch_trades(

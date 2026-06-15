@@ -1,3 +1,16 @@
+"""Default model hyperparameters and inference configuration for PMCMC.
+
+Defines two dataclasses consumed throughout the codebase:
+
+  * ``ModelParams``     — statistical model parameters (regime variances,
+                          insider logistic coefficients, observation noise).
+  * ``InferenceConfig`` — particle filter / iPMCMC tuning knobs.
+
+The module-level ``PRODUCTION`` preset is the reference configuration for
+overnight runs; individual scripts may override specific fields via
+``dataclasses.replace``.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -7,13 +20,21 @@ import numpy as np
 
 @dataclass
 class ModelParams:
+    """Parameters of the regime-switching insider-detection SSM (§5).
+
+    NaN defaults for the four variance parameters are intentional — they must
+    be set either via ``warm_start`` (recommended) or explicitly before running
+    inference. Running the sampler with NaN params will raise immediately on
+    the first Kalman update.
+    """
+
     # Regime-switched process variances
-    sigma2_0: float = float("nan")   # calm regime; set via warm_start
-    sigma2_1: float = float("nan")   # news regime; set via warm_start
+    sigma2_0: float = float("nan")  # calm regime; set via warm_start
+    sigma2_1: float = float("nan")  # news regime; set via warm_start
 
     # Volatility regime transition probabilities (decision #10)
-    q_01: float = 0.05   # calm → news
-    q_10: float = 0.50   # news → calm
+    q_01: float = 0.05  # calm → news
+    q_10: float = 0.50  # news → calm
 
     # Insider indicator logistic coefficients (decision #10)
     beta_S: float = 0.0  # trade size effect
@@ -29,12 +50,12 @@ class ModelParams:
     b: float = 19.0
 
     # Fixed hyperparameters (decision #12)
-    gamma: float = 1.0   # size-informativeness scaling
-    s0_2: float = 1.0    # initialization variance for X_{t_0}
+    gamma: float = 1.0  # size-informativeness scaling
+    s0_2: float = 1.0  # initialization variance for X_{t_0}
 
     @classmethod
     def warm_start(cls, Y: np.ndarray) -> ModelParams:
-        """Moment-matched initialization from logit-price observations (decision #10)."""
+        """Moment-matched initialization from logit-price observations (§10)."""
         var_Y = float(np.var(Y))
         return cls(
             sigma2_0=0.1 * var_Y,
@@ -46,17 +67,24 @@ class ModelParams:
 
 @dataclass
 class InferenceConfig:
+    """Particle filter and iPMCMC tuning knobs (§6, decisions #5 and #7).
+
+    ``N``, ``n_iter``, and ``n_burnin`` drive the primary speed/quality
+    trade-off. Prefer the named presets from ARCHITECTURE.md §10 (dev /
+    half-prod / prod) over setting these by hand.
+    """
+
     # Particle filter (decision #7)
-    N: int = 50                        # particles per chain (50 dev, 500 final)
+    N: int = 50  # particles per chain (50 dev, 500 final)
     ess_resample_threshold: float = 0.5  # resample when ESS < threshold * N
 
     # iPMCMC chain configuration (decision #5)
-    M: int = 8   # total chains
-    P: int = 4   # conditional chains; M - P unconditional
+    M: int = 8  # total chains
+    P: int = 4  # conditional chains; M - P unconditional
 
     # MCMC schedule (decision #9)
-    n_iter: int = 200     # total iterations (200 dev, 3000 final)
-    n_burnin: int = 50    # burn-in to discard (50 dev, 500 final)
+    n_iter: int = 200  # total iterations (200 dev, 3000 final)
+    n_burnin: int = 50  # burn-in to discard (50 dev, 500 final)
 
     # MH step sizes on natural / log scale (decision #11)
     mh_step_beta_S: float = 0.1
@@ -73,6 +101,7 @@ class InferenceConfig:
 
     @property
     def n_unconditional(self) -> int:
+        """Number of unconditional chains (M - P)."""
         return self.M - self.P
 
 

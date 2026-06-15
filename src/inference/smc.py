@@ -9,6 +9,7 @@ resampling (decision #3) is triggered when ESS < threshold * N.
 The particle structure is RBPF: every particle carries its own (mu, sigma2)
 Kalman moments alongside the discrete state (decision #1).
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -18,32 +19,40 @@ from scipy.special import logsumexp
 
 from config.default_params import InferenceConfig, ModelParams
 from src.inference.kalman import kalman_step
-from src.utils.transforms import ess, logit, sigmoid, systematic_resample
+from src.utils.transforms import (
+    bounded_indicator_probability,
+    ess,
+    logit,
+    sigmoid,
+    systematic_resample,
+)
 
 
 @dataclass
 class SMCOutput:
-    log_marginal: float                # log p_hat(Y_{1:T} | params, theta_w)
-    ess_per_step: np.ndarray           # (T,) ESS after the update at step i
-    resample_steps: list[int]          # indices i at which we resampled
+    """Container for SMC diagnostics, trajectories, and terminal particles."""
+
+    log_marginal: float  # log p_hat(Y_{1:T} | params, theta_w)
+    ess_per_step: np.ndarray  # (T,) ESS after the update at step i
+    resample_steps: list[int]  # indices i at which we resampled
 
     # Filter estimates (weighted by normalized log_W at each step)
-    X_filt: np.ndarray                 # (T,) E[X_i | Y_{1:i}]
-    V_prob_filt: np.ndarray            # (T,) P(V_i = 1 | Y_{1:i})
-    Z_prob_filt: np.ndarray            # (T,) P(Z_i = 1 | Y_{1:i})
+    X_filt: np.ndarray  # (T,) E[X_i | Y_{1:i}]
+    V_prob_filt: np.ndarray  # (T,) P(V_i = 1 | Y_{1:i})
+    Z_prob_filt: np.ndarray  # (T,) P(Z_i = 1 | Y_{1:i})
 
     # Final particle ensemble
-    final_V: np.ndarray                # (N,)
-    final_Z: np.ndarray                # (N,)
-    final_mu: np.ndarray               # (N,)
-    final_sigma2: np.ndarray           # (N,)
-    final_log_W: np.ndarray            # (N,) normalized log-weights
+    final_V: np.ndarray  # (N,)
+    final_Z: np.ndarray  # (N,)
+    final_mu: np.ndarray  # (N,)
+    final_sigma2: np.ndarray  # (N,)
+    final_log_W: np.ndarray  # (N,) normalized log-weights
 
     # Full path history (post-update, pre-resample state per step)
-    V_hist: np.ndarray                 # (T, N) int8
-    Z_hist: np.ndarray                 # (T, N) int8
-    mu_hist: np.ndarray                # (T, N) float
-    ancestors: np.ndarray              # (T, N) int32; ancestors[i][n] = parent index at i-1
+    V_hist: np.ndarray  # (T, N) int8
+    Z_hist: np.ndarray  # (T, N) int8
+    mu_hist: np.ndarray  # (T, N) float
+    ancestors: np.ndarray  # (T, N) int32; ancestors[i][n] = parent index at i-1
 
 
 def bootstrap_smc(
@@ -68,6 +77,10 @@ def bootstrap_smc(
         params: ModelParams (must have non-NaN sigma2/tau2; use warm_start).
         config: InferenceConfig; uses N and ess_resample_threshold.
         rng: explicit Generator (§7.1).
+
+    Returns:
+        SMCOutput with log marginal estimate, filtering summaries, particle
+        history, and final weighted particle ensemble.
     """
     T = len(Y)
     N = config.N
@@ -119,10 +132,13 @@ def bootstrap_smc(
 
         # --- Kalman predict + update (vectorized over particles) ---
         mu_new, sigma2_new, log_lik = kalman_step(
-            mu, sigma2,
+            mu,
+            sigma2,
             float(Y[i]),
-            V_new, Z_new,
-            float(delta[i]), float(log_size_ratio[i]),
+            V_new,
+            Z_new,
+            float(delta[i]),
+            float(log_size_ratio[i]),
             params,
         )
 
@@ -140,8 +156,8 @@ def bootstrap_smc(
         mu_hist[i] = mu_new
         X_filt[i] = float(W @ mu_new)
         # Clip the indicator probabilities against ~1e-16 roundoff in W·V
-        V_prob_filt[i] = min(1.0, max(0.0, float(W @ V_new.astype(float))))
-        Z_prob_filt[i] = min(1.0, max(0.0, float(W @ Z_new.astype(float))))
+        V_prob_filt[i] = bounded_indicator_probability(W, V_new)
+        Z_prob_filt[i] = bounded_indicator_probability(W, Z_new)
         ess_per_step[i] = ess(log_W)
 
         # --- Adaptive resample (affects step i+1's incoming particles) ---
@@ -191,6 +207,12 @@ def smooth_paths(out: SMCOutput) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     t (few unique lineages); PG/iPMCMC are the principled fix.
 
     Returns (X_smooth, V_prob_smooth, Z_prob_smooth) each of shape (T,).
+
+    Args:
+        out: Output of ``bootstrap_smc`` containing history and ancestors.
+
+    Returns:
+        Tuple ``(X_smooth, V_prob_smooth, Z_prob_smooth)``, each shape ``(T,)``.
     """
     T, N = out.V_hist.shape
     lineage = np.empty((T, N), dtype=np.int32)
@@ -221,6 +243,13 @@ def sample_path(
     Picks a final-time particle index proportional to W_final, then walks the
     ancestor table back to t = 0. This is what Particle Gibbs uses to choose
     the next CSMC reference trajectory.
+
+    Args:
+        out: Output of ``bootstrap_smc`` containing history and ancestors.
+        rng: Random generator used for final particle-index sampling.
+
+    Returns:
+        A sampled ``(V_path, Z_path)`` pair, each with shape ``(T,)``.
     """
     T, N = out.V_hist.shape
     W = np.exp(out.final_log_W)

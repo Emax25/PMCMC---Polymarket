@@ -16,6 +16,7 @@ PG/iPMCMC samplers expect.
 I/O helpers `save_processed`/`load_processed` use Parquet for the trade-level
 columns and a sidecar JSON for scalars/metadata — fast reload per §7.4.
 """
+
 from __future__ import annotations
 
 import json
@@ -29,8 +30,8 @@ from src.data.polymarket_api import RawTrade
 from src.inference.particle_gibbs import MarketData
 from src.utils.transforms import logit
 
-
 # ---------------- Wallet index ----------------
+
 
 @dataclass
 class WalletIndex:
@@ -40,20 +41,38 @@ class WalletIndex:
     that appear in any market in the genre, so the index must be built once
     over the full list of cleaned trade tables and applied uniformly.
     """
+
     address_to_id: dict[str, int] = field(default_factory=dict)
 
     @property
     def n_wallets(self) -> int:
+        """Total number of distinct wallet addresses registered so far."""
         return len(self.address_to_id)
 
     def add(self, address: str) -> int:
-        """Insert if new; return the id either way."""
+        """Insert an address into the index if new; return its integer id.
+
+        Args:
+            address: Wallet address string to register.
+
+        Returns:
+            Stable integer id in ``[0, n_wallets)`` assigned to ``address``.
+        """
         if address not in self.address_to_id:
             self.address_to_id[address] = len(self.address_to_id)
         return self.address_to_id[address]
 
     def encode(self, addresses: list[str] | np.ndarray | pd.Series) -> np.ndarray:
-        """Map a sequence of addresses to ints, inserting unknowns."""
+        """Map a sequence of wallet addresses to integer ids.
+
+        Addresses not yet in the index are inserted (mutates ``self``).
+
+        Args:
+            addresses: Sequence of wallet address strings to encode.
+
+        Returns:
+            Integer id array of shape ``(len(addresses),)``, dtype int64.
+        """
         ids = np.empty(len(addresses), dtype=np.int64)
         for i, a in enumerate(addresses):
             ids[i] = self.add(str(a))
@@ -66,8 +85,20 @@ class WalletIndex:
         *,
         wallet_col: str = "wallet",
     ) -> WalletIndex:
-        """Build an index covering every wallet observed in `cleaned_tables`,
-        in order of first appearance across the concatenated input."""
+        """Build an index covering every wallet observed in ``cleaned_tables``.
+
+        Wallets are inserted in order of first appearance across the
+        concatenated tables, giving stable ids for a fixed input order.
+
+        Args:
+            cleaned_tables: Cleaned trade DataFrames to scan; each must
+                contain a column named ``wallet_col``.
+            wallet_col: Name of the wallet-address column (keyword-only).
+
+        Returns:
+            WalletIndex whose ids span all wallets seen in
+            ``cleaned_tables``.
+        """
         idx = cls()
         for df in cleaned_tables:
             for w in df[wallet_col].tolist():
@@ -77,6 +108,7 @@ class WalletIndex:
 
 # ---------------- ProcessedMarket ----------------
 
+
 @dataclass
 class ProcessedMarket:
     """Real-data analog of `SyntheticMarket` minus the ground-truth latents.
@@ -84,17 +116,18 @@ class ProcessedMarket:
     Carries both the inference-ready arrays (Y, delta, log_size_ratio,
     wallet_ids) and the raw columns kept for analysis/plotting.
     """
+
     # Inference inputs (consumed by MarketData)
-    Y: np.ndarray              # (T,) logit(p_i)
-    delta: np.ndarray          # (T,) inter-trade times in seconds; delta[0] = 0
-    log_size_ratio: np.ndarray # (T,) log(S_i / S_bar)
-    wallet_ids: np.ndarray     # (T,) integer global wallet ids
+    Y: np.ndarray  # (T,) logit(p_i)
+    delta: np.ndarray  # (T,) inter-trade times in seconds; delta[0] = 0
+    log_size_ratio: np.ndarray  # (T,) log(S_i / S_bar)
+    wallet_ids: np.ndarray  # (T,) integer global wallet ids
 
     # Raw retained for plots / sanity checks
-    t: np.ndarray              # (T,) unix timestamps (seconds)
-    p: np.ndarray              # (T,) raw trade prices
-    S: np.ndarray              # (T,) raw trade sizes (USDC)
-    S_bar: float               # within-market mean size
+    t: np.ndarray  # (T,) unix timestamps (seconds)
+    p: np.ndarray  # (T,) raw trade prices
+    S: np.ndarray  # (T,) raw trade sizes (USDC)
+    S_bar: float  # within-market mean size
 
     # Metadata
     condition_id: str
@@ -102,9 +135,11 @@ class ProcessedMarket:
 
     @property
     def T(self) -> int:
+        """Number of trades in this market."""
         return len(self.Y)
 
     def to_market_data(self) -> MarketData:
+        """Return the slim MarketData view consumed by the PG/iPMCMC samplers."""
         return MarketData(
             Y=self.Y,
             delta=self.delta,
@@ -115,8 +150,20 @@ class ProcessedMarket:
 
 # ---------------- Cleaning ----------------
 
+
 def trades_to_dataframe(trades: list[RawTrade]) -> pd.DataFrame:
-    """Flat DataFrame for one market's trades; no filtering applied."""
+    """Convert a list of RawTrade objects to a flat DataFrame.
+
+    No cleaning or filtering is applied; every field of each trade
+    becomes a column. Pass the result to ``clean_trades`` before use.
+
+    Args:
+        trades: Raw trades for one market as returned by the API.
+
+    Returns:
+        DataFrame with columns: timestamp, price, size, wallet, side,
+        transaction_hash, condition_id, asset_id.
+    """
     return pd.DataFrame(
         {
             "timestamp": [t.timestamp for t in trades],
@@ -142,6 +189,14 @@ def clean_trades(df: pd.DataFrame) -> pd.DataFrame:
     Sorts by (timestamp asc, transaction_hash asc) — hash breaks same-second
     ties deterministically. Drops exact duplicates on transaction_hash since
     the Data API occasionally double-counts a fill across pages.
+
+    Args:
+        df: Raw trade DataFrame as produced by ``trades_to_dataframe``.
+
+    Returns:
+        Cleaned copy with invalid rows removed, transaction_hash duplicates
+        de-duplicated, and rows sorted by (timestamp, transaction_hash).
+        Returns an empty DataFrame (columns preserved) when ``df`` is empty.
     """
     if df.empty:
         return df.copy()
@@ -162,11 +217,25 @@ def clean_trades(df: pd.DataFrame) -> pd.DataFrame:
 
 # ---------------- Feature computation ----------------
 
+
 def compute_features(df: pd.DataFrame) -> dict[str, np.ndarray | float]:
     """Compute the per-trade features the SSM consumes.
 
-    Returns a dict with keys: Y, delta, log_size_ratio, t, p, S, S_bar.
-    Caller is responsible for stamping on wallet_ids and metadata.
+    Derives Δ_i (inter-trade time), log(S_i / S̄), and Y_i = logit(p_i)
+    from a cleaned, sorted trade table. ``delta[0]`` is set to 0 by
+    convention (no predecessor for the first trade). Caller is responsible
+    for stamping on wallet_ids and metadata.
+
+    Args:
+        df: Cleaned and sorted trade DataFrame; must be non-empty and
+            contain columns timestamp, price, size.
+
+    Returns:
+        Dict with keys Y, delta, log_size_ratio, t, p, S (each an array
+        of shape ``(T,)``), and S_bar (scalar float mean trade size).
+
+    Raises:
+        ValueError: If ``df`` is empty.
     """
     if df.empty:
         raise ValueError("compute_features: cannot operate on an empty trade table.")
@@ -177,7 +246,7 @@ def compute_features(df: pd.DataFrame) -> dict[str, np.ndarray | float]:
 
     delta = np.zeros_like(t)
     delta[1:] = np.diff(t)
-    delta = np.maximum(delta, 0.0)   # mergesort is stable; ties → 0 by design
+    delta = np.maximum(delta, 0.0)  # mergesort is stable; ties → 0 by design
 
     S_bar = float(S.mean())
     log_size_ratio = np.log(S / S_bar)
@@ -201,11 +270,24 @@ def build_processed_market(
     wallet_index: WalletIndex,
     slug: str = "",
 ) -> ProcessedMarket:
-    """End-to-end: list[RawTrade] → cleaned DataFrame → ProcessedMarket.
+    """Build a ProcessedMarket end-to-end from a list of raw trades.
 
-    Mutates `wallet_index` in place if new wallets appear. Inherits
-    `condition_id` from the first trade in the cleaned table (sanity-checked
-    to be uniform across the input).
+    Mutates ``wallet_index`` in place when new wallets appear. Inherits
+    ``condition_id`` from the cleaned table and asserts it is uniform
+    across all trades.
+
+    Args:
+        trades: Raw trades for a single market.
+        wallet_index: Shared global index; updated in place with any
+            new wallet addresses found in this market.
+        slug: Human-readable market identifier stored in the result.
+
+    Returns:
+        ProcessedMarket ready for inference and plotting.
+
+    Raises:
+        ValueError: If no trades survive cleaning, or if the trades
+            span more than one condition_id.
     """
     df = clean_trades(trades_to_dataframe(trades))
     if df.empty:
@@ -213,9 +295,7 @@ def build_processed_market(
 
     cids = df["condition_id"].unique()
     if len(cids) != 1:
-        raise ValueError(
-            f"All trades must share one condition_id; got {cids.tolist()}"
-        )
+        raise ValueError(f"All trades must share one condition_id; got {cids.tolist()}")
 
     feats = compute_features(df)
     wallet_ids = wallet_index.encode(df["wallet"].tolist())
@@ -263,9 +343,7 @@ def build_genre_dataset(
         wallet_ids = wallet_index.encode(df["wallet"].tolist())
         cids = df["condition_id"].unique()
         if len(cids) != 1:
-            raise ValueError(
-                f"market {slug!r}: mixed condition_ids {cids.tolist()}"
-            )
+            raise ValueError(f"market {slug!r}: mixed condition_ids {cids.tolist()}")
         out.append(
             ProcessedMarket(
                 Y=feats["Y"],
@@ -285,6 +363,7 @@ def build_genre_dataset(
 
 # ---------------- Persistence ----------------
 
+
 def save_processed(
     market: ProcessedMarket,
     directory: str | Path,
@@ -293,7 +372,20 @@ def save_processed(
 ) -> Path:
     """Persist one ProcessedMarket as Parquet (columns) + JSON (scalars).
 
-    Returns the Parquet path written.
+    Writes two files under ``directory``:
+      * ``<stem>.parquet`` — per-trade columns (Y, delta, log_size_ratio,
+        wallet_ids, t, p, S).
+      * ``<stem>.meta.json`` — scalar metadata (S_bar, condition_id, slug).
+
+    Args:
+        market: Processed market to persist.
+        directory: Destination directory; created (including parents) if
+            it does not exist.
+        name: File stem override; defaults to ``market.slug`` or
+            ``market.condition_id`` when not provided.
+
+    Returns:
+        Path of the Parquet file written.
     """
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
@@ -326,7 +418,16 @@ def save_processed(
 
 
 def save_wallet_index(index: WalletIndex, path: str | Path) -> Path:
-    """Persist a wallet index as a JSON {address: id, ...} mapping."""
+    """Persist a wallet index as a JSON ``{address: id, …}`` mapping.
+
+    Args:
+        index: WalletIndex to serialise.
+        path: Destination file path; parent directories are created if
+            they do not exist.
+
+    Returns:
+        Resolved Path of the JSON file written.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(index.address_to_id))
@@ -334,13 +435,32 @@ def save_wallet_index(index: WalletIndex, path: str | Path) -> Path:
 
 
 def load_wallet_index(path: str | Path) -> WalletIndex:
-    """Inverse of `save_wallet_index`."""
+    """Load a WalletIndex previously saved with ``save_wallet_index``.
+
+    Args:
+        path: Path to the JSON file produced by ``save_wallet_index``.
+
+    Returns:
+        WalletIndex with the original address-to-id mapping restored.
+    """
     data = json.loads(Path(path).read_text())
     return WalletIndex(address_to_id={str(a): int(i) for a, i in data.items()})
 
 
 def load_processed(parquet_path: str | Path) -> ProcessedMarket:
-    """Inverse of `save_processed`. Reads `<stem>.parquet` + `<stem>.meta.json`."""
+    """Load a ProcessedMarket previously saved with ``save_processed``.
+
+    Reads ``<stem>.parquet`` for per-trade arrays and the sidecar
+    ``<stem>.meta.json`` for scalar metadata. The meta path is derived
+    from ``parquet_path`` by replacing the ``.parquet`` suffix.
+
+    Args:
+        parquet_path: Path to the Parquet file written by
+            ``save_processed``.
+
+    Returns:
+        ProcessedMarket with all fields restored from disk.
+    """
     parquet_path = Path(parquet_path)
     meta_path = parquet_path.with_suffix(".meta.json")
     df = pd.read_parquet(parquet_path)

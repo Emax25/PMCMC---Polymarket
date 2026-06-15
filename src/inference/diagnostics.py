@@ -10,6 +10,7 @@ Sample arrays are stored in `(n_iter, n_chains, *extra)` order throughout
 the codebase. `arviz` expects `(chain, draw, *extra)`, so we swap the
 leading two axes inside each wrapper.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -21,20 +22,26 @@ from src.inference.ipmcmc import iPMCMCOutput
 from src.inference.smc import SMCOutput
 
 PHI_PARAM_NAMES = (
-    "sigma2_0", "sigma2_1",
-    "q_01", "q_10",
-    "beta_S", "beta_Z",
-    "tau2_0", "tau2_1",
+    "sigma2_0",
+    "sigma2_1",
+    "q_01",
+    "q_10",
+    "beta_S",
+    "beta_Z",
+    "tau2_0",
+    "tau2_1",
 )
 
 RHAT_FLAG_THRESHOLD = 1.01
-PARTICLE_ESS_FRACTION = 0.25     # threshold = N/4 (decision #13)
-DEGENERACY_FLAG_RATE = 0.10      # >10% steps below threshold flags the market
+PARTICLE_ESS_FRACTION = 0.25  # threshold = N/4 (decision #13)
+DEGENERACY_FLAG_RATE = 0.10  # >10% steps below threshold flags the market
 
 
 # ---------------- Building blocks ----------------
 
+
 def _ensure_2d_or_more(samples: np.ndarray) -> np.ndarray:
+    """Validate that diagnostics input has at least draw and chain axes."""
     samples = np.asarray(samples)
     if samples.ndim < 2:
         raise ValueError(
@@ -49,6 +56,13 @@ def compute_rhat(samples: np.ndarray) -> np.ndarray | float:
     Returns a scalar if `samples` is 2D, an ndarray shaped like `extra`
     otherwise. With fewer than two chains, returns NaN(s) — R-hat requires
     multiple chains by construction.
+
+    Args:
+        samples: Array shaped `(n_iter, n_chains, *extra)`.
+
+    Returns:
+        Rank-normalized R-hat as a scalar (`samples.ndim == 2`) or an array
+        over `extra` dimensions.
     """
     samples = _ensure_2d_or_more(samples)
     extra_shape = samples.shape[2:]
@@ -69,6 +83,13 @@ def compute_ess(samples: np.ndarray) -> np.ndarray | float:
 
     Single-chain inputs are supported (arviz computes autocorrelation-based
     ESS within a single chain).
+
+    Args:
+        samples: Array shaped `(n_iter, n_chains, *extra)` or `(n_iter,)`.
+
+    Returns:
+        Bulk ESS as a scalar (`samples.ndim == 1 or 2`) or an array over
+        `extra` dimensions.
     """
     samples = np.asarray(samples)
     if samples.ndim == 1:
@@ -96,6 +117,14 @@ def particle_degeneracy_rate(
     Accepts a (T,) ESS-per-step vector from a single SMC pass, or any
     multi-dim aggregation across iterations / chains — every entry counts
     equally.
+
+    Args:
+        ess: Effective sample size values to evaluate.
+        N: Number of particles used in the SMC pass.
+        threshold_fraction: ESS threshold as a fraction of `N`.
+
+    Returns:
+        Fraction of ESS entries below the threshold.
     """
     ess = np.asarray(ess)
     threshold = threshold_fraction * N
@@ -108,22 +137,45 @@ def smc_particle_degeneracy(
     *,
     threshold_fraction: float = PARTICLE_ESS_FRACTION,
 ) -> float:
-    """Convenience wrapper: particle-degeneracy rate for one SMC pass."""
+    """Compute particle-degeneracy rate for one SMC output.
+
+    Args:
+        out: One SMC pass output with per-step ESS values.
+        N: Number of particles used in that pass.
+        threshold_fraction: ESS threshold as a fraction of `N`.
+
+    Returns:
+        Fraction of steps whose particle ESS is below the threshold.
+    """
     return particle_degeneracy_rate(
-        out.ess_per_step, N, threshold_fraction=threshold_fraction,
+        out.ess_per_step,
+        N,
+        threshold_fraction=threshold_fraction,
     )
 
 
 # ---------------- iPMCMC report ----------------
 
+
 @dataclass
 class iPMCMCDiagnostics:
-    """Convergence summary for an iPMCMCOutput (post-burn-in)."""
-    rhat: dict[str, float]              # R-hat per phi component
-    ess_bulk: dict[str, float]          # bulk ESS per phi component
-    rhat_max: float                     # worst R-hat across phi
-    ess_bulk_min: float                 # headline min ESS (decision #13)
-    rhat_flagged: list[str]             # phi components with R-hat > 1.01
+    """Convergence summary for post-burn-in iPMCMC chains.
+
+    Attributes:
+        rhat: R-hat by phi parameter name.
+        ess_bulk: Bulk ESS by phi parameter name.
+        rhat_max: Worst finite phi R-hat.
+        ess_bulk_min: Minimum phi bulk ESS.
+        rhat_flagged: Phi names with R-hat above `RHAT_FLAG_THRESHOLD`.
+        rhat_theta_w_max: Worst finite R-hat across wallets in `theta_w`.
+        ess_bulk_theta_w_min: Minimum bulk ESS across wallets in `theta_w`.
+    """
+
+    rhat: dict[str, float]  # R-hat per phi component
+    ess_bulk: dict[str, float]  # bulk ESS per phi component
+    rhat_max: float  # worst R-hat across phi
+    ess_bulk_min: float  # headline min ESS (decision #13)
+    rhat_flagged: list[str]  # phi components with R-hat > 1.01
     # θ_w aggregated across wallets
     rhat_theta_w_max: float
     ess_bulk_theta_w_min: float
@@ -133,12 +185,19 @@ def diagnose_ipmcmc(
     output: iPMCMCOutput,
     n_burnin: int = 0,
 ) -> iPMCMCDiagnostics:
-    """Compute R-hat and bulk ESS across the P conditional chains of an
-    iPMCMC run, after dropping `n_burnin` iterations."""
+    """Compute convergence diagnostics across iPMCMC conditional slots.
+
+    Args:
+        output: iPMCMC samples and diagnostics for one run.
+        n_burnin: Number of initial iterations to discard.
+
+    Returns:
+        Convergence summary over phi and theta_w chains after burn-in removal.
+    """
     rhat: dict[str, float] = {}
     ess_bulk: dict[str, float] = {}
     for name in PHI_PARAM_NAMES:
-        samples = getattr(output, name)[n_burnin:]   # (n_iter, P)
+        samples = getattr(output, name)[n_burnin:]  # (n_iter, P)
         rhat[name] = float(compute_rhat(samples))
         ess_bulk[name] = float(compute_ess(samples))
 
@@ -146,19 +205,20 @@ def diagnose_ipmcmc(
     rhat_max = float(max(finite_rhats)) if finite_rhats else float("nan")
     ess_bulk_min = float(min(ess_bulk.values()))
     rhat_flagged = sorted(
-        k for k, v in rhat.items()
-        if np.isfinite(v) and v > RHAT_FLAG_THRESHOLD
+        k for k, v in rhat.items() if np.isfinite(v) and v > RHAT_FLAG_THRESHOLD
     )
 
-    theta = output.theta_w[n_burnin:]               # (n_iter, P, n_wallets)
+    theta = output.theta_w[n_burnin:]  # (n_iter, P, n_wallets)
     rhat_theta = compute_rhat(theta)
     ess_theta = compute_ess(theta)
     rhat_theta_w_max = float(np.nanmax(rhat_theta))
     ess_bulk_theta_w_min = float(np.nanmin(ess_theta))
 
     return iPMCMCDiagnostics(
-        rhat=rhat, ess_bulk=ess_bulk,
-        rhat_max=rhat_max, ess_bulk_min=ess_bulk_min,
+        rhat=rhat,
+        ess_bulk=ess_bulk,
+        rhat_max=rhat_max,
+        ess_bulk_min=ess_bulk_min,
         rhat_flagged=rhat_flagged,
         rhat_theta_w_max=rhat_theta_w_max,
         ess_bulk_theta_w_min=ess_bulk_theta_w_min,

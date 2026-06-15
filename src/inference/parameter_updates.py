@@ -16,6 +16,7 @@ is uniform, and the log-normal proposal's Jacobian τ*/τ exactly cancels the
 prior ratio, leaving the acceptance probability equal to the bare likelihood
 ratio.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
@@ -28,7 +29,18 @@ from src.utils.transforms import log1pexp, logit
 
 @dataclass
 class MarketLatents:
-    """One market's observations plus the current sampled latent state."""
+    """One market's observations plus current sampled latent trajectories.
+
+    Attributes:
+        Y: Logit-transformed prices in time order.
+        delta: Inter-trade seconds with `delta[0] == 0`.
+        log_size_ratio: Per-trade `log(S / S_bar)` feature.
+        wallet_ids: Integer wallet index per trade.
+        X: Current sampled latent logit-price path.
+        V: Current sampled regime path (`0` calm, `1` news).
+        Z: Current sampled insider-indicator path.
+    """
+
     Y: np.ndarray
     delta: np.ndarray
     log_size_ratio: np.ndarray
@@ -39,6 +51,7 @@ class MarketLatents:
 
 
 # ---------------- Conjugate updates ----------------
+
 
 def update_sigma2(
     markets: list[MarketLatents],
@@ -58,13 +71,22 @@ def update_sigma2(
     model says X_i = X_{i-1} deterministically there, so they carry no
     information about σ² — and the division by zero would otherwise corrupt
     the posterior.
+
+    Args:
+        markets: Per-market observations and current latent trajectories.
+        rng: Source of randomness for posterior draws.
+        alpha_prior: Inverse-Gamma shape hyperparameter.
+        beta_prior: Inverse-Gamma scale hyperparameter.
+
+    Returns:
+        Posterior draw `(sigma2_0, sigma2_1)`.
     """
     N_v = np.zeros(2, dtype=int)
     SS_v = np.zeros(2)
     for m in markets:
-        dX = np.diff(m.X)                  # X_i - X_{i-1}, i = 1..T-1
-        dT = m.delta[1:]                   # Δ_i, i = 1..T-1
-        V_i = m.V[1:]                       # regime at the destination step
+        dX = np.diff(m.X)  # X_i - X_{i-1}, i = 1..T-1
+        dT = m.delta[1:]  # Δ_i, i = 1..T-1
+        V_i = m.V[1:]  # regime at the destination step
         valid = dT > 0
         for v in (0, 1):
             mask = (V_i == v) & valid
@@ -90,6 +112,15 @@ def update_q(
 
     q_01 | . ~ Beta(a_prior + n_01, b_prior + n_00)
     q_10 | . ~ Beta(a_prior + n_10, b_prior + n_11)
+
+    Args:
+        markets: Per-market latent regime trajectories.
+        rng: Source of randomness for posterior draws.
+        a_prior: Beta prior alpha hyperparameter.
+        b_prior: Beta prior beta hyperparameter.
+
+    Returns:
+        Posterior draw `(q_01, q_10)`.
     """
     n_00 = n_01 = n_10 = n_11 = 0
     for m in markets:
@@ -117,6 +148,16 @@ def update_theta_w(
     Treats Z_i | theta_{w_i} as Bernoulli(theta_{w_i}) — exact at β=0 and a
     documented approximation otherwise. Z counts are pooled across markets
     (decision #8). Index i=0 is excluded since Z_0 := 0 is deterministic.
+
+    Args:
+        markets: Per-market latent trajectories with wallet assignments.
+        n_wallets: Total number of wallet indices.
+        a: Beta prior alpha hyperparameter.
+        b: Beta prior beta hyperparameter.
+        rng: Source of randomness for posterior draws.
+
+    Returns:
+        Posterior draw for all wallet propensities, shape `(n_wallets,)`.
     """
     z_count = np.zeros(n_wallets)
     n_count = np.zeros(n_wallets)
@@ -131,6 +172,7 @@ def update_theta_w(
 
 # ---------------- MH updates ----------------
 
+
 def _log_lik_Z(
     Z: np.ndarray,
     wallet_ids: np.ndarray,
@@ -139,7 +181,7 @@ def _log_lik_Z(
     beta_S: float,
     beta_Z: float,
 ) -> float:
-    """Σ_{i>=1} log Bernoulli(Z_i | sigmoid(logit θ_{w_i} + β_S log(S/S̄) + β_Z 1{Z_{i-1}=1}))."""
+    """Return Z-log-likelihood under the current logistic insider model."""
     Z_prev = Z[:-1]
     Z_curr = Z[1:].astype(float)
     logit_pi = (
@@ -164,6 +206,18 @@ def update_beta(
     """Independent random-walk MH on β_S, then β_Z (decision #11).
 
     Prior: N(0, prior_sd²) on each; symmetric Gaussian proposal so the q-ratio cancels.
+
+    Args:
+        beta_S: Current value of the size effect coefficient.
+        beta_Z: Current value of the persistence effect coefficient.
+        markets: Per-market latent trajectories and features.
+        theta_w: Current wallet insider propensities.
+        config: Inference settings with MH proposal step sizes.
+        rng: Source of randomness for propose-accept draws.
+        prior_sd: Standard deviation of the independent Gaussian priors.
+
+    Returns:
+        Tuple `(beta_S_new, beta_Z_new, acc_beta_S, acc_beta_Z)`.
     """
     logit_theta = logit(theta_w)
 
@@ -223,11 +277,22 @@ def update_tau2(
     Proposal: τ²* = τ² · exp(ε), ε ~ N(0, step²). Under p(τ²) ∝ 1/τ², the
     log-prior ratio -ε exactly cancels the log-normal Jacobian +ε, so the
     acceptance ratio is the bare likelihood ratio.
+
+    Args:
+        tau2_0: Current observation variance for `Z=0`.
+        tau2_1: Current observation variance for `Z=1`.
+        markets: Per-market latent trajectories and observations.
+        gamma: Fixed heteroskedasticity coefficient in the observation model.
+        config: Inference settings with log-scale MH proposal step sizes.
+        rng: Source of randomness for propose-accept draws.
+
+    Returns:
+        Tuple `(tau2_0_new, tau2_1_new, acc_tau2_0, acc_tau2_1)`.
     """
+
     def log_lik(t0: float, t1: float) -> float:
         return sum(
-            _log_lik_Y(m.Y, m.X, m.Z, m.log_size_ratio, t0, t1, gamma)
-            for m in markets
+            _log_lik_Y(m.Y, m.X, m.Z, m.log_size_ratio, t0, t1, gamma) for m in markets
         )
 
     log_lik_cur = log_lik(tau2_0, tau2_1)
@@ -250,11 +315,51 @@ def update_tau2(
     return tau2_0, tau2_1, acc_0, acc_1
 
 
+def adapt_mh_step(
+    config: InferenceConfig,
+    attr: str,
+    rate: float,
+    *,
+    lo: float = 0.23,
+    hi: float = 0.44,
+    factor: float = 1.2,
+) -> None:
+    """Nudge one MH proposal step size toward a target acceptance band.
+
+    Mutates ``config`` in place by scaling one named ``mh_step_*`` attribute.
+    Acceptance rates above ``hi`` increase the step size; rates below ``lo``
+    decrease it. The default 0.23-0.44 band matches the repository's
+    burn-in adaptation policy for random-walk MH blocks.
+
+    Args:
+        config: Inference configuration object whose step-size attribute is updated.
+        attr: Name of the ``config`` attribute to adjust.
+        rate: Recent acceptance rate used for adaptation.
+        lo: Lower target acceptance threshold.
+        hi: Upper target acceptance threshold.
+        factor: Multiplicative adjustment applied when outside ``[lo, hi]``.
+    """
+    step = getattr(config, attr)
+    if rate > hi:
+        setattr(config, attr, step * factor)
+    elif rate < lo:
+        setattr(config, attr, step / factor)
+
+
 # ---------------- Orchestrator ----------------
+
 
 @dataclass
 class GibbsSweepDiag:
-    """Acceptance flags from one Gibbs sweep."""
+    """Acceptance diagnostics for one Gibbs sweep.
+
+    Attributes:
+        acc_beta_S: Whether the β_S MH proposal was accepted.
+        acc_beta_Z: Whether the β_Z MH proposal was accepted.
+        acc_tau2_0: Whether the τ²_0 MH proposal was accepted.
+        acc_tau2_1: Whether the τ²_1 MH proposal was accepted.
+    """
+
     acc_beta_S: bool
     acc_beta_Z: bool
     acc_tau2_0: bool
@@ -276,6 +381,16 @@ def gibbs_sweep(
         3. θ_w            — Beta-Bernoulli (pooled across markets)
         4. (β_S, β_Z)     — Gaussian random-walk MH, conditioning on θ_w_new
         5. (τ²_0, τ²_1)   — log-normal MH with Jeffreys prior
+
+    Args:
+        params: Current model parameter block.
+        theta_w: Current wallet-level insider propensities.
+        markets: Per-market observations and sampled latent trajectories.
+        config: Inference settings including MH proposal step sizes.
+        rng: Source of randomness for all Gibbs and MH draws.
+
+    Returns:
+        Updated `(params, theta_w, diagnostics)` for this sweep.
     """
     n_wallets = len(theta_w)
 
@@ -283,21 +398,37 @@ def gibbs_sweep(
     q_01, q_10 = update_q(markets, rng)
     theta_w_new = update_theta_w(markets, n_wallets, params.a, params.b, rng)
     beta_S_new, beta_Z_new, acc_S, acc_Z = update_beta(
-        params.beta_S, params.beta_Z, markets, theta_w_new, config, rng,
+        params.beta_S,
+        params.beta_Z,
+        markets,
+        theta_w_new,
+        config,
+        rng,
     )
     tau2_0_new, tau2_1_new, acc_t0, acc_t1 = update_tau2(
-        params.tau2_0, params.tau2_1, markets, params.gamma, config, rng,
+        params.tau2_0,
+        params.tau2_1,
+        markets,
+        params.gamma,
+        config,
+        rng,
     )
 
     new_params = replace(
         params,
-        sigma2_0=sigma2_0, sigma2_1=sigma2_1,
-        q_01=q_01, q_10=q_10,
-        beta_S=beta_S_new, beta_Z=beta_Z_new,
-        tau2_0=tau2_0_new, tau2_1=tau2_1_new,
+        sigma2_0=sigma2_0,
+        sigma2_1=sigma2_1,
+        q_01=q_01,
+        q_10=q_10,
+        beta_S=beta_S_new,
+        beta_Z=beta_Z_new,
+        tau2_0=tau2_0_new,
+        tau2_1=tau2_1_new,
     )
     diag = GibbsSweepDiag(
-        acc_beta_S=acc_S, acc_beta_Z=acc_Z,
-        acc_tau2_0=acc_t0, acc_tau2_1=acc_t1,
+        acc_beta_S=acc_S,
+        acc_beta_Z=acc_Z,
+        acc_tau2_0=acc_t0,
+        acc_tau2_1=acc_t1,
     )
     return new_params, theta_w_new, diag

@@ -1,3 +1,15 @@
+"""Synthetic data generator for PMCMC validation experiments.
+
+Simulates the full latent-variable model (§5): a regime-switching Gaussian
+random walk for log-odds price X, a logistic insider indicator Z driven by
+per-wallet propensities θ_w, and a heteroskedastic observation model whose
+variance is scaled by trade size.
+
+``SyntheticMarket`` (returned by ``generate_market``) mirrors the
+``ProcessedMarket`` interface so that all downstream inference and plotting
+code works unchanged on both real and synthetic data.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -10,22 +22,28 @@ from src.utils.transforms import logit, sigmoid
 
 @dataclass
 class SyntheticMarket:
+    """One simulated market with ground-truth latents and observations.
+
+    All arrays are length T (number of trades). Ground-truth latents (X, V,
+    Z, theta_w) are only available here — they have no analog for real data.
+    """
+
     # Ground-truth latent variables (available only in synthetic experiments)
-    X: np.ndarray          # (T,) logit of true public-info probability
-    V: np.ndarray          # (T,) int8 volatility regime {0, 1}
-    Z: np.ndarray          # (T,) int8 insider indicator {0, 1}
-    theta_w: np.ndarray    # (n_wallets,) true wallet propensities
+    X: np.ndarray  # (T,) logit of true public-info probability
+    V: np.ndarray  # (T,) int8 volatility regime {0, 1}
+    Z: np.ndarray  # (T,) int8 insider indicator {0, 1}
+    theta_w: np.ndarray  # (n_wallets,) true wallet propensities
 
     # Observations
-    Y: np.ndarray          # (T,) logit-price observations
-    p: np.ndarray          # (T,) trade prices = sigmoid(Y)
-    S: np.ndarray          # (T,) trade sizes in USDC
-    S_bar: float           # within-market mean size (used to normalise log-size ratios)
+    Y: np.ndarray  # (T,) logit-price observations
+    p: np.ndarray  # (T,) trade prices = sigmoid(Y)
+    S: np.ndarray  # (T,) trade sizes in USDC
+    S_bar: float  # within-market mean size (used to normalise log-size ratios)
 
     # Trade metadata
-    t: np.ndarray          # (T,) trade timestamps in seconds
-    delta: np.ndarray      # (T,) inter-trade times; delta[0] = 0 (sentinel)
-    wallet_ids: np.ndarray # (T,) integer wallet index for each trade
+    t: np.ndarray  # (T,) trade timestamps in seconds
+    delta: np.ndarray  # (T,) inter-trade times; delta[0] = 0 (sentinel)
+    wallet_ids: np.ndarray  # (T,) integer wallet index for each trade
 
     # Which wallet indices were injected as insiders
     insider_wallet_ids: list[int]
@@ -38,10 +56,32 @@ def generate_market(
     n_wallets: int = 50,
     n_insider_wallets: int = 5,
     mean_inter_trade_time: float = 300.0,  # seconds; Exponential rate
-    log_size_mean: float = 4.0,            # log-USDC; mean size ~ $55
+    log_size_mean: float = 4.0,  # log-USDC; mean size ~ $55
     log_size_std: float = 1.5,
     rng: np.random.Generator,
 ) -> SyntheticMarket:
+    """Draw one synthetic market from the generative model (§5).
+
+    Simulates in sequence: wallet propensities θ_w, trade timestamps, trade
+    sizes, wallet assignments, the latent state path (V, X, Z), and finally
+    noisy logit-price observations Y. RNG calls are made in this fixed order
+    — reordering them changes the realization even with the same seed.
+
+    Args:
+        params: Model hyperparameters; all variance fields must be non-NaN.
+        n_trades: Number of trades T to simulate.
+        n_wallets: Total number of wallets in the market.
+        n_insider_wallets: Wallets [0, n_insider_wallets) are forced to high
+            propensity via Beta(9, 1) (mean 0.9).
+        mean_inter_trade_time: Mean of the Exponential inter-trade gap in
+            seconds (delta[1:] ~ Exp(1/mean_inter_trade_time)).
+        log_size_mean: Mean of the log-normal trade size distribution (log-USDC).
+        log_size_std: Std dev of the log-normal trade size distribution.
+        rng: Random generator; passed explicitly so callers control the seed.
+
+    Returns:
+        SyntheticMarket with ground-truth latents and noisy observations.
+    """
     T = n_trades
 
     # --- Wallet propensities ---
@@ -102,16 +142,25 @@ def generate_market(
 
     # --- Observation model ---
     tau2_Z = np.where(Z == 0, params.tau2_0, params.tau2_1)
-    # Floor denominator to avoid near-zero or negative variance for tiny trades
+    # Floor denominator to avoid near-zero or negative variance for tiny trades.
+    # Mirrors kalman._DENOM_FLOOR = 0.1 so synthetic and real paths are consistent.
     denom = np.maximum(1.0 + params.gamma * log_size_ratio, 0.1)
     obs_std = np.sqrt(tau2_Z / denom)
     Y = rng.normal(X, obs_std)
     p = sigmoid(Y)
 
     return SyntheticMarket(
-        X=X, V=V, Z=Z, theta_w=theta_w,
-        Y=Y, p=p, S=S, S_bar=S_bar,
-        t=t, delta=delta, wallet_ids=wallet_ids,
+        X=X,
+        V=V,
+        Z=Z,
+        theta_w=theta_w,
+        Y=Y,
+        p=p,
+        S=S,
+        S_bar=S_bar,
+        t=t,
+        delta=delta,
+        wallet_ids=wallet_ids,
         insider_wallet_ids=insider_wallet_ids,
     )
 
@@ -123,7 +172,17 @@ def generate_dataset(
     rng: np.random.Generator,
     **market_kwargs,
 ) -> list[SyntheticMarket]:
-    return [
-        generate_market(params, rng=rng, **market_kwargs)
-        for _ in range(n_markets)
-    ]
+    """Draw K independent synthetic markets sharing one RNG stream.
+
+    Args:
+        params: Model hyperparameters forwarded to each ``generate_market`` call.
+        n_markets: Number of markets K to simulate.
+        rng: Random generator; advanced sequentially across all K markets so
+            the seed controls the entire dataset.
+        **market_kwargs: Forwarded to ``generate_market`` (n_trades,
+            n_wallets, etc.).
+
+    Returns:
+        list of K SyntheticMarket objects in simulation order.
+    """
+    return [generate_market(params, rng=rng, **market_kwargs) for _ in range(n_markets)]

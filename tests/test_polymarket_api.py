@@ -3,6 +3,7 @@
 All HTTP is mocked via `unittest.mock` so the suite never hits the network.
 Fixtures live under `tests/fixtures/`.
 """
+
 from __future__ import annotations
 
 import json
@@ -13,7 +14,6 @@ import pytest
 import requests
 
 from src.data.polymarket_api import (
-    DATA_BASE,
     GAMMA_BASE,
     POLITICS_KEYWORDS,
     MarketMeta,
@@ -28,11 +28,13 @@ from src.data.polymarket_api import (
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
-def _load(name: str):
+def _load(name: str) -> dict | list:
+    """Read and parse a JSON fixture file."""
     return json.loads((FIXTURES / name).read_text())
 
 
 def _mock_response(json_payload, status_code: int = 200):
+    """Build a minimal requests.Response mock with given payload and status."""
     resp = MagicMock(spec=requests.Response)
     resp.status_code = status_code
     resp.json.return_value = json_payload
@@ -42,37 +44,42 @@ def _mock_response(json_payload, status_code: int = 200):
 
 # ---------------- Dataclass parsing ----------------
 
+
 def test_market_meta_from_dict_minimal_fields():
-    m = MarketMeta.from_dict(
-        {"id": "1", "conditionId": "0xabc", "volume": "1000"}
-    )
+    """Defaults to closed=False and empty tags when absent."""
+    m = MarketMeta.from_dict({"id": "1", "conditionId": "0xabc", "volume": "1000"})
     assert m.id == "1"
     assert m.condition_id == "0xabc"
     assert m.volume == 1000.0
-    assert m.closed is False        # default when missing
+    assert m.closed is False  # default when missing
     assert m.tags == []
 
 
 def test_market_meta_from_dict_handles_snake_case_alias():
+    """snake_case key accepted as alias for camelCase."""
     m = MarketMeta.from_dict({"condition_id": "0xdef", "volume": 0})
     assert m.condition_id == "0xdef"
 
 
 def test_market_meta_from_dict_volume_none_safe():
+    """None volume coerces to 0.0."""
     m = MarketMeta.from_dict({"conditionId": "0x", "volume": None})
     assert m.volume == 0.0
 
 
 def test_extract_tags_string_form():
+    """List of strings returned as-is."""
     assert _extract_tags(["Politics", "Elections"]) == ["Politics", "Elections"]
 
 
 def test_extract_tags_object_form():
+    """Dict tags extracted from label, name, or slug key."""
     tags = [{"label": "Politics"}, {"name": "Crypto"}, {"slug": "world-cup"}]
     assert _extract_tags(tags) == ["Politics", "Crypto", "world-cup"]
 
 
 def test_extract_tags_mixed_and_missing():
+    """None, empty list, and mixed string/dict forms all handled."""
     assert _extract_tags(None) == []
     assert _extract_tags([]) == []
     assert _extract_tags(["Politics", {"label": "Elections"}]) == [
@@ -82,6 +89,7 @@ def test_extract_tags_mixed_and_missing():
 
 
 def test_raw_trade_from_dict_typed():
+    """camelCase fields parsed; side upper-cased, numeric types cast."""
     t = RawTrade.from_dict(
         {
             "proxyWallet": "0xWA",
@@ -95,14 +103,15 @@ def test_raw_trade_from_dict_typed():
         }
     )
     assert t.wallet == "0xWA"
-    assert t.side == "BUY"             # upper-cased
+    assert t.side == "BUY"  # upper-cased
     assert t.price == 0.42
     assert t.size == 250.5
-    assert t.timestamp == 1709000000   # cast to int
+    assert t.timestamp == 1709000000  # cast to int
     assert t.transaction_hash == "0xTX"
 
 
 def test_raw_trade_from_dict_snake_case_alias():
+    """snake_case aliases accepted for wallet and asset_id."""
     t = RawTrade.from_dict(
         {
             "wallet": "0xW",
@@ -121,7 +130,9 @@ def test_raw_trade_from_dict_snake_case_alias():
 
 # ---------------- fetch_markets ----------------
 
+
 def test_fetch_markets_filters_and_sorts():
+    """Low-volume and no-conditionId markets dropped; sorted by volume."""
     payload = _load("gamma_markets_sample.json")
     with patch("src.data.polymarket_api.requests.get") as g:
         g.return_value = _mock_response(payload)
@@ -142,16 +153,22 @@ def test_fetch_markets_filters_and_sorts():
 
 
 def test_fetch_markets_passes_correct_params():
+    """All kwargs serialised into correct query-param names."""
     payload = _load("gamma_markets_sample.json")
     with patch("src.data.polymarket_api.requests.get") as g:
         g.return_value = _mock_response(payload)
-        fetch_markets(tag="politics", closed=True, limit=50, offset=10,
-                      min_volume=10_000.0)
+        fetch_markets(
+            tag="politics", closed=True, limit=50, offset=10, min_volume=10_000.0
+        )
         url, kwargs = g.call_args[0][0], g.call_args[1]
     assert url == f"{GAMMA_BASE}/markets"
     assert kwargs["params"] == {
-        "limit": 50, "offset": 10, "tag_slug": "politics", "closed": "true",
-        "order": "volumeNum", "ascending": "false",
+        "limit": 50,
+        "offset": 10,
+        "tag_slug": "politics",
+        "closed": "true",
+        "order": "volumeNum",
+        "ascending": "false",
         "volume_num_min": 10_000.0,
     }
 
@@ -167,6 +184,7 @@ def test_fetch_markets_omits_volume_num_min_when_zero():
 
 
 def test_fetch_markets_order_params_can_be_disabled():
+    """order=None omits both order and ascending from params."""
     payload = _load("gamma_markets_sample.json")
     with patch("src.data.polymarket_api.requests.get") as g:
         g.return_value = _mock_response(payload)
@@ -176,6 +194,7 @@ def test_fetch_markets_order_params_can_be_disabled():
 
 
 def test_fetch_markets_ascending_flag_serializes():
+    """ascending=True serialises to string 'true'."""
     payload = _load("gamma_markets_sample.json")
     with patch("src.data.polymarket_api.requests.get") as g:
         g.return_value = _mock_response(payload)
@@ -192,7 +211,8 @@ def test_fetch_markets_question_keywords_filter():
         g.return_value = _mock_response(payload)
         # min_volume=0 so the keyword filter is the only thing trimming
         markets = fetch_markets(
-            min_volume=0.0, question_keywords=["election", "senate"],
+            min_volume=0.0,
+            question_keywords=["election", "senate"],
         )
     slugs = [m.slug for m in markets]
     assert "presidential-election-winner-2024" in slugs
@@ -201,11 +221,13 @@ def test_fetch_markets_question_keywords_filter():
 
 
 def test_fetch_markets_question_keywords_case_insensitive():
+    """Keyword filter is case-insensitive."""
     payload = _load("gamma_markets_sample.json")
     with patch("src.data.polymarket_api.requests.get") as g:
         g.return_value = _mock_response(payload)
         markets = fetch_markets(
-            min_volume=0.0, question_keywords=["ELECTION"],
+            min_volume=0.0,
+            question_keywords=["ELECTION"],
         )
     assert any("election" in m.question.lower() for m in markets)
     assert all("election" in m.question.lower() for m in markets)
@@ -218,15 +240,18 @@ def test_politics_keywords_constant_is_useful():
     with patch("src.data.polymarket_api.requests.get") as g:
         g.return_value = _mock_response(payload)
         markets = fetch_markets(
-            min_volume=0.0, question_keywords=list(POLITICS_KEYWORDS),
+            min_volume=0.0,
+            question_keywords=list(POLITICS_KEYWORDS),
         )
     slugs = {m.slug for m in markets}
     assert slugs == {
-        "presidential-election-winner-2024", "senate-control-2024",
+        "presidential-election-winner-2024",
+        "senate-control-2024",
     }
 
 
 def test_fetch_markets_raises_on_non_list_payload():
+    """Non-list API response raises PolymarketAPIError."""
     with patch("src.data.polymarket_api.requests.get") as g:
         g.return_value = _mock_response({"error": "bad request"})
         with pytest.raises(PolymarketAPIError):
@@ -235,9 +260,11 @@ def test_fetch_markets_raises_on_non_list_payload():
 
 # ---------------- fetch_trades ----------------
 
+
 def test_fetch_trades_paginates_until_short_page(monkeypatch):
-    page1 = _load("data_trades_page1.json")   # length 8
-    page2 = _load("data_trades_page2.json")   # length 2, signals end
+    """Pagination stops when a page shorter than page_size is returned."""
+    page1 = _load("data_trades_page1.json")  # length 8
+    page2 = _load("data_trades_page2.json")  # length 2, signals end
 
     seen_offsets: list[int] = []
 
@@ -257,12 +284,13 @@ def test_fetch_trades_paginates_until_short_page(monkeypatch):
         page_size=8,
     )
     assert len(trades) == 10
-    assert seen_offsets == [0, 8]                  # stopped at short page 2
+    assert seen_offsets == [0, 8]  # stopped at short page 2
     assert isinstance(trades[0], RawTrade)
     assert all(t.condition_id.startswith("0xaaa") for t in trades)
 
 
 def test_fetch_trades_empty_first_page(monkeypatch):
+    """Empty first page returns an empty list."""
     monkeypatch.setattr(
         "src.data.polymarket_api.requests.get",
         lambda *a, **k: _mock_response([]),
@@ -272,6 +300,7 @@ def test_fetch_trades_empty_first_page(monkeypatch):
 
 
 def test_fetch_trades_rejects_empty_condition_id():
+    """Empty condition_id raises ValueError immediately."""
     with pytest.raises(ValueError):
         fetch_trades("")
 
@@ -281,9 +310,14 @@ def test_fetch_trades_respects_max_offset(monkeypatch):
     caps historical offset at 3000)."""
     full_page = [
         {
-            "proxyWallet": "0xX", "side": "BUY", "asset": "1",
-            "conditionId": "0xabc", "size": "1", "price": "0.5",
-            "timestamp": "1", "transactionHash": "0xT" + str(i),
+            "proxyWallet": "0xX",
+            "side": "BUY",
+            "asset": "1",
+            "conditionId": "0xabc",
+            "size": "1",
+            "price": "0.5",
+            "timestamp": "1",
+            "transactionHash": "0xT" + str(i),
         }
         for i in range(500)
     ]
@@ -307,9 +341,14 @@ def test_fetch_trades_trims_final_page_at_offset_cap(monkeypatch):
     """Final page is shortened so total offset stays <= max_offset."""
     full_page = [
         {
-            "proxyWallet": "0xX", "side": "BUY", "asset": "1",
-            "conditionId": "0xabc", "size": "1", "price": "0.5",
-            "timestamp": "1", "transactionHash": "0xT" + str(i),
+            "proxyWallet": "0xX",
+            "side": "BUY",
+            "asset": "1",
+            "conditionId": "0xabc",
+            "size": "1",
+            "price": "0.5",
+            "timestamp": "1",
+            "transactionHash": "0xT" + str(i),
         }
         for i in range(500)
     ]
@@ -332,9 +371,14 @@ def test_fetch_trades_respects_max_pages(monkeypatch):
     """If the API never returns a short page, we stop at max_pages."""
     full_page = [
         {
-            "proxyWallet": "0xX", "side": "BUY", "asset": "1",
-            "conditionId": "0xabc", "size": "1", "price": "0.5",
-            "timestamp": "1", "transactionHash": "0xT" + str(i),
+            "proxyWallet": "0xX",
+            "side": "BUY",
+            "asset": "1",
+            "conditionId": "0xabc",
+            "size": "1",
+            "price": "0.5",
+            "timestamp": "1",
+            "transactionHash": "0xT" + str(i),
         }
         for i in range(2)
     ]
@@ -349,7 +393,9 @@ def test_fetch_trades_respects_max_pages(monkeypatch):
 
 # ---------------- HTTP error handling ----------------
 
+
 def test_get_json_raises_on_400():
+    """HTTP 400 raises PolymarketAPIError."""
     with patch("src.data.polymarket_api.requests.get") as g:
         g.return_value = _mock_response({"error": "bad"}, status_code=400)
         with pytest.raises(PolymarketAPIError):
@@ -357,6 +403,7 @@ def test_get_json_raises_on_400():
 
 
 def test_get_json_retries_on_429_then_succeeds(monkeypatch):
+    """429/503 retried with backoff; third attempt succeeds."""
     payload = _load("gamma_markets_sample.json")
     responses = [
         _mock_response({}, status_code=429),
@@ -374,24 +421,28 @@ def test_get_json_retries_on_429_then_succeeds(monkeypatch):
     )
     markets = fetch_markets(min_volume=10_000.0)
     assert len(markets) >= 1
-    assert len(sleeps) == 2          # one per retry, before the success
+    assert len(sleeps) == 2  # one per retry, before the success
     assert all(s > 0 for s in sleeps)
 
 
 def test_fetch_market_by_slug_events_fast_path(monkeypatch):
     """/events?slug=X returns the event; we pull its single market."""
-    event_payload = [{
-        "id": "11143",
-        "slug": "will-trump-launch-a-coin-before-the-election",
-        "markets": [{
-            "id": "540817",
+    event_payload = [
+        {
+            "id": "11143",
             "slug": "will-trump-launch-a-coin-before-the-election",
-            "conditionId": "0x70de1b06",
-            "question": "Will Trump launch a coin?",
-            "volume": 76_899_060,
-            "closed": True,
-        }],
-    }]
+            "markets": [
+                {
+                    "id": "540817",
+                    "slug": "will-trump-launch-a-coin-before-the-election",
+                    "conditionId": "0x70de1b06",
+                    "question": "Will Trump launch a coin?",
+                    "volume": 76_899_060,
+                    "closed": True,
+                }
+            ],
+        }
+    ]
     seen_urls: list[str] = []
 
     def fake_get(url, params=None, timeout=None):
@@ -413,8 +464,13 @@ def test_fetch_market_by_slug_falls_back_to_markets_scan(monkeypatch):
     target_slug = "will-donald-trump-win-the-2024-us-presidential-election"
     page = [
         {"id": "X", "slug": "decoy", "conditionId": "0x1", "volume": 1_500_000_000},
-        {"id": "Y", "slug": target_slug, "conditionId": "0xTRUMP24",
-         "volume": 1_500_000_000, "closed": True},
+        {
+            "id": "Y",
+            "slug": target_slug,
+            "conditionId": "0xTRUMP24",
+            "volume": 1_500_000_000,
+            "closed": True,
+        },
     ]
     calls: list[tuple[str, dict]] = []
 
@@ -434,6 +490,7 @@ def test_fetch_market_by_slug_falls_back_to_markets_scan(monkeypatch):
 
 
 def test_fetch_market_by_slug_raises_when_truly_missing(monkeypatch):
+    """PolymarketAPIError raised when slug absent from all pages."""
     monkeypatch.setattr(
         "src.data.polymarket_api.requests.get",
         lambda *a, **k: _mock_response([]),
@@ -443,6 +500,7 @@ def test_fetch_market_by_slug_raises_when_truly_missing(monkeypatch):
 
 
 def test_get_json_request_exception_retried(monkeypatch):
+    """ConnectionError retried; succeeds once resolved."""
     calls = {"n": 0}
 
     def fake_get(*a, **k):

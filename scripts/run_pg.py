@@ -15,6 +15,7 @@ Examples:
     # §9 synthetic validation (5 markets, T=200 each)
     python -m scripts.run_pg --synthetic --config dev
 """
+
 from __future__ import annotations
 
 import argparse
@@ -25,8 +26,11 @@ import time
 import numpy as np
 
 from scripts._runner import (
-    add_common_args, build_config, default_output_path,
-    load_inputs, pickle_run,
+    add_common_args,
+    build_config,
+    default_output_path,
+    load_inputs,
+    pickle_run,
 )
 from src.inference.particle_gibbs import particle_gibbs
 
@@ -34,16 +38,26 @@ log = logging.getLogger("run_pg")
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse CLI arguments for run_pg."""
     p = argparse.ArgumentParser(description="Run Particle Gibbs.")
     add_common_args(p)
     p.add_argument(
-        "--no-progress", action="store_true",
+        "--no-progress",
+        action="store_true",
         help="Suppress tqdm progress bar (CI / non-TTY).",
     )
     return p.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run Particle Gibbs and pickle the chain.
+
+    Args:
+        argv: Argument list passed to argparse; defaults to ``sys.argv[1:]``.
+
+    Returns:
+        Exit code (0 on success).
+    """
     args = _parse_args(argv)
     logging.basicConfig(
         level=args.log_level,
@@ -55,7 +69,11 @@ def main(argv: list[str] | None = None) -> int:
     inputs = load_inputs(args, seed_fallback=cfg.seed)
     log.info(
         "PG: K=%d markets, N=%d particles, n_iter=%d (burn-in %d), seed=%d",
-        len(inputs.markets), cfg.N, cfg.n_iter, cfg.n_burnin, cfg.seed,
+        len(inputs.markets),
+        cfg.N,
+        cfg.n_iter,
+        cfg.n_burnin,
+        cfg.seed,
     )
     for md in inputs.markets:
         log.info("  T=%-6d wallets=%d", md.T, int(md.wallet_ids.max()) + 1)
@@ -63,7 +81,8 @@ def main(argv: list[str] | None = None) -> int:
     t0 = time.monotonic()
     rng = np.random.default_rng(cfg.seed)
     chain = particle_gibbs(
-        inputs.markets, cfg,
+        inputs.markets,
+        cfg,
         rng=rng,
         n_wallets=inputs.wallet_index.n_wallets,
         progress=not args.no_progress,
@@ -72,7 +91,11 @@ def main(argv: list[str] | None = None) -> int:
 
     out_path = args.output or default_output_path("pg", args.config)
     pickle_run(
-        out_path, sampler="pg", config=cfg, chain=chain, inputs=inputs,
+        out_path,
+        sampler="pg",
+        config=cfg,
+        chain=chain,
+        inputs=inputs,
     )
     log.info("wrote %s", out_path)
     return 0

@@ -1,3 +1,7 @@
+"""Tests for src.inference.kalman: Kalman filter, variance helpers, and FFBS."""
+
+from __future__ import annotations
+
 import numpy as np
 import pytest
 
@@ -14,12 +18,14 @@ from src.inference.kalman import (
 
 @pytest.fixture
 def params():
+    """Warm-started ModelParams derived from a 200-step dummy series."""
     rng = np.random.default_rng(0)
     Y_dummy = rng.standard_normal(200)
     return ModelParams.warm_start(Y_dummy)
 
 
 def test_process_variance_regime_dependence(params):
+    """Q_i equals sigma2_v * delta for each regime v ∈ {0, 1}."""
     V = np.array([0, 1, 0, 1])
     Q = process_variance(V, delta=2.0, params=params)
     assert np.allclose(Q[V == 0], params.sigma2_0 * 2.0)
@@ -27,6 +33,7 @@ def test_process_variance_regime_dependence(params):
 
 
 def test_obs_variance_regime_dependence(params):
+    """R_i equals tau2_z when log_size_ratio=0 (size denominator is 1)."""
     Z = np.array([0, 1, 0, 1])
     R = obs_variance(Z, log_size_ratio=0.0, params=params)  # denom = 1
     assert np.allclose(R[Z == 0], params.tau2_0)
@@ -34,6 +41,7 @@ def test_obs_variance_regime_dependence(params):
 
 
 def test_obs_variance_floor_active(params):
+    """Very negative log_size_ratio triggers the denominator floor at 0.1."""
     R = obs_variance(np.array([0]), log_size_ratio=-100.0, params=params)
     assert np.allclose(R, params.tau2_0 / 0.1)
 
@@ -45,9 +53,14 @@ def test_kalman_step_initial_observation(params):
     y = 0.5
 
     mu_new, sigma2_new, log_lik = kalman_step(
-        mu, sigma2, y,
-        V=np.array([0]), Z=np.array([0]),
-        delta=0.0, log_size_ratio=0.0, params=params,
+        mu,
+        sigma2,
+        y,
+        V=np.array([0]),
+        Z=np.array([0]),
+        delta=0.0,
+        log_size_ratio=0.0,
+        params=params,
     )
 
     # Posterior of N(0, s_0^2) updated by N(y; X, tau2_0).
@@ -62,6 +75,7 @@ def test_kalman_step_initial_observation(params):
 
 
 def test_kalman_step_vectorizes_over_particles(params):
+    """Output shapes are (N,) and all variances / log-likelihoods are valid."""
     N = 32
     rng = np.random.default_rng(0)
     mu = rng.standard_normal(N)
@@ -70,8 +84,14 @@ def test_kalman_step_vectorizes_over_particles(params):
     Z = rng.integers(0, 2, size=N)
 
     mu_new, sigma2_new, log_lik = kalman_step(
-        mu, sigma2, y=0.3, V=V, Z=Z,
-        delta=1.0, log_size_ratio=0.5, params=params,
+        mu,
+        sigma2,
+        y=0.3,
+        V=V,
+        Z=Z,
+        delta=1.0,
+        log_size_ratio=0.5,
+        params=params,
     )
 
     assert mu_new.shape == (N,)
@@ -82,13 +102,18 @@ def test_kalman_step_vectorizes_over_particles(params):
 
 
 def test_kalman_step_posterior_variance_decreases_below_prior(params):
-    """An informative observation reduces the posterior variance below the predictive prior."""
+    """Posterior variance drops below the predictive prior after an observation."""
     mu = np.array([0.0])
     sigma2 = np.array([1.0])
     _, sigma2_new, _ = kalman_step(
-        mu, sigma2, y=0.0,
-        V=np.array([0]), Z=np.array([1]),  # informed -> tight obs
-        delta=1.0, log_size_ratio=0.0, params=params,
+        mu,
+        sigma2,
+        y=0.0,
+        V=np.array([0]),
+        Z=np.array([1]),  # informed -> tight obs
+        delta=1.0,
+        log_size_ratio=0.0,
+        params=params,
     )
     sigma2_pred = 1.0 + params.sigma2_0
     assert sigma2_new[0] < sigma2_pred
@@ -115,8 +140,10 @@ def test_filter_recovers_truth_high_snr():
     log_sz = np.zeros(T)
 
     params = ModelParams(
-        sigma2_0=sigma2, sigma2_1=sigma2,
-        tau2_0=tau2, tau2_1=tau2,
+        sigma2_0=sigma2,
+        sigma2_1=sigma2,
+        tau2_0=tau2,
+        tau2_1=tau2,
         s0_2=s0_2,
     )
     mu_filt, sigma2_filt, log_marg = kalman_filter(Y, V, Z, delta, log_sz, params)
@@ -147,9 +174,14 @@ def test_filter_log_marginal_matches_step_sum(params):
     sigma2 = np.array([params.s0_2])
     for i in range(T):
         mu, sigma2, ll = kalman_step(
-            mu, sigma2, float(Y[i]),
-            np.array([V[i]]), np.array([Z[i]]),
-            float(delta[i]), float(log_sz[i]), params,
+            mu,
+            sigma2,
+            float(Y[i]),
+            np.array([V[i]]),
+            np.array([Z[i]]),
+            float(delta[i]),
+            float(log_sz[i]),
+            params,
         )
         log_marg_manual += float(ll[0])
     assert np.isclose(log_marg, log_marg_manual)
@@ -203,7 +235,12 @@ def test_ffbs_smoother_beats_filter_on_synthetic(params):
     X_acc = np.zeros(len(mkt.Y))
     for s in range(n_samples):
         X_acc += ffbs_sample(
-            mkt.Y, mkt.V, mkt.Z, mkt.delta, log_sz, params,
+            mkt.Y,
+            mkt.V,
+            mkt.Z,
+            mkt.delta,
+            log_sz,
+            params,
             rng=np.random.default_rng(1000 + s),
         )
     X_smooth = X_acc / n_samples

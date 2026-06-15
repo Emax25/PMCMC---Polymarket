@@ -1,3 +1,7 @@
+"""Tests for src.inference.smc: bootstrap SMC shapes, marginal, ESS, and smoothing."""
+
+from __future__ import annotations
+
 from dataclasses import replace
 
 import numpy as np
@@ -11,6 +15,7 @@ from src.inference.smc import bootstrap_smc, smooth_paths
 
 @pytest.fixture
 def params():
+    """Warm-started ModelParams derived from a 200-step dummy series."""
     rng = np.random.default_rng(0)
     Y_dummy = rng.standard_normal(200)
     return ModelParams.warm_start(Y_dummy)
@@ -18,28 +23,43 @@ def params():
 
 @pytest.fixture
 def config():
+    """Small InferenceConfig for fast unit tests."""
     return InferenceConfig(N=200, seed=42)
 
 
 @pytest.fixture
 def market(params):
+    """Synthetic 200-trade market with insiders, sized for a discriminative filter."""
     # Short inter-trade time -> small per-step process variance -> filter has
     # discriminative power (otherwise the random walk forgets each step).
     return generate_market(
-        params, n_trades=200, n_wallets=20, n_insider_wallets=3,
-        mean_inter_trade_time=1.0, rng=np.random.default_rng(7),
+        params,
+        n_trades=200,
+        n_wallets=20,
+        n_insider_wallets=3,
+        mean_inter_trade_time=1.0,
+        rng=np.random.default_rng(7),
     )
 
 
 def _smc_args(mkt, params, config):
+    """Pack positional SMC arguments from a synthetic market."""
     return (
-        mkt.Y, mkt.delta, np.log(mkt.S / mkt.S_bar),
-        mkt.wallet_ids, mkt.theta_w, params, config,
+        mkt.Y,
+        mkt.delta,
+        np.log(mkt.S / mkt.S_bar),
+        mkt.wallet_ids,
+        mkt.theta_w,
+        params,
+        config,
     )
 
 
 def test_smc_output_shapes(params, config, market):
-    out = bootstrap_smc(*_smc_args(market, params, config), rng=np.random.default_rng(0))
+    """All output arrays have the expected (T,) or (T, N) shapes."""
+    out = bootstrap_smc(
+        *_smc_args(market, params, config), rng=np.random.default_rng(0)
+    )
     T, N = len(market.Y), config.N
     assert out.X_filt.shape == (T,)
     assert out.V_prob_filt.shape == (T,)
@@ -53,28 +73,41 @@ def test_smc_output_shapes(params, config, market):
 
 
 def test_smc_log_marginal_finite(params, config, market):
-    out = bootstrap_smc(*_smc_args(market, params, config), rng=np.random.default_rng(0))
+    """log_marginal is a finite real number."""
+    out = bootstrap_smc(
+        *_smc_args(market, params, config), rng=np.random.default_rng(0)
+    )
     assert np.isfinite(out.log_marginal)
 
 
 def test_smc_ess_within_bounds(params, config, market):
-    out = bootstrap_smc(*_smc_args(market, params, config), rng=np.random.default_rng(0))
+    """ESS at every step lies in [1, N]."""
+    out = bootstrap_smc(
+        *_smc_args(market, params, config), rng=np.random.default_rng(0)
+    )
     assert np.all(out.ess_per_step >= 1.0 - 1e-9)
     assert np.all(out.ess_per_step <= config.N + 1e-6)
 
 
 def test_smc_probabilities_in_unit_interval(params, config, market):
-    out = bootstrap_smc(*_smc_args(market, params, config), rng=np.random.default_rng(0))
+    """Filtered regime probabilities V_prob and Z_prob lie in [0, 1]."""
+    out = bootstrap_smc(
+        *_smc_args(market, params, config), rng=np.random.default_rng(0)
+    )
     assert np.all((out.V_prob_filt >= 0.0) & (out.V_prob_filt <= 1.0))
     assert np.all((out.Z_prob_filt >= 0.0) & (out.Z_prob_filt <= 1.0))
 
 
 def test_smc_resamples_at_least_once(params, config, market):
-    out = bootstrap_smc(*_smc_args(market, params, config), rng=np.random.default_rng(0))
+    """At least one resampling step is triggered over T observations."""
+    out = bootstrap_smc(
+        *_smc_args(market, params, config), rng=np.random.default_rng(0)
+    )
     assert len(out.resample_steps) > 0
 
 
 def test_smc_reproducibility(params, config, market):
+    """Identical seeds produce bit-exact identical outputs."""
     args = _smc_args(market, params, config)
     out1 = bootstrap_smc(*args, rng=np.random.default_rng(123))
     out2 = bootstrap_smc(*args, rng=np.random.default_rng(123))
@@ -85,7 +118,10 @@ def test_smc_reproducibility(params, config, market):
 
 
 def test_smc_filter_beats_raw_observation(params, config, market):
-    out = bootstrap_smc(*_smc_args(market, params, config), rng=np.random.default_rng(0))
+    """Filtered signal RMSE is lower than raw observation RMSE against true X."""
+    out = bootstrap_smc(
+        *_smc_args(market, params, config), rng=np.random.default_rng(0)
+    )
     rmse_filt = np.sqrt(np.mean((out.X_filt - market.X) ** 2))
     rmse_obs = np.sqrt(np.mean((market.Y - market.X) ** 2))
     assert rmse_filt < rmse_obs
@@ -100,16 +136,25 @@ def test_smc_log_marginal_matches_kalman_when_prior_degenerate(params, market):
     cfg = InferenceConfig(N=100, seed=0)
 
     out = bootstrap_smc(
-        market.Y, market.delta, np.log(market.S / market.S_bar),
-        market.wallet_ids, theta_w_zero,
-        p_det, cfg, rng=np.random.default_rng(0),
+        market.Y,
+        market.delta,
+        np.log(market.S / market.S_bar),
+        market.wallet_ids,
+        theta_w_zero,
+        p_det,
+        cfg,
+        rng=np.random.default_rng(0),
     )
 
     log_sz = np.log(market.S / market.S_bar)
     T = len(market.Y)
     _, _, log_marg_kalman = kalman_filter(
-        market.Y, np.zeros(T, dtype=int), np.zeros(T, dtype=int),
-        market.delta, log_sz, p_det,
+        market.Y,
+        np.zeros(T, dtype=int),
+        np.zeros(T, dtype=int),
+        market.delta,
+        log_sz,
+        p_det,
     )
 
     # Verify the prior actually was degenerate on this seed.
@@ -121,7 +166,10 @@ def test_smc_log_marginal_matches_kalman_when_prior_degenerate(params, market):
 
 
 def test_smooth_paths_shapes_and_ranges(params, config, market):
-    out = bootstrap_smc(*_smc_args(market, params, config), rng=np.random.default_rng(0))
+    """Smoothed paths have shape (T,) and values in valid ranges."""
+    out = bootstrap_smc(
+        *_smc_args(market, params, config), rng=np.random.default_rng(0)
+    )
     X_smooth, V_smooth, Z_smooth = smooth_paths(out)
     T = len(market.Y)
     assert X_smooth.shape == (T,)
@@ -133,8 +181,10 @@ def test_smooth_paths_shapes_and_ranges(params, config, market):
 
 
 def test_smooth_path_at_T_matches_filter(params, config, market):
-    """At i = T-1 the smoothed and filtered estimates coincide (no descendants to weight)."""
-    out = bootstrap_smc(*_smc_args(market, params, config), rng=np.random.default_rng(0))
+    """At i=T-1 smoothed and filtered estimates coincide (no descendants to weight)."""
+    out = bootstrap_smc(
+        *_smc_args(market, params, config), rng=np.random.default_rng(0)
+    )
     X_smooth, V_smooth, Z_smooth = smooth_paths(out)
     assert np.isclose(X_smooth[-1], out.X_filt[-1])
     assert np.isclose(V_smooth[-1], out.V_prob_filt[-1])

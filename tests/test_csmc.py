@@ -1,3 +1,7 @@
+"""Tests for src.inference.csmc: conditional SMC with a pinned reference trajectory."""
+
+from __future__ import annotations
+
 from dataclasses import replace
 
 import numpy as np
@@ -12,6 +16,7 @@ from src.inference.smc import bootstrap_smc, sample_path
 
 @pytest.fixture
 def params():
+    """Warm-started ModelParams derived from a 200-step dummy series."""
     rng = np.random.default_rng(0)
     Y_dummy = rng.standard_normal(200)
     return ModelParams.warm_start(Y_dummy)
@@ -19,26 +24,40 @@ def params():
 
 @pytest.fixture
 def config():
+    """Small InferenceConfig for fast unit tests."""
     return InferenceConfig(N=50, seed=42)
 
 
 @pytest.fixture
 def market(params):
+    """Synthetic market with 150 trades and 3 insider wallets."""
     return generate_market(
-        params, n_trades=150, n_wallets=20, n_insider_wallets=3,
-        mean_inter_trade_time=1.0, rng=np.random.default_rng(7),
+        params,
+        n_trades=150,
+        n_wallets=20,
+        n_insider_wallets=3,
+        mean_inter_trade_time=1.0,
+        rng=np.random.default_rng(7),
     )
 
 
 def _csmc_args(mkt, params, config, V_ref, Z_ref):
+    """Pack positional CSMC arguments from a synthetic market and reference path."""
     return (
-        mkt.Y, mkt.delta, np.log(mkt.S / mkt.S_bar),
-        mkt.wallet_ids, mkt.theta_w, params, config,
-        V_ref, Z_ref,
+        mkt.Y,
+        mkt.delta,
+        np.log(mkt.S / mkt.S_bar),
+        mkt.wallet_ids,
+        mkt.theta_w,
+        params,
+        config,
+        V_ref,
+        Z_ref,
     )
 
 
 def test_csmc_shapes(params, config, market):
+    """All output arrays have the expected (T,) or (T, N) shapes."""
     out = conditional_smc(
         *_csmc_args(market, params, config, market.V, market.Z),
         rng=np.random.default_rng(0),
@@ -55,6 +74,7 @@ def test_csmc_shapes(params, config, market):
 
 
 def test_csmc_reference_pinned_at_index_0(params, config, market):
+    """Particle at REFERENCE_INDEX carries the supplied (V_ref, Z_ref) at every step."""
     out = conditional_smc(
         *_csmc_args(market, params, config, market.V, market.Z),
         rng=np.random.default_rng(0),
@@ -66,6 +86,7 @@ def test_csmc_reference_pinned_at_index_0(params, config, market):
 
 
 def test_csmc_outputs_binary(params, config, market):
+    """V_hist and Z_hist contain only values in {0, 1}."""
     out = conditional_smc(
         *_csmc_args(market, params, config, market.V, market.Z),
         rng=np.random.default_rng(0),
@@ -75,6 +96,7 @@ def test_csmc_outputs_binary(params, config, market):
 
 
 def test_csmc_log_marginal_finite(params, config, market):
+    """log_marginal is a finite real number."""
     out = conditional_smc(
         *_csmc_args(market, params, config, market.V, market.Z),
         rng=np.random.default_rng(0),
@@ -83,6 +105,7 @@ def test_csmc_log_marginal_finite(params, config, market):
 
 
 def test_csmc_ess_in_bounds(params, config, market):
+    """ESS at every step lies in [1, N]."""
     out = conditional_smc(
         *_csmc_args(market, params, config, market.V, market.Z),
         rng=np.random.default_rng(0),
@@ -92,6 +115,7 @@ def test_csmc_ess_in_bounds(params, config, market):
 
 
 def test_csmc_probabilities_in_unit_interval(params, config, market):
+    """Filtered regime probabilities V_prob and Z_prob lie in [0, 1]."""
     out = conditional_smc(
         *_csmc_args(market, params, config, market.V, market.Z),
         rng=np.random.default_rng(0),
@@ -101,6 +125,7 @@ def test_csmc_probabilities_in_unit_interval(params, config, market):
 
 
 def test_csmc_reproducibility(params, config, market):
+    """Identical seeds produce bit-exact identical outputs."""
     args = _csmc_args(market, params, config, market.V, market.Z)
     out1 = conditional_smc(*args, rng=np.random.default_rng(123))
     out2 = conditional_smc(*args, rng=np.random.default_rng(123))
@@ -110,6 +135,7 @@ def test_csmc_reproducibility(params, config, market):
 
 
 def test_csmc_filter_beats_raw_observation(params, config, market):
+    """Filtered signal RMSE is lower than raw observation RMSE against true X."""
     out = conditional_smc(
         *_csmc_args(market, params, config, market.V, market.Z),
         rng=np.random.default_rng(0),
@@ -127,24 +153,37 @@ def test_csmc_locally_optimal_keeps_higher_ess(params, config, market):
         rng=np.random.default_rng(0),
     )
     out_boot = bootstrap_smc(
-        market.Y, market.delta, np.log(market.S / market.S_bar),
-        market.wallet_ids, market.theta_w, params, config,
+        market.Y,
+        market.delta,
+        np.log(market.S / market.S_bar),
+        market.wallet_ids,
+        market.theta_w,
+        params,
+        config,
         rng=np.random.default_rng(0),
     )
     assert out_csmc.ess_per_step.mean() > out_boot.ess_per_step.mean()
 
 
 def test_csmc_rejects_invalid_reference_length(params, config, market):
+    """V_ref with length != T raises ValueError."""
     with pytest.raises(ValueError):
         conditional_smc(
-            market.Y, market.delta, np.log(market.S / market.S_bar),
-            market.wallet_ids, market.theta_w, params, config,
-            market.V[:-1], market.Z,
+            market.Y,
+            market.delta,
+            np.log(market.S / market.S_bar),
+            market.wallet_ids,
+            market.theta_w,
+            params,
+            config,
+            market.V[:-1],
+            market.Z,
             rng=np.random.default_rng(0),
         )
 
 
 def test_csmc_rejects_z_ref_starting_at_one(params, config, market):
+    """Z_ref[0] == 1 violates the Z_0 := 0 model constraint and raises ValueError."""
     bad_Z = market.Z.copy()
     bad_Z[0] = 1
     with pytest.raises(ValueError):
@@ -155,6 +194,7 @@ def test_csmc_rejects_z_ref_starting_at_one(params, config, market):
 
 
 def test_sample_path_returns_valid_trajectory(params, config, market):
+    """Sampled path has shape (T,), binary values, and Z_0 = 0."""
     out = conditional_smc(
         *_csmc_args(market, params, config, market.V, market.Z),
         rng=np.random.default_rng(0),
@@ -180,16 +220,26 @@ def test_csmc_log_marginal_matches_kalman_when_prior_degenerate(params, market):
     Z_ref = np.zeros(T, dtype=np.int8)
 
     out = conditional_smc(
-        market.Y, market.delta, np.log(market.S / market.S_bar),
-        market.wallet_ids, theta_w_zero,
-        p_det, cfg,
-        V_ref, Z_ref,
+        market.Y,
+        market.delta,
+        np.log(market.S / market.S_bar),
+        market.wallet_ids,
+        theta_w_zero,
+        p_det,
+        cfg,
+        V_ref,
+        Z_ref,
         rng=np.random.default_rng(0),
     )
 
     log_sz = np.log(market.S / market.S_bar)
     _, _, log_marg_kalman = kalman_filter(
-        market.Y, V_ref, Z_ref, market.delta, log_sz, p_det,
+        market.Y,
+        V_ref,
+        Z_ref,
+        market.delta,
+        log_sz,
+        p_det,
     )
     assert np.all(out.V_hist == 0)
     assert np.all(out.Z_hist == 0)

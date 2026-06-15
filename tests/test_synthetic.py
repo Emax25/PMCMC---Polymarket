@@ -1,12 +1,17 @@
+"""Tests for src.data.synthetic: market generation shapes and constraints."""
+
+from __future__ import annotations
+
 import numpy as np
 import pytest
 
 from config.default_params import ModelParams
-from src.data.synthetic import generate_market, generate_dataset
+from src.data.synthetic import generate_dataset, generate_market
 
 
 @pytest.fixture
 def params():
+    """Warm-started ModelParams derived from a 200-step dummy series."""
     rng = np.random.default_rng(0)
     Y_dummy = rng.standard_normal(200)
     return ModelParams.warm_start(Y_dummy)
@@ -14,10 +19,12 @@ def params():
 
 @pytest.fixture
 def rng():
+    """Default RNG for deterministic test execution."""
     return np.random.default_rng(42)
 
 
 def test_shapes(params, rng):
+    """All market arrays have the expected length-T shape."""
     T, W = 100, 20
     mkt = generate_market(params, n_trades=T, n_wallets=W, rng=rng)
     assert mkt.X.shape == (T,)
@@ -33,6 +40,7 @@ def test_shapes(params, rng):
 
 
 def test_binary_indicators(params, rng):
+    """V and Z contain only values in {0, 1}."""
     mkt = generate_market(params, n_trades=200, rng=rng)
     assert set(np.unique(mkt.V)).issubset({0, 1})
     assert set(np.unique(mkt.Z)).issubset({0, 1})
@@ -46,6 +54,7 @@ def test_prices_in_unit_interval(params, rng):
 
 
 def test_times_monotone_nonneg(params, rng):
+    """delta[0]=0 by convention; all subsequent deltas and time diffs are positive."""
     mkt = generate_market(params, n_trades=200, rng=rng)
     assert mkt.delta[0] == 0.0
     assert np.all(mkt.delta[1:] > 0)
@@ -53,11 +62,13 @@ def test_times_monotone_nonneg(params, rng):
 
 
 def test_sizes_positive(params, rng):
+    """Trade sizes S are strictly positive."""
     mkt = generate_market(params, n_trades=200, rng=rng)
     assert np.all(mkt.S > 0)
 
 
 def test_wallet_ids_in_range(params, rng):
+    """wallet_ids lie in [0, n_wallets)."""
     n_wallets = 30
     mkt = generate_market(params, n_trades=200, n_wallets=n_wallets, rng=rng)
     assert np.all(mkt.wallet_ids >= 0)
@@ -65,11 +76,13 @@ def test_wallet_ids_in_range(params, rng):
 
 
 def test_theta_w_in_unit_interval(params, rng):
+    """Per-wallet propensities theta_w lie in [0, 1]."""
     mkt = generate_market(params, n_trades=200, rng=rng)
     assert np.all(mkt.theta_w >= 0) and np.all(mkt.theta_w <= 1)
 
 
 def test_insider_wallets_have_high_propensity(params, rng):
+    """Insider theta_w mean exceeds regular-wallet mean."""
     mkt = generate_market(params, n_trades=500, n_insider_wallets=5, rng=rng)
     insider_theta = mkt.theta_w[mkt.insider_wallet_ids]
     regular_theta = np.delete(mkt.theta_w, mkt.insider_wallet_ids)
@@ -77,6 +90,7 @@ def test_insider_wallets_have_high_propensity(params, rng):
 
 
 def test_z0_always_zero(params, rng):
+    """Z_0 := 0 by model convention across multiple markets."""
     for _ in range(10):
         mkt = generate_market(params, n_trades=50, rng=rng)
         assert mkt.Z[0] == 0
@@ -92,6 +106,7 @@ def test_obs_variance_tighter_for_insiders(params, rng):
 
 
 def test_generate_dataset(params, rng):
+    """generate_dataset returns a list of K markets each with the requested T."""
     K = 3
     dataset = generate_dataset(params, n_markets=K, n_trades=50, rng=rng)
     assert len(dataset) == K
@@ -100,6 +115,7 @@ def test_generate_dataset(params, rng):
 
 
 def test_reproducibility(params):
+    """Same RNG seed produces bit-exact identical market data."""
     mkt1 = generate_market(params, n_trades=100, rng=np.random.default_rng(7))
     mkt2 = generate_market(params, n_trades=100, rng=np.random.default_rng(7))
     np.testing.assert_array_equal(mkt1.Y, mkt2.Y)

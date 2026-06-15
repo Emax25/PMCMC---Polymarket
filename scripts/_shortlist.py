@@ -14,6 +14,7 @@ diverse insider-information structures:
     decision process, so shared insider wallets should jointly drive both
   * Trump launches a coin pre-election — personal business decision
 """
+
 from __future__ import annotations
 
 # Order matters only for reproducibility — wallet ids assigned in this order.

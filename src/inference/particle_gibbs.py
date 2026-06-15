@@ -20,6 +20,7 @@ untouched after the call.
 Naive index-pinning (decision #4) is inherited from CSMC; ancestor sampling
 for the reference particle is iPMCMC's job.
 """
+
 from __future__ import annotations
 
 import copy
@@ -30,13 +31,21 @@ import numpy as np
 from config.default_params import InferenceConfig, ModelParams
 from src.inference.csmc import conditional_smc
 from src.inference.kalman import ffbs_sample
-from src.inference.parameter_updates import MarketLatents, gibbs_sweep
+from src.inference.parameter_updates import MarketLatents, adapt_mh_step, gibbs_sweep
 from src.inference.smc import bootstrap_smc, sample_path
 
 
 @dataclass
 class MarketData:
-    """One market's observations (the data PG conditions on)."""
+    """One market's observations conditioned on by Particle Gibbs.
+
+    Attributes:
+        Y: Logit-transformed prices in time order.
+        delta: Inter-trade seconds with `delta[0] == 0`.
+        log_size_ratio: Per-trade `log(S / S_bar)` feature.
+        wallet_ids: Integer wallet index per trade.
+    """
+
     Y: np.ndarray
     delta: np.ndarray
     log_size_ratio: np.ndarray
@@ -44,13 +53,18 @@ class MarketData:
 
     @property
     def T(self) -> int:
+        """Return the number of trades in this market."""
         return len(self.Y)
 
 
 @dataclass
 class PGOutput:
-    """Particle Gibbs chain output. All arrays cover all `n_iter` iterations
-    (no burn-in dropped); the caller slices off `n_burnin` for inference."""
+    """Container for Particle Gibbs chains and diagnostics.
+
+    All arrays include every iteration (`n_iter`) with burn-in still present.
+    Callers apply burn-in slicing downstream.
+    """
+
     # Parameter chains (n_iter,)
     sigma2_0: np.ndarray
     sigma2_1: np.ndarray
@@ -91,30 +105,28 @@ def _csmc_then_ffbs(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
     """One CSMC pass → sample new reference → FFBS for X."""
     out = conditional_smc(
-        md.Y, md.delta, md.log_size_ratio, md.wallet_ids,
-        theta_w, params, config, V_ref, Z_ref, rng=rng,
+        md.Y,
+        md.delta,
+        md.log_size_ratio,
+        md.wallet_ids,
+        theta_w,
+        params,
+        config,
+        V_ref,
+        Z_ref,
+        rng=rng,
     )
     V_new, Z_new = sample_path(out, rng)
     X_new = ffbs_sample(
-        md.Y, V_new, Z_new, md.delta, md.log_size_ratio, params, rng,
+        md.Y,
+        V_new,
+        Z_new,
+        md.delta,
+        md.log_size_ratio,
+        params,
+        rng,
     )
     return V_new, Z_new, X_new, out.log_marginal
-
-
-def _adapt_step(
-    config: InferenceConfig,
-    attr: str,
-    rate: float,
-    *,
-    lo: float = 0.23,
-    hi: float = 0.44,
-    factor: float = 1.2,
-) -> None:
-    step = getattr(config, attr)
-    if rate > hi:
-        setattr(config, attr, step * factor)
-    elif rate < lo:
-        setattr(config, attr, step / factor)
 
 
 def particle_gibbs(
@@ -148,6 +160,11 @@ def particle_gibbs(
         adapt_step_sizes: whether to run the windowed step-size adaptation
             during early burn-in (decision #11).
         progress: show a tqdm bar.
+
+    Returns:
+        Full Particle Gibbs output with parameter chains, latent trajectories,
+        marginal likelihood diagnostics, MH acceptance flags, and final adapted
+        step sizes.
     """
     # Local copy so we don't mutate the caller's config during adaptation
     config = copy.copy(config)
@@ -172,8 +189,14 @@ def particle_gibbs(
         Z_refs: list[np.ndarray] = []
         for md in markets:
             out0 = bootstrap_smc(
-                md.Y, md.delta, md.log_size_ratio, md.wallet_ids,
-                theta_w, params, config, rng=rng,
+                md.Y,
+                md.delta,
+                md.log_size_ratio,
+                md.wallet_ids,
+                theta_w,
+                params,
+                config,
+                rng=rng,
             )
             V_p, Z_p = sample_path(out0, rng)
             V_refs.append(V_p)
@@ -211,6 +234,7 @@ def particle_gibbs(
     iterator = range(n_iter)
     if progress:
         from tqdm.auto import tqdm
+
         iterator = tqdm(iterator, desc="PG")
 
     for it in iterator:
@@ -218,7 +242,13 @@ def particle_gibbs(
         latents: list[MarketLatents] = []
         for k, md in enumerate(markets):
             V_new, Z_new, X_new, lm = _csmc_then_ffbs(
-                md, theta_w, params, config, V_refs[k], Z_refs[k], rng,
+                md,
+                theta_w,
+                params,
+                config,
+                V_refs[k],
+                Z_refs[k],
+                rng,
             )
             V_refs[k] = V_new
             Z_refs[k] = Z_new
@@ -226,11 +256,17 @@ def particle_gibbs(
             X_chains[k][it] = X_new
             V_chains[k][it] = V_new
             Z_chains[k][it] = Z_new
-            latents.append(MarketLatents(
-                Y=md.Y, delta=md.delta, log_size_ratio=md.log_size_ratio,
-                wallet_ids=md.wallet_ids,
-                X=X_new, V=V_new, Z=Z_new,
-            ))
+            latents.append(
+                MarketLatents(
+                    Y=md.Y,
+                    delta=md.delta,
+                    log_size_ratio=md.log_size_ratio,
+                    wallet_ids=md.wallet_ids,
+                    X=X_new,
+                    V=V_new,
+                    Z=Z_new,
+                )
+            )
 
         # ----- Gibbs sweep on parameters -----
         params, theta_w, diag = gibbs_sweep(params, theta_w, latents, config, rng)
@@ -252,21 +288,37 @@ def particle_gibbs(
         # ----- Adaptive step-size tuning -----
         if adapt_step_sizes and 0 < it < adapt_until and (it + 1) % adapt_window == 0:
             lo, hi = it + 1 - adapt_window, it + 1
-            _adapt_step(config, "mh_step_beta_S", float(acc_beta_S[lo:hi].mean()))
-            _adapt_step(config, "mh_step_beta_Z", float(acc_beta_Z[lo:hi].mean()))
-            _adapt_step(config, "mh_step_log_tau2_0", float(acc_tau2_0[lo:hi].mean()))
-            _adapt_step(config, "mh_step_log_tau2_1", float(acc_tau2_1[lo:hi].mean()))
+            adapt_mh_step(config, "mh_step_beta_S", float(acc_beta_S[lo:hi].mean()))
+            adapt_mh_step(config, "mh_step_beta_Z", float(acc_beta_Z[lo:hi].mean()))
+            adapt_mh_step(
+                config,
+                "mh_step_log_tau2_0",
+                float(acc_tau2_0[lo:hi].mean()),
+            )
+            adapt_mh_step(
+                config,
+                "mh_step_log_tau2_1",
+                float(acc_tau2_1[lo:hi].mean()),
+            )
 
     return PGOutput(
-        sigma2_0=sigma2_0, sigma2_1=sigma2_1,
-        q_01=q_01, q_10=q_10,
-        beta_S=beta_S, beta_Z=beta_Z,
-        tau2_0=tau2_0, tau2_1=tau2_1,
+        sigma2_0=sigma2_0,
+        sigma2_1=sigma2_1,
+        q_01=q_01,
+        q_10=q_10,
+        beta_S=beta_S,
+        beta_Z=beta_Z,
+        tau2_0=tau2_0,
+        tau2_1=tau2_1,
         theta_w=theta_w_chain,
-        X=X_chains, V=V_chains, Z=Z_chains,
+        X=X_chains,
+        V=V_chains,
+        Z=Z_chains,
         log_marg=log_marg,
-        acc_beta_S=acc_beta_S, acc_beta_Z=acc_beta_Z,
-        acc_tau2_0=acc_tau2_0, acc_tau2_1=acc_tau2_1,
+        acc_beta_S=acc_beta_S,
+        acc_beta_Z=acc_beta_Z,
+        acc_tau2_0=acc_tau2_0,
+        acc_tau2_1=acc_tau2_1,
         final_mh_step_beta_S=config.mh_step_beta_S,
         final_mh_step_beta_Z=config.mh_step_beta_Z,
         final_mh_step_log_tau2_0=config.mh_step_log_tau2_0,
