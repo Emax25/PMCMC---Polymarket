@@ -216,7 +216,7 @@ Via `src/analysis/results.py` and `plots.py`.
 | `csmc.py` | Conditional SMC | `REFERENCE_INDEX = 0`; 4-state optimal proposal |
 | `particle_gibbs.py` | PG sampler | Defines `MarketData` |
 | `ipmcmc.py` | iPMCMC + swap | M=8, P=4; P0: parallelize |
-| `parameter_updates.py` | Gibbs/MH | P3: fix `theta_w` approx |
+| `parameter_updates.py` | Gibbs/MH | `theta_w` = per-wallet RWMH on logit scale (full logistic Z model; correct for β≠0) |
 | `diagnostics.py` | R-hat, ESS | arviz |
 
 **PG iteration:** CSMC → sample path → FFBS → `gibbs_sweep` (per market, params pooled).
@@ -247,7 +247,12 @@ Regression tests: `test_parameter_updates.py` (delta-zero case); SMC/CSMC suites
 3. `joblib.Parallel` — K markets in PG/iPMCMC
 4. Profile first (`cProfile` / `py-spy` on one dev iteration)
 
-**Benchmark:** `scripts/benchmark.py` (planned) — time one PG iteration at dev scale before/after changes.
+**Benchmark:** `scripts/benchmark.py` — wall-clock per PG run / iteration, cProfile
+cost breakdown (kalman / resample / gibbs buckets), BLAS thread pinning via
+`--threads`, and an optional `--gate` synthetic accuracy check (ROC AUC, insider
+ranking, `theta_w` Spearman). Run before/after hot-path changes. NB: cProfile
+`tottime`-by-file under-attributes Kalman work that executes inside NumPy C kernels
+(lands in `other`); use it for relative trends, not exact attribution.
 
 **Trading implication (P6):** Full MCMC too slow live → filter-only CSMC, warm-started chains, or surrogate model. Keep inference kernels callable outside MCMC wrapper.
 
@@ -296,7 +301,10 @@ class MarketData:
 
 **Cleaning:** drop invalid → dedupe `transaction_hash` → sort `(timestamp, hash)` → features → wallet IDs.
 
-**P1 (planned):** `--pre-resolution-days N` — drop resolution tail (default 7 days).
+**P1 (done):** `--pre-resolution-days N` — drop trades within N days of market
+resolution (default 7). `filter_pre_resolution` runs after `clean_trades`, before
+feature computation; resolution time comes from Gamma `endDate` threaded through
+`pull_data.py`. Pass `--pre-resolution-days 0` to disable the N-day buffer.
 
 ### 9.4 API quirks (Gamma + Data)
 
@@ -390,9 +398,9 @@ Correct **iff** synthetic injection passes:
 | Issue | Priority |
 |-------|----------|
 | numba + joblib | P0 |
-| Pre-resolution filter | P1 |
-| `theta_w` approx fix | P3 |
-| Negative `β_S` | P3 |
+| Pre-resolution filter | P1 — DONE |
+| `theta_w` approx fix | P3 — DONE (RWMH, full logistic) |
+| Negative `β_S` | P3 — open |
 
 ---
 

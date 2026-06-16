@@ -1,15 +1,14 @@
 """Conjugate Gibbs and Metropolis-Hastings updates for the model parameters.
 
 Decision #6 splits the parameter block into:
-  * conjugate Gibbs for sigma2_0, sigma2_1, q_01, q_10, theta_w
-  * random-walk MH for beta_S, beta_Z, tau2_0, tau2_1
+  * conjugate Gibbs for sigma2_0, sigma2_1, q_01, q_10
+  * random-walk MH for theta_w, beta_S, beta_Z, tau2_0, tau2_1
 
 Decision #8 pools sufficient statistics across markets — every update accepts a
 list of `MarketLatents` so single-market inference is just K = 1.
 
-The theta_w update is Beta-Bernoulli treating Z_i | theta_{w_i} as a direct
-Bernoulli (exact when beta_S = beta_Z = 0; approximate otherwise — this
-matches the README framing).
+The theta_w update is RWMH on eta = logit(theta_w) under the full logistic Z
+model (Beta prior in eta-space plus pooled Bernoulli log-likelihood).
 
 The tau2 update uses a Jeffreys prior p(tau2) ∝ 1/tau2: on the log-scale this
 is uniform, and the log-normal proposal's Jacobian τ*/τ exactly cancels the
@@ -24,7 +23,7 @@ from dataclasses import dataclass, replace
 import numpy as np
 
 from config.default_params import InferenceConfig, ModelParams
-from src.utils.transforms import log1pexp, logit
+from src.utils.transforms import log1pexp, logit, sigmoid
 
 
 @dataclass
@@ -136,41 +135,127 @@ def update_q(
     return q_01, q_10
 
 
-def update_theta_w(
+# ---------------- MH updates ----------------
+
+
+def _pool_z_trades(
     markets: list[MarketLatents],
+    beta_S: float,
+    beta_Z: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Pool per-trade Z data across markets for trades with index i >= 1."""
+    wallet_chunks: list[np.ndarray] = []
+    z_chunks: list[np.ndarray] = []
+    offset_chunks: list[np.ndarray] = []
+    for m in markets:
+        if len(m.Z) <= 1:
+            continue
+        w_idx = np.asarray(m.wallet_ids[1:], dtype=np.int64)
+        Z_i = m.Z[1:].astype(float)
+        Z_prev = m.Z[:-1]
+        offset = beta_S * m.log_size_ratio[1:] + beta_Z * (Z_prev == 1).astype(float)
+        wallet_chunks.append(w_idx)
+        z_chunks.append(Z_i)
+        offset_chunks.append(offset)
+    if not wallet_chunks:
+        return (
+            np.empty(0, dtype=np.int64),
+            np.empty(0, dtype=float),
+            np.empty(0, dtype=float),
+        )
+    return (
+        np.concatenate(wallet_chunks),
+        np.concatenate(z_chunks),
+        np.concatenate(offset_chunks),
+    )
+
+
+def _log_prior_eta(eta: np.ndarray, a: float, b: float) -> np.ndarray:
+    """Log-density of eta = logit(theta) when theta ~ Beta(a, b).
+
+    With theta = sigmoid(eta), p(eta) propto exp(a*eta) / (1+exp(eta))^(a+b),
+    i.e. log p(eta) = a*eta - (a+b)*log1pexp(eta) + const (Jacobian included).
+    """
+    return a * eta - (a + b) * log1pexp(eta)
+
+
+def _log_lik_theta_w_by_wallet(
+    eta: np.ndarray,
+    wallet_ids: np.ndarray,
+    Z_i: np.ndarray,
+    offset: np.ndarray,
+    n_wallets: int,
+) -> np.ndarray:
+    """Per-wallet Z log-likelihood summed over pooled trades (i >= 1)."""
+    if wallet_ids.size == 0:
+        return np.zeros(n_wallets)
+    logit_pi = eta[wallet_ids] + offset
+    contrib = Z_i * logit_pi - log1pexp(logit_pi)
+    return np.bincount(wallet_ids, weights=contrib, minlength=n_wallets)
+
+
+def _log_post_theta_w(
+    eta: np.ndarray,
+    wallet_ids: np.ndarray,
+    Z_i: np.ndarray,
+    offset: np.ndarray,
     n_wallets: int,
     a: float,
     b: float,
-    rng: np.random.Generator,
 ) -> np.ndarray:
-    """Approximate Beta-Bernoulli Gibbs for theta_w (decision #6).
+    """Full log-posterior (unnormalized) for each wallet on the logit scale."""
+    return _log_prior_eta(eta, a, b) + _log_lik_theta_w_by_wallet(
+        eta, wallet_ids, Z_i, offset, n_wallets
+    )
 
-    Treats Z_i | theta_{w_i} as Bernoulli(theta_{w_i}) — exact at β=0 and a
-    documented approximation otherwise. Z counts are pooled across markets
-    (decision #8). Index i=0 is excluded since Z_0 := 0 is deterministic.
+
+def update_theta_w(
+    theta_w: np.ndarray,
+    markets: list[MarketLatents],
+    n_wallets: int,
+    params: ModelParams,
+    config: InferenceConfig,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, float]:
+    """RWMH update of theta_w on the logit scale under the full logistic Z model.
+
+    Target for wallet w (others fixed):
+        log p(eta_w | rest) = a*eta_w - (a+b)*log1pexp(eta_w)
+            + sum_{i>=1, w_i=w} [ Z_i*logit_pi_i - log1pexp(logit_pi_i) ]
+    where logit_pi_i = eta_w + beta_S*log(S_i/S_bar) + beta_Z*1{Z_{i-1}=1}.
+
+    Symmetric Gaussian proposal on eta_w cancels in the MH ratio.
 
     Args:
+        theta_w: Current wallet insider propensities, shape ``(n_wallets,)``.
         markets: Per-market latent trajectories with wallet assignments.
         n_wallets: Total number of wallet indices.
-        a: Beta prior alpha hyperparameter.
-        b: Beta prior beta hyperparameter.
-        rng: Source of randomness for posterior draws.
+        params: Model parameters (Beta prior ``a``, ``b``, and ``beta_S``, ``beta_Z``).
+        config: Inference settings including ``mh_step_logit_theta_w``.
+        rng: Source of randomness for propose-accept draws.
 
     Returns:
-        Posterior draw for all wallet propensities, shape `(n_wallets,)`.
+        Tuple ``(theta_w_new, mean_acceptance)`` where ``mean_acceptance`` is the
+        fraction of per-wallet MH proposals accepted in this update.
     """
-    z_count = np.zeros(n_wallets)
-    n_count = np.zeros(n_wallets)
-    for m in markets:
-        w_idx = np.asarray(m.wallet_ids[1:], dtype=np.int64)
-        Z_i = m.Z[1:].astype(float)
-        n_count += np.bincount(w_idx, minlength=n_wallets).astype(float)
-        z_count += np.bincount(w_idx, weights=Z_i, minlength=n_wallets)
+    wallet_ids, Z_i, offset = _pool_z_trades(
+        markets, params.beta_S, params.beta_Z
+    )
+    eta = logit(theta_w)
+    step = config.mh_step_logit_theta_w
 
-    return rng.beta(a + z_count, b + n_count - z_count)
-
-
-# ---------------- MH updates ----------------
+    eta_star = eta + step * rng.standard_normal(n_wallets)
+    log_post_cur = _log_post_theta_w(
+        eta, wallet_ids, Z_i, offset, n_wallets, params.a, params.b
+    )
+    log_post_star = _log_post_theta_w(
+        eta_star, wallet_ids, Z_i, offset, n_wallets, params.a, params.b
+    )
+    log_alpha = log_post_star - log_post_cur
+    accept = rng.random(n_wallets) < np.exp(np.minimum(0.0, log_alpha))
+    eta_new = np.where(accept, eta_star, eta)
+    mean_acc = float(np.mean(accept))
+    return sigmoid(eta_new), mean_acc
 
 
 def _log_lik_Z(
@@ -358,12 +443,14 @@ class GibbsSweepDiag:
         acc_beta_Z: Whether the β_Z MH proposal was accepted.
         acc_tau2_0: Whether the τ²_0 MH proposal was accepted.
         acc_tau2_1: Whether the τ²_1 MH proposal was accepted.
+        acc_theta_w: Mean per-wallet MH acceptance rate for θ_w.
     """
 
     acc_beta_S: bool
     acc_beta_Z: bool
     acc_tau2_0: bool
     acc_tau2_1: bool
+    acc_theta_w: float
 
 
 def gibbs_sweep(
@@ -378,7 +465,7 @@ def gibbs_sweep(
     Order (any cycle of full conditionals leaves the posterior invariant):
         1. (σ²_0, σ²_1)   — Inv-Gamma
         2. (q_01, q_10)   — Beta
-        3. θ_w            — Beta-Bernoulli (pooled across markets)
+        3. θ_w            — logit-scale RWMH under full logistic Z model
         4. (β_S, β_Z)     — Gaussian random-walk MH, conditioning on θ_w_new
         5. (τ²_0, τ²_1)   — log-normal MH with Jeffreys prior
 
@@ -396,7 +483,9 @@ def gibbs_sweep(
 
     sigma2_0, sigma2_1 = update_sigma2(markets, rng)
     q_01, q_10 = update_q(markets, rng)
-    theta_w_new = update_theta_w(markets, n_wallets, params.a, params.b, rng)
+    theta_w_new, acc_theta_w = update_theta_w(
+        theta_w, markets, n_wallets, params, config, rng
+    )
     beta_S_new, beta_Z_new, acc_S, acc_Z = update_beta(
         params.beta_S,
         params.beta_Z,
@@ -430,5 +519,6 @@ def gibbs_sweep(
         acc_beta_Z=acc_Z,
         acc_tau2_0=acc_t0,
         acc_tau2_1=acc_t1,
+        acc_theta_w=acc_theta_w,
     )
     return new_params, theta_w_new, diag

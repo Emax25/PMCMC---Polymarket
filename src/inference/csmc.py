@@ -22,7 +22,7 @@ import numpy as np
 from scipy.special import logsumexp
 
 from config.default_params import InferenceConfig, ModelParams
-from src.inference.kalman import kalman_step
+from src.inference.kalman import _kalman_step_all_combos
 from src.inference.smc import SMCOutput
 from src.utils.transforms import (
     bounded_indicator_probability,
@@ -108,6 +108,12 @@ def conditional_smc(
     denom_q = params.q_01 + params.q_10
     rho_V = params.q_01 / denom_q if denom_q > 0 else 0.5
 
+    sigma2_0 = params.sigma2_0
+    sigma2_1 = params.sigma2_1
+    tau2_0 = params.tau2_0
+    tau2_1 = params.tau2_1
+    gamma = params.gamma
+
     for i in range(T):
         # ---------- log p(V_i = v | V_prev), shape (N, 2) ----------
         if i == 0:
@@ -147,26 +153,19 @@ def conditional_smc(
         # log_prior_joint[n, 2v+z] = log_p_V[n, v] + log_p_Z[n, z]   shape (N, 4)
         log_prior_joint = (log_p_V[:, :, None] + log_p_Z[:, None, :]).reshape(N, 4)
 
-        # ---------- One vectorized kalman_step per (v, z) combo ----------
-        log_lik = np.empty((N, 4))
-        mu_combos = np.empty((N, 4))
-        sigma2_combos = np.empty((N, 4))
-        for v in (0, 1):
-            for z in (0, 1):
-                k = 2 * v + z
-                mu_k, s2_k, ll_k = kalman_step(
-                    mu,
-                    sigma2,
-                    float(Y[i]),
-                    np.full(N, v, dtype=np.int8),
-                    np.full(N, z, dtype=np.int8),
-                    float(delta[i]),
-                    float(log_size_ratio[i]),
-                    params,
-                )
-                log_lik[:, k] = ll_k
-                mu_combos[:, k] = mu_k
-                sigma2_combos[:, k] = s2_k
+        # ---------- All four (v, z) combos via jitted Kalman kernel ----------
+        mu_combos, sigma2_combos, log_lik = _kalman_step_all_combos(
+            mu,
+            sigma2,
+            float(Y[i]),
+            float(delta[i]),
+            float(log_size_ratio[i]),
+            sigma2_0,
+            sigma2_1,
+            tau2_0,
+            tau2_1,
+            gamma,
+        )
 
         # ---------- Locally-optimal proposal ----------
         # plus per-particle normalizing constant

@@ -19,6 +19,7 @@ from src.inference.parameter_updates import (
     update_tau2,
     update_theta_w,
 )
+from src.utils.transforms import logit, sigmoid
 
 
 @pytest.fixture
@@ -170,8 +171,25 @@ def test_update_q_recovers_truth():
 # -------------------- update_theta_w --------------------
 
 
+def _theta_w_chain(
+    theta_init: np.ndarray,
+    markets: list[MarketLatents],
+    params: ModelParams,
+    config: InferenceConfig,
+    n_iter: int,
+    seed: int,
+) -> np.ndarray:
+    """Run sequential RWMH updates and return the final theta_w draw."""
+    theta = theta_init.copy()
+    rng = np.random.default_rng(seed)
+    n_wallets = len(theta)
+    for _ in range(n_iter):
+        theta, _ = update_theta_w(theta, markets, n_wallets, params, config, rng)
+    return theta
+
+
 def test_update_theta_w_recovers_truth():
-    """Beta–Binomial conjugate update recovers per-wallet propensity means."""
+    """At beta=0 the full conditional matches Beta-Bernoulli; RWMH should recover."""
     rng = np.random.default_rng(0)
     T = 30000
     n_wallets = 10
@@ -189,19 +207,83 @@ def test_update_theta_w_recovers_truth():
         V=np.zeros(T, dtype=np.int8),
         Z=Z,
     )
+    p = replace(ModelParams.warm_start(np.zeros(10)), a=1.0, b=1.0, beta_S=0.0, beta_Z=0.0)
+    cfg = InferenceConfig(mh_step_logit_theta_w=0.4, seed=42)
 
-    theta_mean = np.mean(
+    samples = np.array(
         [
-            update_theta_w([market], n_wallets, 1.0, 1.0, np.random.default_rng(s))
+            _theta_w_chain(
+                np.full(n_wallets, 0.5),
+                [market],
+                p,
+                cfg,
+                n_iter=200,
+                seed=s,
+            )
             for s in range(200)
-        ],
-        axis=0,
+        ]
     )
+    theta_mean = samples.mean(axis=0)
     assert np.mean(np.abs(theta_mean - theta_true)) < 0.02
 
 
+def test_update_theta_w_recovers_with_nonzero_beta():
+    """With beta_S != 0, RWMH beats the naive Beta-Bernoulli count estimator."""
+    rng = np.random.default_rng(0)
+    T = 40000
+    n_wallets = 10
+    a, b = 1.0, 1.0
+    beta_S_true = 1.5
+    theta_true = rng.beta(2.0, 5.0, size=n_wallets)
+    logit_theta = logit(theta_true)
+    wallet_ids = rng.integers(0, n_wallets, size=T)
+    log_size_ratio = rng.standard_normal(T)
+    Z = np.zeros(T, dtype=np.int8)
+    logit_pi = logit_theta[wallet_ids[1:]] + beta_S_true * log_size_ratio[1:]
+    Z[1:] = (rng.random(T - 1) < sigmoid(logit_pi)).astype(np.int8)
+
+    market = MarketLatents(
+        Y=np.zeros(T),
+        delta=np.ones(T),
+        log_size_ratio=log_size_ratio,
+        wallet_ids=wallet_ids,
+        X=np.zeros(T),
+        V=np.zeros(T, dtype=np.int8),
+        Z=Z,
+    )
+    p = replace(
+        ModelParams.warm_start(np.zeros(10)),
+        a=a,
+        b=b,
+        beta_S=beta_S_true,
+        beta_Z=0.0,
+    )
+    cfg = InferenceConfig(mh_step_logit_theta_w=0.35, seed=42)
+
+    theta_chain = np.full(n_wallets, 0.5)
+    chain_rng = np.random.default_rng(42)
+    samples: list[np.ndarray] = []
+    for it in range(2500):
+        theta_chain, _ = update_theta_w(
+            theta_chain, [market], n_wallets, p, cfg, chain_rng
+        )
+        if it >= 1250:
+            samples.append(theta_chain.copy())
+    mh_mean = np.mean(samples, axis=0)
+
+    w_idx = wallet_ids[1:]
+    z_count = np.bincount(w_idx, weights=Z[1:].astype(float), minlength=n_wallets)
+    n_count = np.bincount(w_idx, minlength=n_wallets).astype(float)
+    naive_mean = (a + z_count) / (a + b + n_count)
+
+    mh_err = float(np.mean(np.abs(mh_mean - theta_true)))
+    naive_err = float(np.mean(np.abs(naive_mean - theta_true)))
+    assert mh_err < naive_err
+    assert mh_err < 0.04
+
+
 def test_update_theta_w_unobserved_wallet_uses_prior():
-    """A wallet that never trades draws from the Beta(a, b) prior."""
+    """A wallet with zero trades explores the Beta(a, b) prior via MH."""
     T = 100
     n_wallets = 5
     wallet_ids = np.zeros(T, dtype=np.int64)  # only wallet 0 trades
@@ -216,21 +298,31 @@ def test_update_theta_w_unobserved_wallet_uses_prior():
         Z=Z,
     )
     a, b = 2.0, 8.0  # prior mean 0.2
+    p = replace(ModelParams.warm_start(np.zeros(10)), a=a, b=b, beta_S=0.0, beta_Z=0.0)
+    cfg = InferenceConfig(mh_step_logit_theta_w=0.5, seed=42)
     samples = np.array(
         [
-            update_theta_w([market], n_wallets, a, b, np.random.default_rng(s))[4]
+            _theta_w_chain(
+                np.full(n_wallets, 0.5),
+                [market],
+                p,
+                cfg,
+                n_iter=500,
+                seed=s,
+            )[4]
             for s in range(2000)
         ]
     )
-    # Unobserved wallet posterior == prior == Beta(2, 8); mean = 0.2
     assert abs(samples.mean() - a / (a + b)) < 0.02
 
 
 def test_update_theta_w_pools_across_markets():
-    """The posterior for a shared wallet should use Z counts from every market."""
+    """The posterior for a shared wallet pools Z counts from every market (beta=0)."""
     n_wallets = 3
     a, b = 1.0, 1.0
     T = 100
+    p = replace(ModelParams.warm_start(np.zeros(10)), a=a, b=b, beta_S=0.0, beta_Z=0.0)
+    cfg = InferenceConfig(mh_step_logit_theta_w=0.4, seed=42)
     # Market 1: wallet 0 trades 100 times, Z always 1
     m1 = MarketLatents(
         Y=np.zeros(T),
@@ -251,14 +343,65 @@ def test_update_theta_w_pools_across_markets():
         V=np.zeros(T, dtype=np.int8),
         Z=np.zeros(T, dtype=np.int8),
     )
-    # Pooled: 99 ones + 99 zeros (i=0 dropped from each) → Beta(1+99, 1+99) ≈ 0.5
     samples = np.array(
         [
-            update_theta_w([m1, m2], n_wallets, a, b, np.random.default_rng(s))[0]
+            _theta_w_chain(
+                np.full(n_wallets, 0.5),
+                [m1, m2],
+                p,
+                cfg,
+                n_iter=300,
+                seed=s,
+            )[0]
             for s in range(500)
         ]
     )
     assert 0.45 < samples.mean() < 0.55
+
+
+def test_update_theta_w_zero_step_always_accepts(params, config):
+    """Zero MH step means proposal == current; log-ratio = 0, so always accept."""
+    _, state, _ = _make_market()
+    n_wallets = 20
+    theta_in = np.linspace(0.05, 0.95, n_wallets)
+    cfg = replace(config, mh_step_logit_theta_w=0.0)
+    theta_out, acc = update_theta_w(
+        theta_in, [state], n_wallets, params, cfg, np.random.default_rng(0)
+    )
+    np.testing.assert_allclose(theta_out, theta_in, rtol=0, atol=1e-10)
+    assert acc == 1.0
+
+
+def test_update_theta_w_huge_step_mostly_rejects(params, config):
+    """Very large MH step produces far-from-mode proposals; mostly rejected."""
+    _, state, _ = _make_market(T=500)
+    n_wallets = 20
+    theta_in = np.full(n_wallets, 0.5)
+    cfg = replace(config, mh_step_logit_theta_w=50.0)
+    accs = []
+    for s in range(200):
+        _, acc = update_theta_w(
+            theta_in,
+            [state],
+            n_wallets,
+            params,
+            cfg,
+            np.random.default_rng(s),
+        )
+        accs.append(acc)
+    assert np.mean(accs) < 0.15
+
+
+def test_update_theta_w_reproducible(params, config):
+    """Same seed produces identical theta_w values and acceptance rate."""
+    _, state, _ = _make_market()
+    n_wallets = 20
+    theta_in = np.full(n_wallets, 0.5)
+    args = (theta_in, [state], n_wallets, params, config)
+    o1 = update_theta_w(*args, rng=np.random.default_rng(123))
+    o2 = update_theta_w(*args, rng=np.random.default_rng(123))
+    np.testing.assert_array_equal(o1[0], o2[0])
+    assert o1[1] == o2[1]
 
 
 # -------------------- update_beta --------------------

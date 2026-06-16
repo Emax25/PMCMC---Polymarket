@@ -18,6 +18,7 @@ from src.analysis.results import (
     posterior_Z_probability,
     roc_auc,
     roc_curve,
+    spearman_theta_w,
     summarize_chain,
     wallet_ranking,
 )
@@ -292,3 +293,16 @@ def test_roc_curve_monotonic_and_bounded():
     assert tpr[-1] == pytest.approx(1.0)
     assert np.all(np.diff(fpr) >= -1e-9)  # non-decreasing
     assert np.all(np.diff(tpr) >= -1e-9)
+
+
+def test_spearman_theta_w_perfect_and_reversed():
+    """Spearman rho is ~1 for matching ranks and ~-1 when reversed."""
+    theta = np.array([0.1, 0.3, 0.5, 0.9])
+    assert spearman_theta_w(theta, theta) == pytest.approx(1.0)
+    assert spearman_theta_w(theta, theta[::-1]) == pytest.approx(-1.0)
+
+
+def test_spearman_theta_w_constant_returns_nan():
+    """Constant inputs yield nan (degenerate ranks)."""
+    theta = np.array([0.5, 0.5, 0.5])
+    assert np.isnan(spearman_theta_w(theta, theta))

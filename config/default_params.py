@@ -89,6 +89,8 @@ class InferenceConfig:
     # MH step sizes on natural / log scale (decision #11)
     mh_step_beta_S: float = 0.1
     mh_step_beta_Z: float = 0.1
+    # RWMH on logit(theta_w); ~0.5 targets ~30% acceptance per wallet in pilot runs
+    mh_step_logit_theta_w: float = 0.5
     mh_step_log_tau2_0: float = 0.3
     mh_step_log_tau2_1: float = 0.3
 

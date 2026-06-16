@@ -20,7 +20,9 @@ columns and a sidecar JSON for scalars/metadata — fast reload per §7.4.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -29,6 +31,8 @@ import pandas as pd
 from src.data.polymarket_api import RawTrade
 from src.inference.particle_gibbs import MarketData
 from src.utils.transforms import logit
+
+log = logging.getLogger(__name__)
 
 # ---------------- Wallet index ----------------
 
@@ -215,6 +219,63 @@ def clean_trades(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+# ---------------- Pre-resolution filter ----------------
+
+
+def _resolution_ts_from_end_date(end_date: str | None) -> float | None:
+    """Parse Gamma ``end_date`` (ISO or date-only) to unix seconds (UTC).
+
+    Args:
+        end_date: ISO-8601 string (e.g. ``2024-11-05T23:59:59Z``) or
+            date-only ``YYYY-MM-DD``; treated as UTC when naive.
+
+    Returns:
+        Unix timestamp as float, or ``None`` when ``end_date`` is missing,
+        empty, or unparseable.
+    """
+    if not end_date or not str(end_date).strip():
+        return None
+    text = str(end_date).strip()
+    for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(text, fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return float(dt.timestamp())
+        except ValueError:
+            continue
+    log.warning("Could not parse end_date %r; skipping pre-resolution filter.", text)
+    return None
+
+
+def filter_pre_resolution(
+    df: pd.DataFrame,
+    resolution_ts: float | None,
+    *,
+    days: float = 7.0,
+) -> pd.DataFrame:
+    """Drop trades within ``days`` of the market resolution time.
+
+    Keeps rows where ``timestamp < resolution_ts - days * 86400``. When
+    ``resolution_ts`` is ``None``, returns a copy of ``df`` unchanged.
+
+    Args:
+        df: Cleaned trade DataFrame with a ``timestamp`` column (unix
+            seconds).
+        resolution_ts: Market close/resolution time in unix seconds, or
+            ``None`` to skip filtering.
+        days: Exclusion window length in days before ``resolution_ts``
+            (keyword-only).
+
+    Returns:
+        Filtered copy of ``df``; input is never mutated.
+    """
+    if resolution_ts is None or df.empty:
+        return df.copy()
+    cutoff = resolution_ts - days * 86400.0
+    return df.loc[df["timestamp"] < cutoff].reset_index(drop=True)
+
+
 # ---------------- Feature computation ----------------
 
 
@@ -269,6 +330,8 @@ def build_processed_market(
     *,
     wallet_index: WalletIndex,
     slug: str = "",
+    resolution_ts: float | None = None,
+    pre_resolution_days: float = 7.0,
 ) -> ProcessedMarket:
     """Build a ProcessedMarket end-to-end from a list of raw trades.
 
@@ -281,15 +344,24 @@ def build_processed_market(
         wallet_index: Shared global index; updated in place with any
             new wallet addresses found in this market.
         slug: Human-readable market identifier stored in the result.
+        resolution_ts: Market close time (unix seconds); when set, trades
+            within ``pre_resolution_days`` of this time are dropped
+            after cleaning and before feature computation.
+        pre_resolution_days: Exclusion window in days before
+            ``resolution_ts`` (keyword-only; default 7).
 
     Returns:
         ProcessedMarket ready for inference and plotting.
 
     Raises:
-        ValueError: If no trades survive cleaning, or if the trades
-            span more than one condition_id.
+        ValueError: If no trades survive cleaning or pre-resolution
+            filtering, or if the trades span more than one condition_id.
     """
     df = clean_trades(trades_to_dataframe(trades))
+    if df.empty:
+        raise ValueError("build_processed_market: no trades survived cleaning.")
+
+    df = filter_pre_resolution(df, resolution_ts, days=pre_resolution_days)
     if df.empty:
         raise ValueError("build_processed_market: no trades survived cleaning.")
 
@@ -316,6 +388,9 @@ def build_processed_market(
 
 def build_genre_dataset(
     trades_by_market: list[tuple[str, list[RawTrade]]],
+    *,
+    resolution_ts_by_slug: dict[str, float | None] | None = None,
+    pre_resolution_days: float = 7.0,
 ) -> tuple[list[ProcessedMarket], WalletIndex]:
     """Process K markets sharing one global wallet index.
 
@@ -323,14 +398,23 @@ def build_genre_dataset(
         trades_by_market: list of (slug, raw_trades) pairs in the order to
             process. Slug is informational only (used for the
             ProcessedMarket.slug field and any sidecar metadata).
+        resolution_ts_by_slug: Optional mapping from slug to market close
+            time (unix seconds). Missing slugs are treated as unfiltered.
+        pre_resolution_days: Exclusion window in days before each market's
+            resolution time (keyword-only; default 7).
 
     Returns:
         (list[ProcessedMarket], WalletIndex). The index is built up across
         all markets in the input order so wallet ids are stable.
     """
+    resolution_map = resolution_ts_by_slug or {}
     cleaned: list[tuple[str, pd.DataFrame]] = []
     for slug, trades in trades_by_market:
         df = clean_trades(trades_to_dataframe(trades))
+        if df.empty:
+            raise ValueError(f"market {slug!r}: no trades survived cleaning.")
+        resolution_ts = resolution_map.get(slug)
+        df = filter_pre_resolution(df, resolution_ts, days=pre_resolution_days)
         if df.empty:
             raise ValueError(f"market {slug!r}: no trades survived cleaning.")
         cleaned.append((slug, df))

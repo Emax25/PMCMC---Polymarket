@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -13,10 +14,12 @@ from src.data.polymarket_api import RawTrade
 from src.data.preprocess import (
     ProcessedMarket,
     WalletIndex,
+    _resolution_ts_from_end_date,
     build_genre_dataset,
     build_processed_market,
     clean_trades,
     compute_features,
+    filter_pre_resolution,
     load_processed,
     save_processed,
     trades_to_dataframe,
@@ -173,6 +176,117 @@ def test_compute_features_empty_raises():
     """Empty DataFrame raises ValueError."""
     with pytest.raises(ValueError):
         compute_features(pd.DataFrame(columns=["timestamp", "price", "size"]))
+
+
+# ---------------- filter_pre_resolution ----------------
+
+
+def test_filter_pre_resolution_keeps_before_cutoff_drops_tail():
+    """Trades before the cutoff are kept; trades within N days are dropped."""
+    resolution_ts = 1_000_000.0
+    days = 7.0
+    cutoff = resolution_ts - days * 86400.0
+    df = pd.DataFrame(
+        {
+            "timestamp": [cutoff - 1.0, cutoff - 0.5, cutoff, cutoff + 1.0],
+            "price": [0.5] * 4,
+            "size": [10.0] * 4,
+            "wallet": ["0xA"] * 4,
+            "transaction_hash": ["0xT1", "0xT2", "0xT3", "0xT4"],
+            "side": ["BUY"] * 4,
+            "condition_id": ["0xab"] * 4,
+            "asset_id": ["1"] * 4,
+        }
+    )
+    out = filter_pre_resolution(df, resolution_ts, days=days)
+    assert out["timestamp"].tolist() == [cutoff - 1.0, cutoff - 0.5]
+    assert out is not df
+
+
+def test_filter_pre_resolution_none_returns_unchanged():
+    """resolution_ts=None skips filtering."""
+    df = pd.DataFrame({"timestamp": [1, 2, 3]})
+    out = filter_pre_resolution(df, None)
+    pd.testing.assert_frame_equal(out, df)
+    assert out is not df
+
+
+def test_resolution_ts_from_end_date_parses_iso_and_date_only():
+    """ISO-Z and date-only strings parse to unix seconds (UTC)."""
+    iso_ts = _resolution_ts_from_end_date("2024-11-05T23:59:59Z")
+    assert iso_ts == pytest.approx(
+        datetime(2024, 11, 5, 23, 59, 59, tzinfo=timezone.utc).timestamp()
+    )
+    date_ts = _resolution_ts_from_end_date("2024-11-05")
+    assert date_ts == pytest.approx(
+        datetime(2024, 11, 5, 0, 0, 0, tzinfo=timezone.utc).timestamp()
+    )
+
+
+def test_resolution_ts_from_end_date_none_and_garbage():
+    """None, empty, and unparseable strings return None."""
+    assert _resolution_ts_from_end_date(None) is None
+    assert _resolution_ts_from_end_date("") is None
+    assert _resolution_ts_from_end_date("not-a-date") is None
+
+
+def test_build_processed_market_pre_resolution_reduces_tail():
+    """resolution_ts removes late trades; None matches unfiltered count."""
+    base_ts = 1_700_000_000
+    trades = [
+        RawTrade.from_dict(
+            {
+                "proxyWallet": "0xA",
+                "side": "BUY",
+                "asset": "1",
+                "conditionId": "0xab1",
+                "size": "1",
+                "price": "0.5",
+                "timestamp": str(base_ts + i * 86400),
+                "transactionHash": f"0xT{i}",
+            }
+        )
+        for i in range(10)
+    ]
+    idx = WalletIndex()
+    unfiltered = build_processed_market(
+        trades, wallet_index=idx, resolution_ts=None
+    )
+    filtered = build_processed_market(
+        trades,
+        wallet_index=WalletIndex(),
+        resolution_ts=float(base_ts + 9 * 86400),
+        pre_resolution_days=7.0,
+    )
+    assert filtered.T < unfiltered.T
+    assert filtered.T == 2
+    assert unfiltered.T == 10
+
+
+def test_build_processed_market_empty_after_filter_raises():
+    """All trades within the exclusion window raises ValueError."""
+    base_ts = 1_700_000_000
+    trades = [
+        RawTrade.from_dict(
+            {
+                "proxyWallet": "0xA",
+                "side": "BUY",
+                "asset": "1",
+                "conditionId": "0xab1",
+                "size": "1",
+                "price": "0.5",
+                "timestamp": str(base_ts),
+                "transactionHash": "0xT0",
+            }
+        )
+    ]
+    with pytest.raises(ValueError, match="no trades survived cleaning"):
+        build_processed_market(
+            trades,
+            wallet_index=WalletIndex(),
+            resolution_ts=float(base_ts),
+            pre_resolution_days=7.0,
+        )
 
 
 # ---------------- build_processed_market ----------------

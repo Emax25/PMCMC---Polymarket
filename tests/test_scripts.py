@@ -15,7 +15,7 @@ import pytest
 
 matplotlib.use("Agg")
 
-from scripts import _runner, make_figures, pull_data, run_ipmcmc, run_pg
+from scripts import _runner, benchmark, make_figures, pull_data, run_ipmcmc, run_pg
 from src.data.polymarket_api import MarketMeta, RawTrade
 from src.inference.ipmcmc import iPMCMCOutput
 from src.inference.particle_gibbs import PGOutput
@@ -463,3 +463,49 @@ def test_make_figures_skips_roc_on_real_data(tmp_path, monkeypatch):
     )
     assert not (figs / "pg_roc.pdf").exists()
     assert (figs / "pg_alpha_overview.pdf").exists()
+
+
+# ---------------- benchmark.py ----------------
+
+
+_BENCHMARK_TINY = [
+    "--synthetic",
+    "--synthetic-K",
+    "2",
+    "--synthetic-T",
+    "40",
+    "--synthetic-n-wallets",
+    "8",
+    "--config",
+    "dev",
+    "--n-iter",
+    "6",
+    "--n-burnin",
+    "2",
+    "--n-particles",
+    "10",
+    "--n-runs",
+    "2",
+    "--threads",
+    "1",
+    "--log-level",
+    "WARNING",
+]
+
+
+def test_benchmark_smoke(tmp_path):
+    """benchmark.py runs on tiny synthetic scale and writes optional JSON."""
+    json_path = tmp_path / "bench.json"
+    rc = benchmark.main([*_BENCHMARK_TINY, "--json-out", str(json_path)])
+    assert rc == 0
+    assert json_path.exists()
+    payload = json.loads(json_path.read_text())
+    assert payload["inputs"]["synthetic"] is True
+    assert len(payload["timings"]["sec_per_run"]) == 2
+    assert "profile_tottime" in payload
+
+
+def test_benchmark_gate_smoke():
+    """benchmark.py --gate computes synthetic metrics without error."""
+    rc = benchmark.main([*_BENCHMARK_TINY, "--gate"])
+    assert rc == 0

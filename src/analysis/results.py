@@ -24,6 +24,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 from scipy.special import expit
+from scipy.stats import spearmanr
 
 from src.data.preprocess import WalletIndex
 from src.inference.diagnostics import (
@@ -327,6 +328,24 @@ def summarize_chain(
 
 
 # ---------------- Synthetic-validation metrics (§9) ----------------
+
+
+def spearman_theta_w(theta_true: np.ndarray, theta_post_mean: np.ndarray) -> float:
+    """Spearman rank correlation between true and posterior-mean wallet propensities.
+
+    Args:
+        theta_true: Ground-truth wallet propensities, shape ``(n_wallets,)``.
+        theta_post_mean: Posterior mean propensities, same shape.
+
+    Returns:
+        Spearman correlation in ``[-1, 1]``, or ``nan`` when either input is
+        constant (degenerate ranks; ``scipy.stats.spearmanr`` returns nan).
+    """
+    result = spearmanr(
+        np.asarray(theta_true, dtype=float),
+        np.asarray(theta_post_mean, dtype=float),
+    )
+    return float(result.correlation)
 
 
 def roc_auc(z_true: np.ndarray, z_score: np.ndarray) -> float:

@@ -8,6 +8,7 @@ import pytest
 from config.default_params import ModelParams
 from src.data.synthetic import generate_market
 from src.inference.kalman import (
+    _kalman_step_all_combos,
     ffbs_sample,
     kalman_filter,
     kalman_step,
@@ -72,6 +73,48 @@ def test_kalman_step_initial_observation(params):
     expected_S = params.s0_2 + params.tau2_0
     expected_log_lik = -0.5 * (np.log(2 * np.pi * expected_S) + y * y / expected_S)
     assert np.allclose(log_lik[0], expected_log_lik)
+
+
+def test_kalman_step_all_combos_matches_four_kalman_steps(params):
+    """Jitted all-combos kernel matches four separate kalman_step calls."""
+    rng = np.random.default_rng(42)
+    for _ in range(20):
+        N = rng.integers(8, 64)
+        mu = rng.standard_normal(N)
+        sigma2 = rng.uniform(0.05, 2.0, size=N)
+        y = float(rng.standard_normal())
+        delta = float(rng.exponential(1.0))
+        log_size_ratio = float(rng.standard_normal())
+
+        mu_combos, sigma2_combos, log_lik = _kalman_step_all_combos(
+            mu,
+            sigma2,
+            y,
+            delta,
+            log_size_ratio,
+            params.sigma2_0,
+            params.sigma2_1,
+            params.tau2_0,
+            params.tau2_1,
+            params.gamma,
+        )
+
+        for v in (0, 1):
+            for z in (0, 1):
+                k = 2 * v + z
+                mu_k, s2_k, ll_k = kalman_step(
+                    mu,
+                    sigma2,
+                    y,
+                    np.full(N, v, dtype=np.int8),
+                    np.full(N, z, dtype=np.int8),
+                    delta,
+                    log_size_ratio,
+                    params,
+                )
+                np.testing.assert_allclose(mu_combos[:, k], mu_k, atol=1e-10)
+                np.testing.assert_allclose(sigma2_combos[:, k], s2_k, atol=1e-10)
+                np.testing.assert_allclose(log_lik[:, k], ll_k, atol=1e-10)
 
 
 def test_kalman_step_vectorizes_over_particles(params):

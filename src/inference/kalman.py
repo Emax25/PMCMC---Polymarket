@@ -16,6 +16,7 @@ accumulate different conditional variances (decision #1).
 from __future__ import annotations
 
 import numpy as np
+from numba import njit
 
 from config.default_params import ModelParams
 
@@ -117,6 +118,52 @@ def kalman_step(
     log_lik = -0.5 * (_LOG_2PI + np.log(S) + innov * innov / S)
     log_lik = np.maximum(log_lik, _LOG_LIK_FLOOR)
     return mu_new, sigma2_new, log_lik
+
+
+@njit(cache=True, fastmath=False)
+def _kalman_step_all_combos(
+    mu: np.ndarray,
+    sigma2: np.ndarray,
+    y: float,
+    delta: float,
+    log_size_ratio: float,
+    sigma2_0: float,
+    sigma2_1: float,
+    tau2_0: float,
+    tau2_1: float,
+    gamma: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Predict+update all four (v, z) combos for every particle in one pass."""
+    N = mu.shape[0]
+    mu_combos = np.empty((N, 4))
+    sigma2_combos = np.empty((N, 4))
+    log_lik = np.empty((N, 4))
+    denom = max(1.0 + gamma * log_size_ratio, _DENOM_FLOOR)
+
+    for n in range(N):
+        mu_n = mu[n]
+        sigma2_n = sigma2[n]
+        innov = y - mu_n  # mu_pred = mu (random-walk transition)
+
+        for v in (0, 1):
+            Q = (sigma2_0 if v == 0 else sigma2_1) * delta
+            sigma2_pred = sigma2_n + Q
+
+            for z in (0, 1):
+                k = 2 * v + z
+                tau2_z = tau2_0 if z == 0 else tau2_1
+                R = tau2_z / denom
+                S = sigma2_pred + R
+                K = sigma2_pred / S
+
+                mu_combos[n, k] = mu_n + K * innov
+                sigma2_combos[n, k] = (1.0 - K) * sigma2_pred
+                ll = -0.5 * (_LOG_2PI + np.log(S) + innov * innov / S)
+                if ll < _LOG_LIK_FLOOR:
+                    ll = _LOG_LIK_FLOOR
+                log_lik[n, k] = ll
+
+    return mu_combos, sigma2_combos, log_lik
 
 
 def kalman_filter(

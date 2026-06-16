@@ -34,6 +34,7 @@ from src.data.polymarket_api import (
 )
 from src.data.preprocess import (
     ProcessedMarket,
+    _resolution_ts_from_end_date,
     build_genre_dataset,
     save_processed,
     save_wallet_index,
@@ -75,6 +76,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         nargs="+",
         default=list(SLUGS),
         help="Override the shortlist (debug). Defaults to the 10-market §5 set.",
+    )
+    p.add_argument(
+        "--pre-resolution-days",
+        type=float,
+        default=7.0,
+        help="Drop trades within N days of market resolution/close (default: 7). "
+        "Pass 0 to disable pre-resolution filtering.",
     )
     p.add_argument(
         "--log-level",
@@ -166,8 +174,37 @@ def main(argv: list[str] | None = None) -> int:
         sleep_between=args.sleep_between,
     )
 
+    resolution_ts_by_slug = {
+        meta.slug: _resolution_ts_from_end_date(meta.end_date) for meta in metas
+    }
+    n_with_resolution = sum(ts is not None for ts in resolution_ts_by_slug.values())
+    log.info(
+        "pre-resolution filter: %d/%d markets have a usable end_date "
+        "(--pre-resolution-days=%.1f)",
+        n_with_resolution,
+        len(metas),
+        args.pre_resolution_days,
+    )
+
+    raw_trade_counts = {slug: len(trades) for slug, trades in trades_by_market}
+
     log.info("cleaning + indexing across %d markets …", len(trades_by_market))
-    markets, wallet_index = build_genre_dataset(trades_by_market)
+    markets, wallet_index = build_genre_dataset(
+        trades_by_market,
+        resolution_ts_by_slug=resolution_ts_by_slug,
+        pre_resolution_days=args.pre_resolution_days,
+    )
+
+    if args.pre_resolution_days > 0 and n_with_resolution > 0:
+        dropped = sum(
+            raw_trade_counts[m.slug] - m.T
+            for m in markets
+            if resolution_ts_by_slug.get(m.slug) is not None
+        )
+        log.info(
+            "pre-resolution filter dropped %d trades across markets with end_date",
+            dropped,
+        )
 
     if args.tail_trades is not None:
         markets = [_tail(m, args.tail_trades) for m in markets]
