@@ -11,11 +11,21 @@ import pickle
 from pathlib import Path
 
 import matplotlib
+import pandas as pd
 import pytest
 
 matplotlib.use("Agg")
 
-from scripts import _runner, benchmark, make_figures, pull_data, run_ipmcmc, run_pg
+from scripts import (
+    _runner,
+    benchmark,
+    eval_c4,
+    make_figures,
+    pareto,
+    pull_data,
+    run_ipmcmc,
+    run_pg,
+)
 from src.data.polymarket_api import MarketMeta, RawTrade
 from src.inference.ipmcmc import iPMCMCOutput
 from src.inference.particle_gibbs import PGOutput
@@ -468,6 +478,30 @@ def test_make_figures_skips_roc_on_real_data(tmp_path, monkeypatch):
 # ---------------- benchmark.py ----------------
 
 
+_BENCHMARK_VEM_FILTER = [
+    "--synthetic",
+    "--synthetic-K",
+    "2",
+    "--synthetic-T",
+    "40",
+    "--synthetic-n-wallets",
+    "8",
+    "--config",
+    "dev",
+    "--n-iter",
+    "10",
+    "--n-burnin",
+    "2",
+    "--n-particles",
+    "10",
+    "--n-runs",
+    "1",
+    "--threads",
+    "1",
+    "--log-level",
+    "WARNING",
+]
+
 _BENCHMARK_TINY = [
     "--synthetic",
     "--synthetic-K",
@@ -509,3 +543,165 @@ def test_benchmark_gate_smoke():
     """benchmark.py --gate computes synthetic metrics without error."""
     rc = benchmark.main([*_BENCHMARK_TINY, "--gate"])
     assert rc == 0
+
+
+def test_benchmark_vem_smoke(tmp_path):
+    """benchmark.py --method vem runs and writes method key to JSON."""
+    json_path = tmp_path / "bench_vem.json"
+    rc = benchmark.main(
+        [
+            *_BENCHMARK_VEM_FILTER,
+            "--method",
+            "vem",
+            "--vem-iters",
+            "10",
+            "--json-out",
+            str(json_path),
+        ],
+    )
+    assert rc == 0
+    payload = json.loads(json_path.read_text())
+    assert payload["method"] == "vem"
+
+
+def test_benchmark_filter_gate_smoke(tmp_path):
+    """benchmark.py --method filter --gate runs and writes method key to JSON."""
+    json_path = tmp_path / "bench_filter.json"
+    rc = benchmark.main(
+        [
+            *_BENCHMARK_VEM_FILTER,
+            "--method",
+            "filter",
+            "--gate",
+            "--json-out",
+            str(json_path),
+        ],
+    )
+    assert rc == 0
+    payload = json.loads(json_path.read_text())
+    assert payload["method"] == "filter"
+
+
+# ---------------- eval_c4.py ----------------
+
+
+def test_eval_c4_smoke(tmp_path):
+    """eval_c4.py runs on tiny synthetic scale and writes gate_pass to JSON."""
+    json_path = tmp_path / "c4.json"
+    rc = eval_c4.main(
+        [
+            "--synthetic-K",
+            "2",
+            "--synthetic-T",
+            "60",
+            "--synthetic-n-wallets",
+            "10",
+            "--config",
+            "dev",
+            "--vem-iters",
+            "10",
+            "--json-out",
+            str(json_path),
+            "--log-level",
+            "WARNING",
+        ],
+    )
+    assert rc == 0
+    payload = json.loads(json_path.read_text())
+    assert "gate_pass" in payload
+    assert payload["inputs"]["synthetic"] is True
+
+
+# ---------------- pareto.py ----------------
+
+
+def _fake_bench_json(
+    *,
+    method: str = "pg",
+    mean_sec: float = 228.0,
+    ci_hw: float = 12.0,
+    pooled_auc: float = 0.91,
+    gate_pass: bool = True,
+    with_gate: bool = True,
+    kendall_tau: float | None = None,
+) -> dict:
+    """Minimal benchmark JSON payload for offline pareto.py tests."""
+    payload = {
+        "method": method,
+        "config": {
+            "N": 50,
+            "n_iter": 200,
+            "n_burnin": 50,
+            "seed_base": 42,
+            "threads": 1,
+        },
+        "inputs": {"K": 2, "synthetic": True, "seeds": [42, 43]},
+        "timings": {
+            "sec_per_run": [mean_sec - 1.0, mean_sec + 1.0],
+            "mean_sec_per_run": mean_sec,
+            "ci_half_width_sec_per_run": ci_hw,
+            "mean_sec_per_iter": mean_sec / 200.0,
+            "ci_half_width_sec_per_iter": ci_hw / 200.0,
+        },
+        "profile_tottime": None,
+        "gate": (
+            {
+                "pooled_auc": pooled_auc,
+                "gate_pass": gate_pass,
+            }
+            if with_gate
+            else None
+        ),
+    }
+    if kendall_tau is not None:
+        payload["kendall_tau_vs_baseline"] = kendall_tau
+    return payload
+
+
+def test_pareto_from_fake_benchmark_json(tmp_path):
+    """pareto.py plots gated benchmark JSON and writes PNG + CSV summary."""
+    bench_pg = tmp_path / "bench_pg.json"
+    bench_vem = tmp_path / "bench_vem.json"
+    bench_no_gate = tmp_path / "bench_no_gate.json"
+    bench_pg.write_text(json.dumps(_fake_bench_json(method="pg", mean_sec=228.0)))
+    bench_vem.write_text(
+        json.dumps(
+            _fake_bench_json(
+                method="vem",
+                mean_sec=45.0,
+                ci_hw=0.0,
+                pooled_auc=0.88,
+                kendall_tau=0.72,
+            )
+        )
+    )
+    bench_no_gate.write_text(json.dumps(_fake_bench_json(with_gate=False)))
+
+    png_out = tmp_path / "pareto.png"
+    csv_out = tmp_path / "pareto.csv"
+    rc = pareto.main(
+        [
+            "--bench-json",
+            str(bench_pg),
+            str(bench_vem),
+            str(bench_no_gate),
+            "--output",
+            str(png_out),
+            "--csv-out",
+            str(csv_out),
+            "--log-level",
+            "WARNING",
+        ]
+    )
+    assert rc == 0
+    assert png_out.exists() and png_out.stat().st_size > 0
+
+    table = pd.read_csv(csv_out)
+    assert len(table) == 2
+    assert set(table["method"]) == {"pg", "vem"}
+    assert table.loc[table["method"] == "pg", "pooled_auc"].iloc[0] == pytest.approx(
+        0.91
+    )
+    vem_row = table.loc[table["method"] == "vem"].iloc[0]
+    assert vem_row["kendall_tau_vs_baseline"] == pytest.approx(0.72)
+    assert vem_row["label"] == "vem N=50 it=200"

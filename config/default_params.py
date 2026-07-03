@@ -98,6 +98,9 @@ class InferenceConfig:
     rhat_threshold: float = 1.01
     degeneracy_threshold: float = 0.25  # flag if particle ESS < threshold * N
 
+    # joblib parallelism over K markets; 1 = sequential (reproducible); -1 = all CPUs
+    n_jobs: int = 1
+
     # Reproducibility
     seed: int = 42
 

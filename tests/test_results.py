@@ -12,10 +12,13 @@ from src.analysis.results import (
     count_wallet_trades,
     credible_interval,
     flagged_trade_indices,
+    insider_recall_at_k,
+    kendall_theta_w,
     posterior_pi_mean,
     posterior_regime_probability,
     posterior_X_mean,
     posterior_Z_probability,
+    recall_k_cutoff,
     roc_auc,
     roc_curve,
     spearman_theta_w,
@@ -250,6 +253,29 @@ def test_summarize_chain_returns_finite_rhat_for_ipmcmc(ipmcmc_output):
     assert (df["rhat"] > 0).all()
 
 
+# ---------------- Insider recall@K ----------------
+
+
+def test_recall_k_cutoff_top_decile_and_insiders():
+    """K is at least the insider count and the top decile."""
+    assert recall_k_cutoff(20, 3) == 3
+    assert recall_k_cutoff(100, 3) == 10
+
+
+def test_insider_recall_at_k_perfect_and_partial():
+    """Recall@K counts insiders in the top-K score ranks."""
+    scores = np.array([0.9, 0.1, 0.8, 0.2, 0.7])
+    insiders = [0, 2, 4]
+    assert insider_recall_at_k(scores, insiders, k=3) == pytest.approx(1.0)
+    assert insider_recall_at_k(scores, insiders, k=2) == pytest.approx(2 / 3)
+
+
+def test_insider_recall_at_k_empty_insiders():
+    """Empty insider list yields recall 1.0."""
+    scores = np.array([0.5, 0.1, 0.9])
+    assert insider_recall_at_k(scores, [], k=2) == 1.0
+
+
 # ---------------- ROC ----------------
 
 
@@ -306,3 +332,16 @@ def test_spearman_theta_w_constant_returns_nan():
     """Constant inputs yield nan (degenerate ranks)."""
     theta = np.array([0.5, 0.5, 0.5])
     assert np.isnan(spearman_theta_w(theta, theta))
+
+
+def test_kendall_theta_w_perfect_and_reversed():
+    """Kendall tau is ~1 for matching ranks and ~-1 when reversed."""
+    theta = np.array([0.1, 0.3, 0.5, 0.9])
+    assert kendall_theta_w(theta, theta) == pytest.approx(1.0)
+    assert kendall_theta_w(theta, theta[::-1]) == pytest.approx(-1.0)
+
+
+def test_kendall_theta_w_constant_returns_nan():
+    """Constant inputs yield nan (degenerate ranks)."""
+    theta = np.array([0.5, 0.5, 0.5])
+    assert np.isnan(kendall_theta_w(theta, theta))

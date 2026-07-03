@@ -1,18 +1,29 @@
-"""CLI: benchmark Particle Gibbs wall-clock and optional synthetic accuracy gate.
+"""CLI: benchmark inference wall-clock and optional synthetic accuracy gate.
 
-Measures end-to-end PG runtime across repeated seeds, attributes self-time to
-coarse buckets via cProfile (no hot-path instrumentation), and optionally
-runs the Stage-0 synthetic validation gate.
+Measures end-to-end runtime for Particle Gibbs, Variational EM, or a
+filter-only screening pass across repeated seeds, attributes self-time to
+coarse buckets via cProfile for PG only, and optionally runs the synthetic
+validation gate.
 
 Thread pinning: BLAS env vars are set from ``--threads`` before numpy is
 imported so wall-clock comparisons are not skewed by OpenBLAS/MKL defaults.
 
 Examples:
-    # Quick dev benchmark (default synthetic data)
+    # Quick dev benchmark (default synthetic data, Particle Gibbs)
     python -m scripts.benchmark --config dev
 
-    # Half-prod-ish benchmark (dev preset + overrides; no preset in _runner)
+    # Variational EM benchmark with synthetic gate
+    python -m scripts.benchmark --method vem --gate --vem-iters 50
+
+    # Filter-only screening pass
+    python -m scripts.benchmark --method filter --synthetic-K 2
+
+    # Half-prod-ish PG benchmark (dev preset + overrides)
     python -m scripts.benchmark --n-particles 250 --n-iter 1500 --n-burnin 300
+
+    # Cross-method theta comparison (Kendall tau vs saved baseline)
+    python -m scripts.benchmark --method vem --save-theta results/theta_vem.npy
+    python -m scripts.benchmark --method pg --compare-theta results/theta_vem.npy
 
     # Synthetic gate on the last timed run
     python -m scripts.benchmark --gate --strict
@@ -28,6 +39,7 @@ import os
 import pstats
 import sys
 import time
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -65,6 +77,16 @@ def _pin_blas_threads(threads: int) -> None:
 # Pin BLAS threads at import time when invoked as ``python -m scripts.benchmark``
 # so deferred numpy imports inside ``main`` see bounded thread counts.
 _pin_blas_threads(_parse_threads_early())
+
+
+@dataclass
+class _RunArtifacts:
+    """Outputs from the last timed inference run used for gate and theta export."""
+
+    theta_w: Any
+    z_scores_per_market: list[Any]
+    vem_n_iter_run: int | None = None
+    vem_final_elbo: float | None = None
 
 
 def _mean_ci(values: list[float], conf: float = 0.95) -> tuple[float, float]:
@@ -125,28 +147,146 @@ def _run_pg_timed(
     return chain, elapsed
 
 
+def _run_vem_timed(
+    markets: list[Any],
+    cfg: Any,
+    *,
+    seed: int,
+    n_wallets: int,
+    n_iter: int,
+    tol: float,
+) -> tuple[Any, float]:
+    """Run one VEM fit and return ``(VEMOutput, wall_seconds)``.
+
+    VEM is deterministic given inputs; ``seed`` is accepted for timing
+    parity with PG runs but does not affect the fit.
+    """
+    from src.inference.variational_em import variational_em
+
+    _ = seed
+    t0 = time.perf_counter()
+    out = variational_em(
+        markets,
+        cfg,
+        n_wallets=n_wallets,
+        n_iter=n_iter,
+        tol=tol,
+    )
+    elapsed = time.perf_counter() - t0
+    return out, elapsed
+
+
+def _run_filter_timed(
+    markets: list[Any],
+    cfg: Any,
+    *,
+    seed: int,
+    n_wallets: int,
+) -> tuple[_RunArtifacts, float]:
+    """Run filter-only screening and return artifacts plus wall seconds."""
+    import numpy as np
+
+    from config.default_params import ModelParams
+    from src.inference.smc import bootstrap_smc
+
+    rng = np.random.default_rng(seed)
+    Y_all = np.concatenate([md.Y for md in markets])
+    params = ModelParams.warm_start(Y_all)
+    theta_w = np.full(n_wallets, params.a / (params.a + params.b))
+
+    wallet_sum = np.zeros(n_wallets)
+    wallet_count = np.zeros(n_wallets, dtype=int)
+    z_scores_per_market: list[np.ndarray] = []
+
+    t0 = time.perf_counter()
+    for md in markets:
+        out = bootstrap_smc(
+            md.Y,
+            md.delta,
+            md.log_size_ratio,
+            md.wallet_ids,
+            theta_w,
+            params,
+            cfg,
+            rng=rng,
+        )
+        z_prob_filt = out.Z_prob_filt
+        z_scores_per_market.append(z_prob_filt)
+        wallet_sum += np.bincount(
+            md.wallet_ids,
+            weights=z_prob_filt,
+            minlength=n_wallets,
+        )
+        wallet_count += np.bincount(md.wallet_ids, minlength=n_wallets)
+    elapsed = time.perf_counter() - t0
+
+    wallet_scores = np.where(wallet_count > 0, wallet_sum / wallet_count, 0.0)
+    artifacts = _RunArtifacts(
+        theta_w=wallet_scores,
+        z_scores_per_market=z_scores_per_market,
+    )
+    return artifacts, elapsed
+
+
 def _time_runs(
+    method: str,
     markets: list[Any],
     cfg: Any,
     *,
     seeds: list[int],
     n_wallets: int,
-) -> tuple[list[float], list[float], Any]:
-    """Time full PG runs; return seconds, sec/iter, and the last chain."""
+    vem_iters: int,
+    vem_tol: float,
+) -> tuple[list[float], list[float], _RunArtifacts | Any]:
+    """Time inference runs; return seconds, sec/iter, and last-run artifacts."""
     sec_per_run: list[float] = []
     sec_per_iter: list[float] = []
-    last_chain = None
+    last_artifacts: _RunArtifacts | Any = None
+
     for seed in seeds:
-        chain, elapsed = _run_pg_timed(
-            markets,
-            cfg,
-            seed=seed,
-            n_wallets=n_wallets,
-        )
-        sec_per_run.append(elapsed)
-        sec_per_iter.append(elapsed / cfg.n_iter)
-        last_chain = chain
-    return sec_per_run, sec_per_iter, last_chain
+        if method == "pg":
+            chain, elapsed = _run_pg_timed(
+                markets,
+                cfg,
+                seed=seed,
+                n_wallets=n_wallets,
+            )
+            sec_per_run.append(elapsed)
+            sec_per_iter.append(elapsed / cfg.n_iter)
+            last_artifacts = chain
+        elif method == "vem":
+            out, elapsed = _run_vem_timed(
+                markets,
+                cfg,
+                seed=seed,
+                n_wallets=n_wallets,
+                n_iter=vem_iters,
+                tol=vem_tol,
+            )
+            sec_per_run.append(elapsed)
+            sec_per_iter.append(elapsed / out.n_iter_run)
+            last_artifacts = _RunArtifacts(
+                theta_w=out.theta_w,
+                z_scores_per_market=out.Z_prob,
+                vem_n_iter_run=out.n_iter_run,
+                vem_final_elbo=(
+                    float(out.elbo_trace[-1]) if len(out.elbo_trace) else float("nan")
+                ),
+            )
+        elif method == "filter":
+            artifacts, elapsed = _run_filter_timed(
+                markets,
+                cfg,
+                seed=seed,
+                n_wallets=n_wallets,
+            )
+            sec_per_run.append(elapsed)
+            sec_per_iter.append(elapsed)
+            last_artifacts = artifacts
+        else:
+            raise ValueError(f"unknown method: {method}")
+
+    return sec_per_run, sec_per_iter, last_artifacts
 
 
 def _profile_breakdown(
@@ -181,7 +321,13 @@ def _profile_breakdown(
         "other": 0.0,
     }
     stats = pstats.Stats(prof)
-    for (filename, _line, funcname), (_nc, _ncc, tottime, _cum, _callers) in stats.stats.items():
+    for (filename, _line, funcname), (
+        _nc,
+        _ncc,
+        tottime,
+        _cum,
+        _callers,
+    ) in stats.stats.items():
         bucket = _classify_profile_bucket(filename, funcname)
         buckets[bucket] += tottime
 
@@ -191,106 +337,64 @@ def _profile_breakdown(
     return {**buckets, "total": total}
 
 
-def _wallet_rank(rank_df: Any, wallet_id: int) -> int:
-    """Return 1-based rank of ``wallet_id`` in a posterior-mean ranking table."""
-    matches = rank_df.index[rank_df["wallet_id"] == wallet_id]
-    if len(matches) == 0:
-        return int(len(rank_df) + 1)
-    return int(matches[0]) + 1
+def _artifacts_from_pg(chain: Any, *, n_burnin: int) -> _RunArtifacts:
+    """Build gate artifacts from a PG chain."""
+    from src.analysis.results import posterior_Z_probability
+
+    z_scores = [
+        posterior_Z_probability(chain, market_idx=idx, n_burnin=n_burnin)
+        for idx in range(len(chain.Z))
+    ]
+    theta_w = chain.theta_w[n_burnin:].mean(axis=0)
+    return _RunArtifacts(theta_w=theta_w, z_scores_per_market=z_scores)
 
 
 def _run_gate(
-    chain: Any,
+    artifacts: _RunArtifacts,
     inputs: Any,
     *,
     n_burnin: int,
+    method: str,
     auc_target: float = 0.85,
 ) -> dict[str, Any]:
-    """Evaluate Stage-0 synthetic accuracy metrics on one PG chain."""
-    from src.analysis.results import (
-        count_wallet_trades,
-        posterior_Z_probability,
-        roc_auc,
-        spearman_theta_w,
-        wallet_ranking,
-    )
-    from src.data.synthetic import SyntheticMarket
+    """Evaluate synthetic gate from per-market z-scores and wallet scores."""
+    import numpy as np
+
+    from src.analysis.results import count_wallet_trades, evaluate_synthetic_gate
 
     if not inputs.is_synthetic:
         raise ValueError("--gate requires synthetic inputs")
+
+    if method == "pg":
+        if not hasattr(artifacts, "theta_w") or not hasattr(artifacts, "Z"):
+            raise TypeError("PG gate requires a PGOutput chain")
+        gate_artifacts = _artifacts_from_pg(artifacts, n_burnin=n_burnin)
+    else:
+        gate_artifacts = artifacts
 
     n_trades = count_wallet_trades(
         [md.wallet_ids for md in inputs.markets],
         n_wallets=inputs.wallet_index.n_wallets,
     )
-    rank_df = wallet_ranking(
-        chain,
+    return evaluate_synthetic_gate(
+        gate_artifacts.z_scores_per_market,
+        np.asarray(gate_artifacts.theta_w, dtype=float),
+        inputs.market_objs,
         inputs.wallet_index,
-        n_burnin=n_burnin,
         n_trades_per_wallet=n_trades,
+        auc_target=auc_target,
     )
-    theta_post = chain.theta_w[n_burnin:].mean(axis=0)
 
-    per_market_auc: list[float] = []
-    z_true_all: list[Any] = []
-    z_score_all: list[Any] = []
-    per_market_spearman: list[float] = []
 
-    for idx, mobj in enumerate(inputs.market_objs):
-        if not isinstance(mobj, SyntheticMarket):
-            continue
-        z_prob = posterior_Z_probability(chain, market_idx=idx, n_burnin=n_burnin)
-        z_true = mobj.Z.astype(int)
-        per_market_auc.append(float(roc_auc(z_true, z_prob)))
-        z_true_all.append(z_true)
-        z_score_all.append(z_prob)
-        per_market_spearman.append(
-            float(spearman_theta_w(mobj.theta_w, theta_post)),
-        )
-
+def _theta_vector(artifacts: _RunArtifacts | Any, *, method: str, n_burnin: int) -> Any:
+    """Extract per-wallet theta/score vector for save/compare."""
     import numpy as np
 
-    pooled_auc = float(
-        roc_auc(np.concatenate(z_true_all), np.concatenate(z_score_all)),
-    )
-    pooled_spearman = float(np.nanmean(per_market_spearman))
-
-    n_wallets = inputs.wallet_index.n_wallets
-    insider_ids = sorted(
-        {
-            wid
-            for mobj in inputs.market_objs
-            if isinstance(mobj, SyntheticMarket)
-            for wid in mobj.insider_wallet_ids
-        },
-    )
-    # "Planted insiders ranked at the top": the cutoff is a top slice of the
-    # wallet ranking, but it must be at least as large as the number of
-    # planted insiders -- otherwise the criterion is unsatisfiable (e.g. 3
-    # insiders can never all fit inside the top 2 of 20 wallets).
-    n_insiders = len(insider_ids)
-    top_cutoff = max(1, int(np.ceil(n_wallets * 0.1)), n_insiders)
-    insider_ranks = {wid: _wallet_rank(rank_df, wid) for wid in insider_ids}
-    insiders_in_top = all(rank <= top_cutoff for rank in insider_ranks.values())
-
-    auc_pass = pooled_auc >= auc_target
-    insider_pass = insiders_in_top
-    gate_pass = auc_pass and insider_pass
-
-    return {
-        "pooled_auc": pooled_auc,
-        "per_market_auc": per_market_auc,
-        "pooled_spearman": pooled_spearman,
-        "per_market_spearman": per_market_spearman,
-        "insider_wallet_ids": insider_ids,
-        "insider_ranks": insider_ranks,
-        "top_cutoff": top_cutoff,
-        "insiders_in_top": insiders_in_top,
-        "auc_pass": auc_pass,
-        "insider_pass": insider_pass,
-        "gate_pass": gate_pass,
-        "spearman_target": 0.9,
-    }
+    if method == "pg":
+        return np.asarray(_artifacts_from_pg(artifacts, n_burnin=n_burnin).theta_w)
+    if isinstance(artifacts, _RunArtifacts):
+        return np.asarray(artifacts.theta_w, dtype=float)
+    raise TypeError(f"cannot extract theta for method={method}")
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -298,13 +402,19 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     from scripts._runner import add_common_args
 
     p = argparse.ArgumentParser(
-        description="Benchmark Particle Gibbs runtime and optional synthetic gate.",
+        description="Benchmark inference runtime and optional synthetic gate.",
     )
     add_common_args(p)
     p.add_argument(
+        "--method",
+        choices=("pg", "vem", "filter"),
+        default="pg",
+        help="Inference method to benchmark (default: pg).",
+    )
+    p.add_argument(
         "--real",
         action="store_true",
-        help="Load processed markets from disk instead of synthetic (default: synthetic).",
+        help="Load processed markets from disk (default: synthetic).",
     )
     p.add_argument(
         "--threads",
@@ -313,10 +423,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Pin BLAS/OpenMP thread count for reproducible wall-clock (default: 8).",
     )
     p.add_argument(
+        "--n-jobs",
+        type=int,
+        default=1,
+        help="joblib workers for market parallelism in PG (default: 1).",
+    )
+    p.add_argument(
         "--n-runs",
         type=int,
         default=3,
-        help="Number of timed PG runs with distinct seeds (default: 3).",
+        help="Number of timed runs with distinct seeds (default: 3).",
     )
     p.add_argument(
         "--seeds",
@@ -326,14 +442,38 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Explicit RNG seeds for timed runs (default: base_seed + 0..n_runs-1).",
     )
     p.add_argument(
+        "--vem-iters",
+        type=int,
+        default=50,
+        help="Maximum EM iterations for --method vem (default: 50).",
+    )
+    p.add_argument(
+        "--vem-tol",
+        type=float,
+        default=1e-4,
+        help="ELBO convergence tolerance for --method vem (default: 1e-4).",
+    )
+    p.add_argument(
         "--gate",
         action="store_true",
-        help="Run synthetic accuracy gate on the last timed PG chain.",
+        help="Run synthetic accuracy gate on the last timed run.",
     )
     p.add_argument(
         "--strict",
         action="store_true",
         help="Exit with code 1 when --gate fails (default: report only).",
+    )
+    p.add_argument(
+        "--save-theta",
+        type=Path,
+        default=None,
+        help="Write per-wallet theta/scores from the last run to a .npy file.",
+    )
+    p.add_argument(
+        "--compare-theta",
+        type=Path,
+        default=None,
+        help="Load baseline .npy and report Kendall tau vs the last run.",
     )
     p.add_argument(
         "--json-out",
@@ -346,49 +486,82 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def _format_report(
     *,
+    method: str,
     cfg: Any,
     inputs: Any,
     seeds: list[int],
     sec_per_run: list[float],
     sec_per_iter: list[float],
-    profile_buckets: dict[str, float],
+    profile_buckets: dict[str, float] | None,
     gate: dict[str, Any] | None,
+    vem_n_iter_run: int | None,
+    vem_final_elbo: float | None,
+    kendall_tau_vs_baseline: float | None,
 ) -> str:
     """Build a human-readable benchmark report."""
     run_mean, run_hw = _mean_ci(sec_per_run)
     iter_mean, iter_hw = _mean_ci(sec_per_iter)
 
+    method_labels = {
+        "pg": "Particle Gibbs",
+        "vem": "Variational EM",
+        "filter": "Filter screen",
+    }
     lines = [
-        "=== Particle Gibbs benchmark ===",
+        f"=== {method_labels.get(method, method)} benchmark ===",
+        f"Method: {method}",
         f"Markets K={len(inputs.markets)}  N={cfg.N}  "
         f"n_iter={cfg.n_iter}  n_burnin={cfg.n_burnin}  "
         f"synthetic={inputs.is_synthetic}",
-        f"Seeds ({len(seeds)}): {seeds}",
-        "",
-        "Wall-clock (full PG run, seconds):",
     ]
-    for seed, elapsed in zip(seeds, sec_per_run):
-        lines.append(f"  seed={seed}: {elapsed:.3f}s  ({elapsed / cfg.n_iter:.4f}s/iter)")
+    if method == "vem" and vem_n_iter_run is not None:
+        lines.append(
+            f"VEM: n_iter_run={vem_n_iter_run}  final_elbo={vem_final_elbo:.4f}  "
+            f"(deterministic given inputs; seeds only affect timing repeats)",
+        )
+    elif method == "vem":
+        lines.append(
+            "VEM: deterministic given inputs; seeds only affect timing repeats",
+        )
+    lines.extend(
+        [
+            f"Seeds ({len(seeds)}): {seeds}",
+            "",
+            f"Wall-clock (full {method} run, seconds):",
+        ],
+    )
+    iter_label = "sec/iter" if method == "pg" else "sec/iter_equiv"
+    for seed, elapsed, spi in zip(seeds, sec_per_run, sec_per_iter):
+        lines.append(f"  seed={seed}: {elapsed:.3f}s  ({spi:.4f}s/{iter_label})")
     if len(sec_per_run) > 1:
         lines.append(f"  mean +/- CI: {run_mean:.3f} +/- {run_hw:.3f}s")
         lines.append(
-            f"  sec/iter mean +/- CI: {iter_mean:.4f} +/- {iter_hw:.4f}s",
+            f"  {iter_label} mean +/- CI: {iter_mean:.4f} +/- {iter_hw:.4f}s",
         )
     else:
-        lines.append(f"  mean: {run_mean:.3f}s  ({iter_mean:.4f}s/iter)")
+        lines.append(f"  mean: {run_mean:.3f}s  ({iter_mean:.4f}s/{iter_label})")
 
-    total = profile_buckets.get("total", 0.0)
-    lines.extend(["", "Cost breakdown (cProfile tottime, one run):"])
-    for bucket in ("kalman", "resample", "gibbs", "csmc_other", "other"):
-        secs = profile_buckets.get(bucket, 0.0)
-        pct = 100.0 * secs / total if total > 0 else 0.0
-        lines.append(f"  {bucket:12s}: {secs:8.3f}s  ({pct:5.1f}%)")
+    if profile_buckets is not None:
+        total = profile_buckets.get("total", 0.0)
+        lines.extend(["", "Cost breakdown (cProfile tottime, one run):"])
+        for bucket in ("kalman", "resample", "gibbs", "csmc_other", "other"):
+            secs = profile_buckets.get(bucket, 0.0)
+            pct = 100.0 * secs / total if total > 0 else 0.0
+            lines.append(f"  {bucket:12s}: {secs:8.3f}s  ({pct:5.1f}%)")
+
+    if kendall_tau_vs_baseline is not None:
+        lines.extend(
+            [
+                "",
+                f"Kendall tau vs baseline: {kendall_tau_vs_baseline:.4f}",
+            ],
+        )
 
     if gate is not None:
         lines.extend(
             [
                 "",
-                "Synthetic gate (Stage-0):",
+                "Synthetic gate (Stage-0/1):",
                 f"  pooled ROC AUC: {gate['pooled_auc']:.4f}  "
                 f"(target >= 0.85, {'PASS' if gate['auc_pass'] else 'FAIL'})",
             ],
@@ -417,7 +590,7 @@ def _format_report(
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Benchmark PG runtime and optionally evaluate the synthetic gate.
+    """Benchmark inference runtime and optionally evaluate the synthetic gate.
 
     Args:
         argv: Argument list passed to argparse; defaults to ``sys.argv[1:]``.
@@ -425,6 +598,10 @@ def main(argv: list[str] | None = None) -> int:
     Returns:
         Exit code (0 on success; 1 when ``--strict`` and gate fails).
     """
+    import numpy as np
+
+    from src.analysis.results import kendall_theta_w
+
     args = _parse_args(argv)
     _pin_blas_threads(args.threads)
 
@@ -439,9 +616,13 @@ def main(argv: list[str] | None = None) -> int:
     if not args.real:
         args.synthetic = True
 
-    cfg = build_config(args)
+    cfg = replace(build_config(args), n_jobs=args.n_jobs)
     base_seed = args.seed if args.seed is not None else cfg.seed
-    seeds = args.seeds if args.seeds is not None else [base_seed + i for i in range(args.n_runs)]
+    seeds = (
+        args.seeds
+        if args.seeds is not None
+        else [base_seed + i for i in range(args.n_runs)]
+    )
 
     if args.seeds is None and len(seeds) != args.n_runs:
         seeds = [base_seed + i for i in range(args.n_runs)]
@@ -457,37 +638,70 @@ def main(argv: list[str] | None = None) -> int:
         inputs = load_inputs(args, seed_fallback=cfg.seed)
 
     log.info(
-        "Benchmark: K=%d N=%d n_iter=%d threads=%d n_runs=%d",
+        "Benchmark method=%s K=%d N=%d n_iter=%d threads=%d n_jobs=%d n_runs=%d",
+        args.method,
         len(inputs.markets),
         cfg.N,
         cfg.n_iter,
         args.threads,
+        cfg.n_jobs,
         len(seeds),
     )
 
-    sec_per_run, sec_per_iter, last_chain = _time_runs(
+    sec_per_run, sec_per_iter, last_artifacts = _time_runs(
+        args.method,
         inputs.markets,
         cfg,
         seeds=seeds,
         n_wallets=inputs.wallet_index.n_wallets,
+        vem_iters=args.vem_iters,
+        vem_tol=args.vem_tol,
     )
 
-    profile_seed = seeds[0]
-    profile_buckets = _profile_breakdown(
-        inputs.markets,
-        cfg,
-        seed=profile_seed,
-        n_wallets=inputs.wallet_index.n_wallets,
-    )
+    profile_buckets: dict[str, float] | None = None
+    if args.method == "pg":
+        profile_buckets = _profile_breakdown(
+            inputs.markets,
+            cfg,
+            seed=seeds[0],
+            n_wallets=inputs.wallet_index.n_wallets,
+        )
+
+    vem_n_iter_run: int | None = None
+    vem_final_elbo: float | None = None
+    if isinstance(last_artifacts, _RunArtifacts):
+        vem_n_iter_run = last_artifacts.vem_n_iter_run
+        vem_final_elbo = last_artifacts.vem_final_elbo
 
     gate: dict[str, Any] | None = None
     if args.gate:
         if not inputs.is_synthetic:
             log.error("--gate requires synthetic inputs (omit --real)")
             return 1
-        gate = _run_gate(last_chain, inputs, n_burnin=cfg.n_burnin)
+        gate = _run_gate(
+            last_artifacts,
+            inputs,
+            n_burnin=cfg.n_burnin,
+            method=args.method,
+        )
+
+    theta_current = _theta_vector(
+        last_artifacts,
+        method=args.method,
+        n_burnin=cfg.n_burnin,
+    )
+    if args.save_theta is not None:
+        args.save_theta.parent.mkdir(parents=True, exist_ok=True)
+        np.save(args.save_theta, theta_current)
+        log.info("wrote theta %s", args.save_theta)
+
+    kendall_tau_vs_baseline: float | None = None
+    if args.compare_theta is not None:
+        baseline = np.load(args.compare_theta)
+        kendall_tau_vs_baseline = float(kendall_theta_w(baseline, theta_current))
 
     report = _format_report(
+        method=args.method,
         cfg=cfg,
         inputs=inputs,
         seeds=seeds,
@@ -495,6 +709,9 @@ def main(argv: list[str] | None = None) -> int:
         sec_per_iter=sec_per_iter,
         profile_buckets=profile_buckets,
         gate=gate,
+        vem_n_iter_run=vem_n_iter_run,
+        vem_final_elbo=vem_final_elbo,
+        kendall_tau_vs_baseline=kendall_tau_vs_baseline,
     )
     print(report)
 
@@ -502,10 +719,12 @@ def main(argv: list[str] | None = None) -> int:
         run_mean, run_hw = _mean_ci(sec_per_run)
         iter_mean, iter_hw = _mean_ci(sec_per_iter)
         payload: dict[str, Any] = {
+            "method": args.method,
             "config": {
                 "N": cfg.N,
                 "n_iter": cfg.n_iter,
                 "n_burnin": cfg.n_burnin,
+                "n_jobs": cfg.n_jobs,
                 "seed_base": base_seed,
                 "threads": args.threads,
             },
@@ -525,6 +744,15 @@ def main(argv: list[str] | None = None) -> int:
             "profile_tottime": profile_buckets,
             "gate": gate,
         }
+        if args.method == "vem":
+            payload["vem"] = {
+                "n_iter_run": vem_n_iter_run,
+                "final_elbo": vem_final_elbo,
+                "vem_iters": args.vem_iters,
+                "vem_tol": args.vem_tol,
+            }
+        if kendall_tau_vs_baseline is not None:
+            payload["kendall_tau_vs_baseline"] = kendall_tau_vs_baseline
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
         args.json_out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         log.info("wrote %s", args.json_out)

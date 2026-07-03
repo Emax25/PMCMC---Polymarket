@@ -7,7 +7,7 @@ import pytest
 
 from config.default_params import InferenceConfig, ModelParams
 from src.data.synthetic import generate_market
-from src.inference.particle_gibbs import MarketData, PGOutput, particle_gibbs
+from src.inference.particle_gibbs import MarketData, PGOutput, filter_screen, particle_gibbs
 
 
 @pytest.fixture
@@ -174,6 +174,96 @@ def test_pg_respects_provided_initial_reference():
         Z_ref_init=[Z_init],
     )
     assert out.V[0].shape == (1, md.T)
+
+
+def test_pg_parallel_shapes_match_sequential():
+    """particle_gibbs with n_jobs=2 produces same-shaped outputs as n_jobs=1."""
+    from dataclasses import replace
+    mkt = _make_synth(T=60, n_wallets=10, seed=5)
+    md = _to_market_data(mkt)
+    cfg_seq = InferenceConfig(N=20, n_iter=10, n_burnin=2, seed=0)
+    cfg_par = replace(cfg_seq, n_jobs=2)
+    out_seq = particle_gibbs([md], cfg_seq, rng=np.random.default_rng(0))
+    out_par = particle_gibbs([md], cfg_par, rng=np.random.default_rng(0))
+    assert out_par.sigma2_0.shape == out_seq.sigma2_0.shape
+    assert out_par.theta_w.shape == out_seq.theta_w.shape
+    assert out_par.Z[0].shape == out_seq.Z[0].shape
+    assert out_par.log_marg.shape == out_seq.log_marg.shape
+
+
+def test_pg_parallel_produces_finite_valid_outputs():
+    """parallel particle_gibbs produces finite, in-range outputs."""
+    from dataclasses import replace
+    mkts = [_make_synth(T=60, n_wallets=10, seed=s) for s in (1, 2)]
+    mds = [_to_market_data(m) for m in mkts]
+    cfg = InferenceConfig(N=20, n_iter=10, n_burnin=2, seed=0, n_jobs=2)
+    out = particle_gibbs(mds, cfg, rng=np.random.default_rng(0), n_wallets=10)
+    assert np.all(np.isfinite(out.sigma2_0))
+    assert np.all(out.sigma2_0 > 0)
+    assert np.all(np.isfinite(out.log_marg))
+    assert np.all((out.theta_w >= 0) & (out.theta_w <= 1))
+
+
+def test_filter_screen_returns_valid_wallet_scores():
+    """filter_screen returns per-wallet scores in [0, 1] with correct shape."""
+    mkt = _make_synth(T=80, n_wallets=10, n_insider=2, seed=3)
+    md = _to_market_data(mkt)
+    rng = np.random.default_rng(0)
+    Y_dummy = rng.standard_normal(200)
+    params = ModelParams.warm_start(Y_dummy)
+    theta_w = np.full(10, 0.05)
+    cfg = InferenceConfig(N=20)
+    scores = filter_screen([md], params, theta_w, cfg, rng=rng)
+    assert scores.shape == (10,)
+    assert np.all(scores >= 0.0) and np.all(scores <= 1.0)
+    assert np.all(np.isfinite(scores))
+
+
+def test_filter_screen_insiders_score_higher():
+    """filter_screen assigns higher Z_prob to true insider wallets on average."""
+    mkt = _make_synth(T=200, n_wallets=20, n_insider=3, seed=7)
+    md = _to_market_data(mkt)
+    rng = np.random.default_rng(1)
+    Y_dummy = rng.standard_normal(200)
+    params = ModelParams.warm_start(Y_dummy)
+    theta_w_true = np.where(
+        np.isin(np.arange(20), mkt.insider_wallet_ids), 0.9, 0.05
+    )
+    cfg = InferenceConfig(N=50)
+    scores = filter_screen([md], params, theta_w_true, cfg, rng=rng)
+    insider_mean = scores[mkt.insider_wallet_ids].mean()
+    regular_ids = [w for w in range(20) if w not in mkt.insider_wallet_ids]
+    regular_mean = scores[regular_ids].mean()
+    assert insider_mean > regular_mean, (
+        f"Insider mean Z_prob {insider_mean:.3f} should exceed regular {regular_mean:.3f}"
+    )
+
+
+def test_filter_screen_multi_market():
+    """filter_screen aggregates correctly across multiple markets."""
+    mkts = [_make_synth(T=60, n_wallets=10, seed=s) for s in (1, 2, 3)]
+    mds = [_to_market_data(m) for m in mkts]
+    rng = np.random.default_rng(0)
+    Y_dummy = rng.standard_normal(200)
+    params = ModelParams.warm_start(Y_dummy)
+    theta_w = np.full(10, 0.05)
+    cfg = InferenceConfig(N=20)
+    scores = filter_screen(mds, params, theta_w, cfg, rng=rng)
+    assert scores.shape == (10,)
+    assert np.all(np.isfinite(scores))
+
+
+def test_filter_screen_reproducible():
+    """filter_screen produces identical results for the same seed."""
+    mkt = _make_synth(T=80, n_wallets=10, seed=4)
+    md = _to_market_data(mkt)
+    Y_dummy = np.random.default_rng(0).standard_normal(200)
+    params = ModelParams.warm_start(Y_dummy)
+    theta_w = np.full(10, 0.05)
+    cfg = InferenceConfig(N=20)
+    s1 = filter_screen([md], params, theta_w, cfg, rng=np.random.default_rng(99))
+    s2 = filter_screen([md], params, theta_w, cfg, rng=np.random.default_rng(99))
+    np.testing.assert_array_equal(s1, s2)
 
 
 @pytest.mark.slow

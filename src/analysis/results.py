@@ -21,10 +21,12 @@ want a multi-chain R-hat.
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 import pandas as pd
 from scipy.special import expit
-from scipy.stats import spearmanr
+from scipy.stats import kendalltau, spearmanr
 
 from src.data.preprocess import WalletIndex
 from src.inference.diagnostics import (
@@ -346,6 +348,215 @@ def spearman_theta_w(theta_true: np.ndarray, theta_post_mean: np.ndarray) -> flo
         np.asarray(theta_post_mean, dtype=float),
     )
     return float(result.correlation)
+
+
+def kendall_theta_w(theta_true: np.ndarray, theta_est: np.ndarray) -> float:
+    """Kendall tau rank correlation between true and estimated wallet propensities.
+
+    Args:
+        theta_true: Ground-truth wallet propensities, shape ``(n_wallets,)``.
+        theta_est: Estimated propensities, same shape.
+
+    Returns:
+        Kendall tau in ``[-1, 1]``, or ``nan`` when either input is constant
+        (degenerate ranks; ``scipy.stats.kendalltau`` returns nan).
+    """
+    result = kendalltau(
+        np.asarray(theta_true, dtype=float),
+        np.asarray(theta_est, dtype=float),
+    )
+    return float(result.correlation)
+
+
+def rank_wallets_by_scores(
+    wallet_scores: np.ndarray,
+    wallet_index: WalletIndex,
+    *,
+    n_trades_per_wallet: dict[int, int] | None = None,
+) -> pd.DataFrame:
+    """Rank wallets by a per-wallet score vector descending.
+
+    Mirrors ``wallet_ranking`` column layout for gate/screening comparisons,
+    but accepts a single score per wallet instead of MCMC samples.
+
+    Args:
+        wallet_scores: Per-wallet scores, shape ``(n_wallets,)``; higher is
+            more suspicious.
+        wallet_index: Maps wallet id to address for table labels.
+        n_trades_per_wallet: Optional ``{wallet_id: trade_count}`` annotation.
+
+    Returns:
+        DataFrame with columns: wallet_id, wallet_address, posterior_mean,
+        posterior_median, ci_lo, ci_hi, n_trades. ``posterior_mean`` holds
+        the input score; median and CI columns duplicate it (point estimate).
+    """
+    scores = np.asarray(wallet_scores, dtype=float)
+    id_to_addr = {wid: addr for addr, wid in wallet_index.address_to_id.items()}
+    n_wallets = len(scores)
+    rows = []
+    for w in range(n_wallets):
+        score = float(scores[w])
+        rows.append(
+            {
+                "wallet_id": w,
+                "wallet_address": id_to_addr.get(w, ""),
+                "posterior_mean": score,
+                "posterior_median": score,
+                "ci_lo": score,
+                "ci_hi": score,
+                "n_trades": int((n_trades_per_wallet or {}).get(w, 0)),
+            }
+        )
+    df = pd.DataFrame(rows)
+    return df.sort_values("posterior_mean", ascending=False).reset_index(drop=True)
+
+
+def evaluate_synthetic_gate(
+    z_scores_per_market: list[np.ndarray],
+    wallet_scores: np.ndarray,
+    market_objs: list[Any],
+    wallet_index: WalletIndex,
+    *,
+    n_trades_per_wallet: dict[int, int] | None = None,
+    auc_target: float = 0.85,
+) -> dict[str, Any]:
+    """Evaluate Stage-0/1 synthetic accuracy metrics from z-scores and wallet scores.
+
+    Wallet ranking uses raw per-wallet scores (no MCMC credible intervals).
+    Tie-breaking follows ``DataFrame.sort_values`` on ``posterior_mean`` only;
+    low-trade wallets are annotated but not filtered from the ranking.
+
+    Args:
+        z_scores_per_market: Per-market insider anomaly scores, each shape
+            ``(T_k,)``; higher indicates a more likely insider trade.
+        wallet_scores: Per-wallet propensity estimates, shape ``(n_wallets,)``.
+        market_objs: Synthetic market objects with ground-truth ``Z`` and
+            ``theta_w``; non-synthetic entries are skipped.
+        wallet_index: Wallet index for ranking table labels.
+        n_trades_per_wallet: Optional trade-count annotation for ranking.
+        auc_target: Minimum pooled ROC AUC required for gate pass.
+
+    Returns:
+        Dict with pooled/per-market AUC, Spearman vs ground-truth theta_w,
+        insider-rank checks, and ``gate_pass`` boolean.
+    """
+    from src.data.synthetic import SyntheticMarket
+
+    rank_df = rank_wallets_by_scores(
+        wallet_scores,
+        wallet_index,
+        n_trades_per_wallet=n_trades_per_wallet,
+    )
+    theta_post = np.asarray(wallet_scores, dtype=float)
+
+    per_market_auc: list[float] = []
+    z_true_all: list[np.ndarray] = []
+    z_score_all: list[np.ndarray] = []
+    per_market_spearman: list[float] = []
+
+    for idx, mobj in enumerate(market_objs):
+        if not isinstance(mobj, SyntheticMarket):
+            continue
+        z_prob = np.asarray(z_scores_per_market[idx], dtype=float)
+        z_true = mobj.Z.astype(int)
+        per_market_auc.append(float(roc_auc(z_true, z_prob)))
+        z_true_all.append(z_true)
+        z_score_all.append(z_prob)
+        per_market_spearman.append(float(spearman_theta_w(mobj.theta_w, theta_post)))
+
+    pooled_auc = float(
+        roc_auc(np.concatenate(z_true_all), np.concatenate(z_score_all)),
+    )
+    pooled_spearman = float(np.nanmean(per_market_spearman))
+
+    n_wallets = wallet_index.n_wallets
+    insider_ids = sorted(
+        {
+            wid
+            for mobj in market_objs
+            if isinstance(mobj, SyntheticMarket)
+            for wid in mobj.insider_wallet_ids
+        },
+    )
+    n_insiders = len(insider_ids)
+    top_cutoff = max(1, int(np.ceil(n_wallets * 0.1)), n_insiders)
+    insider_ranks = {
+        wid: (
+            int(rank_df.index[rank_df["wallet_id"] == wid][0]) + 1
+            if len(rank_df.index[rank_df["wallet_id"] == wid]) > 0
+            else int(len(rank_df) + 1)
+        )
+        for wid in insider_ids
+    }
+    insiders_in_top = all(rank <= top_cutoff for rank in insider_ranks.values())
+
+    auc_pass = pooled_auc >= auc_target
+    insider_pass = insiders_in_top
+    gate_pass = auc_pass and insider_pass
+
+    return {
+        "pooled_auc": pooled_auc,
+        "per_market_auc": per_market_auc,
+        "pooled_spearman": pooled_spearman,
+        "per_market_spearman": per_market_spearman,
+        "insider_wallet_ids": insider_ids,
+        "insider_ranks": insider_ranks,
+        "top_cutoff": top_cutoff,
+        "insiders_in_top": insiders_in_top,
+        "auc_pass": auc_pass,
+        "insider_pass": insider_pass,
+        "gate_pass": gate_pass,
+        "spearman_target": 0.9,
+    }
+
+
+def recall_k_cutoff(n_wallets: int, n_insiders: int) -> int:
+    """Default K for insider recall@K (top decile, at least all insiders).
+
+    Matches the Stage-3 C4 gate: ``K = max(ceil(0.1 * n_wallets), n_insiders)``.
+
+    Args:
+        n_wallets: Total wallet count in the ranking.
+        n_insiders: Number of planted insider wallets.
+
+    Returns:
+        Integer cutoff rank (1-based top-K size).
+    """
+    return max(int(np.ceil(n_wallets * 0.1)), n_insiders)
+
+
+def insider_recall_at_k(
+    scores: np.ndarray,
+    insider_ids: list[int] | np.ndarray,
+    *,
+    k: int,
+) -> float:
+    """Compute planted-insider recall@K from a per-wallet score vector.
+
+    Wallets are ranked by ``scores`` descending (stable sort on ties). Recall is
+    the fraction of ``insider_ids`` whose wallet index appears in the top ``k``
+    ranks.
+
+    Args:
+        scores: Per-wallet scores, shape ``(n_wallets,)``; higher is more
+            suspicious.
+        insider_ids: Ground-truth insider wallet indices.
+        k: Number of top-ranked wallets treated as retrieved.
+
+    Returns:
+        Recall in ``[0, 1]``. Returns ``1.0`` when ``insider_ids`` is empty.
+    """
+    insiders = np.asarray(insider_ids, dtype=int)
+    n_insiders = int(insiders.size)
+    if n_insiders == 0:
+        return 1.0
+
+    scores_arr = np.asarray(scores, dtype=float)
+    k_eff = min(max(1, int(k)), scores_arr.size)
+    order = np.argsort(-scores_arr, kind="mergesort")
+    top_k = set(order[:k_eff].tolist())
+    hits = sum(1 for wid in insiders if int(wid) in top_k)
+    return hits / n_insiders
 
 
 def roc_auc(z_true: np.ndarray, z_score: np.ndarray) -> float:

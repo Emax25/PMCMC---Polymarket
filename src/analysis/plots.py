@@ -571,3 +571,107 @@ def figure_synthetic_validation(
         plot_roc(z_true, z_score, label=label, ax=ax)
     fig.tight_layout()
     return fig
+
+
+def _format_wall_time(seconds: float) -> str:
+    """Format elapsed seconds as a compact human-readable duration."""
+    if seconds < 60.0:
+        return f"{seconds:.1f} s"
+    if seconds < 3600.0:
+        return f"{seconds / 60.0:.1f} min"
+    return f"{seconds / 3600.0:.1f} hr"
+
+
+def pareto_plot(
+    rows: pd.DataFrame,
+    *,
+    title: str | None = None,
+    gate_threshold: float = 0.85,
+    figsize: tuple[float, float] = (6.0, 4.0),
+) -> plt.Figure:
+    """Pareto scatter: synthetic pooled ROC AUC vs mean wall-clock per run.
+
+    Each row supplies ``mean_sec_per_run``, ``ci_half_width`` (optional
+    horizontal error bar when positive), ``pooled_auc``, and ``label``.
+    The x-axis is log-scaled in seconds; a horizontal reference marks
+    the synthetic validation gate threshold.
+
+    Args:
+        rows: DataFrame with columns ``label``, ``mean_sec_per_run``,
+            ``ci_half_width``, and ``pooled_auc``; one point per method
+            or configuration.
+        title: Optional figure title; omitted when None.
+        gate_threshold: Horizontal AUC reference line (default 0.85).
+        figsize: Figure dimensions in inches ``(width, height)``.
+
+    Returns:
+        Figure containing the Pareto scatter with annotations.
+
+    Raises:
+        ValueError: If ``rows`` is empty or required columns are missing.
+    """
+    required = ("label", "mean_sec_per_run", "ci_half_width", "pooled_auc")
+    missing = [c for c in required if c not in rows.columns]
+    if missing:
+        raise ValueError(f"rows missing columns: {missing}")
+    if len(rows) == 0:
+        raise ValueError("rows is empty; nothing to plot")
+
+    fig, ax = plt.subplots(figsize=figsize)
+    x = rows["mean_sec_per_run"].to_numpy(dtype=float)
+    y = rows["pooled_auc"].to_numpy(dtype=float)
+    ci = rows["ci_half_width"].to_numpy(dtype=float)
+    labels = rows["label"].tolist()
+
+    xerr = np.where(ci > 0.0, ci, np.nan)
+    has_xerr = np.any(np.isfinite(xerr))
+    if has_xerr:
+        ax.errorbar(
+            x,
+            y,
+            xerr=xerr,
+            fmt="none",
+            ecolor="0.45",
+            elinewidth=0.9,
+            capsize=2.5,
+            zorder=1,
+        )
+
+    for i, (xi, yi, lab) in enumerate(zip(x, y, labels)):
+        color = f"C{i % 10}"
+        ax.plot(xi, yi, "o", color=color, ms=7, zorder=2)
+        time_txt = _format_wall_time(float(xi))
+        ax.annotate(
+            lab,
+            (xi, yi),
+            textcoords="offset points",
+            xytext=(6, 6),
+            fontsize=7,
+            color=color,
+        )
+        ax.annotate(
+            time_txt,
+            (xi, yi),
+            textcoords="offset points",
+            xytext=(6, -10),
+            fontsize=6,
+            color="0.35",
+        )
+
+    ax.axhline(
+        gate_threshold,
+        color="0.55",
+        lw=0.9,
+        ls="--",
+        label="gate threshold",
+        zorder=0,
+    )
+    ax.set_xscale("log")
+    ax.set_xlabel("wall-clock per run (seconds, log scale)")
+    ax.set_ylabel("pooled synthetic ROC AUC")
+    ax.set_ylim(0.0, 1.02)
+    ax.legend(loc="lower right")
+    if title:
+        ax.set_title(title)
+    fig.tight_layout()
+    return fig

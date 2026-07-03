@@ -27,6 +27,7 @@ import copy
 from dataclasses import dataclass
 
 import numpy as np
+from joblib import Parallel, delayed
 
 from config.default_params import InferenceConfig, ModelParams
 from src.inference.csmc import conditional_smc
@@ -127,6 +128,94 @@ def _csmc_then_ffbs(
         rng,
     )
     return V_new, Z_new, X_new, out.log_marginal
+
+
+def _filter_screen_worker(
+    md: MarketData,
+    theta_w: np.ndarray,
+    params: ModelParams,
+    config: InferenceConfig,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Run bootstrap_smc on one market and return Z_prob_filt."""
+    out = bootstrap_smc(
+        md.Y,
+        md.delta,
+        md.log_size_ratio,
+        md.wallet_ids,
+        theta_w,
+        params,
+        config,
+        rng=rng,
+    )
+    return out.Z_prob_filt
+
+
+def filter_screen(
+    markets: list[MarketData],
+    params: ModelParams,
+    theta_w: np.ndarray,
+    config: InferenceConfig,
+    *,
+    rng: np.random.Generator,
+    n_jobs: int = 1,
+) -> np.ndarray:
+    """Fast filter-only screening pass: one SMC filter per market, no MCMC.
+
+    Runs bootstrap SMC on each market with the given (fixed) parameters and
+    theta_w, returning per-wallet aggregate Z_prob scores suitable for ranking
+    wallets by insider propensity without a full MCMC run.
+
+    This is the "fast shortlist" tier: run filter_screen first, then run
+    full particle_gibbs only on the flagged wallets/markets.
+
+    Args:
+        markets: List of K markets.
+        params: Fixed model parameters (e.g. warm-start or PG posterior mean).
+        theta_w: Fixed per-wallet insider propensities, shape (n_wallets,).
+        config: InferenceConfig; uses N and ess_resample_threshold.
+        rng: Random generator.
+        n_jobs: joblib workers for market parallelism (1 = sequential).
+
+    Returns:
+        wallet_scores: shape (n_wallets,) — mean Z_prob aggregated over all
+            trades belonging to each wallet across all markets. Wallets with
+            no trades get score 0.0.
+    """
+    K = len(markets)
+    n_wallets = len(theta_w)
+    wallet_sum = np.zeros(n_wallets)
+    wallet_count = np.zeros(n_wallets, dtype=int)
+
+    if n_jobs == 1:
+        for md in markets:
+            out = bootstrap_smc(
+                md.Y,
+                md.delta,
+                md.log_size_ratio,
+                md.wallet_ids,
+                theta_w,
+                params,
+                config,
+                rng=rng,
+            )
+            wallet_sum += np.bincount(md.wallet_ids, weights=out.Z_prob_filt, minlength=n_wallets)
+            wallet_count += np.bincount(md.wallet_ids, minlength=n_wallets)
+    else:
+        child_rngs = [
+            np.random.default_rng(s)
+            for s in np.random.SeedSequence(rng.integers(2**63)).spawn(K)
+        ]
+        z_probs = Parallel(n_jobs=n_jobs, prefer="processes")(
+            delayed(_filter_screen_worker)(markets[k], theta_w, params, config, child_rngs[k])
+            for k in range(K)
+        )
+        for k, z_prob_filt in enumerate(z_probs):
+            md = markets[k]
+            wallet_sum += np.bincount(md.wallet_ids, weights=z_prob_filt, minlength=n_wallets)
+            wallet_count += np.bincount(md.wallet_ids, minlength=n_wallets)
+
+    return np.where(wallet_count > 0, wallet_sum / wallet_count, 0.0)
 
 
 def particle_gibbs(
@@ -240,33 +329,63 @@ def particle_gibbs(
     for it in iterator:
         # ----- CSMC + FFBS per market -----
         latents: list[MarketLatents] = []
-        for k, md in enumerate(markets):
-            V_new, Z_new, X_new, lm = _csmc_then_ffbs(
-                md,
-                theta_w,
-                params,
-                config,
-                V_refs[k],
-                Z_refs[k],
-                rng,
-            )
-            V_refs[k] = V_new
-            Z_refs[k] = Z_new
-            log_marg[it, k] = lm
-            X_chains[k][it] = X_new
-            V_chains[k][it] = V_new
-            Z_chains[k][it] = Z_new
-            latents.append(
-                MarketLatents(
-                    Y=md.Y,
-                    delta=md.delta,
-                    log_size_ratio=md.log_size_ratio,
-                    wallet_ids=md.wallet_ids,
-                    X=X_new,
-                    V=V_new,
-                    Z=Z_new,
+        if config.n_jobs == 1:
+            for k, md in enumerate(markets):
+                V_new, Z_new, X_new, lm = _csmc_then_ffbs(
+                    md,
+                    theta_w,
+                    params,
+                    config,
+                    V_refs[k],
+                    Z_refs[k],
+                    rng,
                 )
+                V_refs[k] = V_new
+                Z_refs[k] = Z_new
+                log_marg[it, k] = lm
+                X_chains[k][it] = X_new
+                V_chains[k][it] = V_new
+                Z_chains[k][it] = Z_new
+                latents.append(
+                    MarketLatents(
+                        Y=md.Y,
+                        delta=md.delta,
+                        log_size_ratio=md.log_size_ratio,
+                        wallet_ids=md.wallet_ids,
+                        X=X_new,
+                        V=V_new,
+                        Z=Z_new,
+                    )
+                )
+        else:
+            iter_seed = int(rng.integers(2**63))
+            ss = np.random.SeedSequence(iter_seed)
+            child_seeds = ss.spawn(K)
+            child_rngs = [np.random.default_rng(s) for s in child_seeds]
+            results = Parallel(n_jobs=config.n_jobs, prefer="processes")(
+                delayed(_csmc_then_ffbs)(
+                    markets[k], theta_w, params, config, V_refs[k], Z_refs[k], child_rngs[k]
+                )
+                for k in range(K)
             )
+            for k, (V_new, Z_new, X_new, lm) in enumerate(results):
+                V_refs[k] = V_new
+                Z_refs[k] = Z_new
+                log_marg[it, k] = lm
+                X_chains[k][it] = X_new
+                V_chains[k][it] = V_new
+                Z_chains[k][it] = Z_new
+                latents.append(
+                    MarketLatents(
+                        Y=markets[k].Y,
+                        delta=markets[k].delta,
+                        log_size_ratio=markets[k].log_size_ratio,
+                        wallet_ids=markets[k].wallet_ids,
+                        X=X_new,
+                        V=V_new,
+                        Z=Z_new,
+                    )
+                )
 
         # ----- Gibbs sweep on parameters -----
         params, theta_w, diag = gibbs_sweep(params, theta_w, latents, config, rng)
