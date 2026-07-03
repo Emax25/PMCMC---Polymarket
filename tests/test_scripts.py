@@ -222,6 +222,17 @@ def test_run_pg_synthetic_writes_pickle(tmp_path):
     assert len(payload["market_objs"]) == 2
 
 
+def test_run_pg_n_jobs_defaults_to_one_and_is_overridable():
+    """--n-jobs defaults to 1 (sequential, bit-exact) and can be overridden."""
+    args_default = run_pg._parse_args(["--synthetic", "--config", "dev"])
+    assert args_default.n_jobs == 1
+
+    args_override = run_pg._parse_args(
+        ["--synthetic", "--config", "dev", "--n-jobs", "4"]
+    )
+    assert args_override.n_jobs == 4
+
+
 def test_run_ipmcmc_synthetic_writes_pickle(tmp_path):
     """run_ipmcmc.py --synthetic writes an iPMCMCOutput with (n_iter, P) shape."""
     out = tmp_path / "ip.pkl"

@@ -22,6 +22,7 @@ import argparse
 import logging
 import sys
 import time
+from dataclasses import replace
 
 import numpy as np
 
@@ -46,6 +47,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Suppress tqdm progress bar (CI / non-TTY).",
     )
+    p.add_argument(
+        "--n-jobs",
+        type=int,
+        default=1,
+        help="joblib workers for market parallelism in PG (default: 1).",
+    )
     return p.parse_args(argv)
 
 
@@ -65,15 +72,16 @@ def main(argv: list[str] | None = None) -> int:
         datefmt="%H:%M:%S",
     )
 
-    cfg = build_config(args)
+    cfg = replace(build_config(args), n_jobs=args.n_jobs)
     inputs = load_inputs(args, seed_fallback=cfg.seed)
     log.info(
-        "PG: K=%d markets, N=%d particles, n_iter=%d (burn-in %d), seed=%d",
+        "PG: K=%d markets, N=%d particles, n_iter=%d (burn-in %d), seed=%d, n_jobs=%d",
         len(inputs.markets),
         cfg.N,
         cfg.n_iter,
         cfg.n_burnin,
         cfg.seed,
+        cfg.n_jobs,
     )
     for md in inputs.markets:
         log.info("  T=%-6d wallets=%d", md.T, int(md.wallet_ids.max()) + 1)
