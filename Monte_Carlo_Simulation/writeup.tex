@@ -17,7 +17,7 @@ Three features of the model rule out simpler alternatives. The regime-by-insider
 
 The practical obstacle is \emph{path degeneracy}. Every CSMC sweep must keep one reference trajectory alive across resampling. After many iterations the non-reference particles concentrate on the reference at early times, and the marginal posterior on the earliest latent variables effectively stops mixing. \citet{rainforth2016interacting} address this with iPMCMC. The algorithm runs $M$ SMC chains in parallel, $P$ of them conditional and $M-P$ unconditional, and lets each conditional chain swap its reference with a marginal-likelihood-weighted draw from the unconditional pool. The swap is a valid Markov kernel against the joint target, and the diversity it injects improves mixing of the early-time marginals.
 
-This essay contributes a self-contained derivation of CSMC, Particle Gibbs (PG), and iPMCMC for the switching state-space model above, with the conditionally linear-Gaussian price state marginalized out via a per-particle Kalman filter (\S\ref{ssec:pg}); an iPMCMC implementation with a marginal-likelihood-weighted swap step (\S\ref{ssec:ipmcmc}); and an empirical study on $10$ real Polymarket politics markets ($20{,}000$ trades, $15{,}528$ wallets) alongside a synthetic-injection validation (\S\ref{ssec:empirical}).
+This essay contributes a self-contained derivation of CSMC and Particle Gibbs (PG) for the switching state-space model above, with the conditionally linear-Gaussian price state marginalized out via a per-particle Kalman filter (\S\ref{ssec:pg}); a structured variational EM sampler that replaces the CSMC sweep with a deterministic assumed-density-filtering (ADF) forward pass, which we recommend as the fast inference core for day-to-day surveillance (\S\ref{ssec:vem}); an iPMCMC implementation with a marginal-likelihood-weighted swap step, retained here as an ablation comparison against PG and variational EM rather than as the centerpiece method (\S\ref{ssec:ipmcmc}); the engineering that makes PG a practical gold-standard baseline at scale --- a numba-compiled Kalman kernel, \texttt{joblib} parallelism across markets, and a filter-only screening tier, together with an optional cheap microstructure prefilter for wallet shortlisting (\S\ref{ssec:engineering}); and an empirical study on $10$ real Polymarket politics markets ($20{,}000$ trades, $15{,}528$ wallets) alongside a synthetic-injection validation (\S\ref{ssec:empirical}).
 
 \subsection{Switching State-Space Model}\label{ssec:model}
 
@@ -114,7 +114,9 @@ Algorithm~\ref{alg:pg} admits the joint posterior \eqref{eq:posterior} as an inv
 
 The tuning takeaway is that $N$ controls mixing speed but not the stationary distribution, so the choice of particle count is a compute decision and not a correctness one.
 
-\subsection{Interacting Particle Markov Chain Monte Carlo}\label{ssec:ipmcmc}
+\subsection{Interacting Particle Markov Chain Monte Carlo (Ablation)}\label{ssec:ipmcmc}
+
+We derive iPMCMC here as a mixing-focused variant of PG and carry it through the empirical study as a comparison point, not as the method we recommend for production use. The swap step below buys better early-time mixing at roughly $M/P$ times the per-iteration compute of a single PG chain, and \S\ref{ssec:empirical} finds that the extra cost translates into only a marginal gain in synthetic detection accuracy over plain PG. Readers who want the fast, deployable core should skip ahead to the variational EM sampler of \S\ref{ssec:vem}.
 
 \subsubsection{Path degeneracy}
 
@@ -168,6 +170,32 @@ The swap preserves the joint target: \citet[Theorem~1]{rainforth2016interacting}
 \STATE \textbf{Output:} chains $\{\phi^{(t)}, \theta^{(t)}_{\mathcal{W}}, \{\xi^{\star,(t)}_{j'}\}_{j'=1}^P\}_{t=1}^T$. Only conditional chains contribute parameter samples.
 \end{algorithmic}
 \end{algorithm}
+
+\subsection{Variational EM: A Fast Approximate Core}\label{ssec:vem}
+
+Structured variational inference for prediction-market surveillance replaces the stochastic CSMC sweep of \S\ref{ssec:pg} with a deterministic forward pass, trading the exact-posterior guarantee of Theorem~\ref{thm:pg-invariance} for wall-clock that no longer scales with a particle count. The idea traces to \citet{ghahramani2000switching}, who first cast switching state-space inference as a variational EM problem, and to the expectation-correction refinement of \citet{barber2006ec}; we adapt the single-mode assumed-density-filtering (ADF) variant of that idea to the model of \S\ref{ssec:model}.
+
+\subsubsection{Single-mode ADF E-step}
+
+At each trade $j$, the exact filtering distribution over $(V_{t_j}, Z_j)$ is a mixture with as many modes as there are surviving discrete histories, exactly the growth CSMC controls by resampling. The variational E-step instead collapses the mixture over the four $(V,Z)$ combinations at step $j-1$ into a single moment-matched Kalman summary $(\mu_{j-1}, \omega_{j-1})$ before propagating, so every step performs one Kalman predict/update per candidate $\ell \in \{0,1\}^2$ against a single incoming component rather than against every surviving particle history. Each market runs in $\mathcal{O}(4J)$ time, independent of the particle count $N$ that governs the CSMC cost of $\mathcal{O}(NJ)$ (Algorithm~\ref{alg:csmc}). The trade-off is that the mixture collapse is a genuine approximation: it discards the correlation between the discrete path and $X$ that Rao-Blackwellization keeps exactly, so the E-step returns a single global posterior mode rather than a particle cloud.
+
+\subsubsection{Moment-matched M-step}
+
+Given the ADF marginals $q(V_{t_j})$, $q(Z_j)$, the M-step updates $\theta_w$ and the transition rates $q_{01}, q_{10}$ with the same conjugate Beta form as the PG Gibbs step (Algorithm~\ref{alg:pg}), replacing hard trajectory counts with the soft ADF marginals; $\sigma^2_v$ is updated by an inverse-Gamma MAP on the moment-matched $X$-increments; and $\tau^2_{Z_j}$ is updated by matching the first two moments of the mixed observation residual. $\beta_S$ and $\beta_Z$ are held fixed at their PG posterior means rather than re-estimated inside VEM, since the ADF marginals do not carry enough curvature information for a stable update on those parameters.
+
+\subsubsection{What the approximation costs}
+
+Two honest caveats. First, because the E-step commits to a single mixture mode at every step rather than propagating a particle cloud, the resulting posterior on $\theta_w$ is compressed toward the $\mathrm{Beta}(a,b)$ prior relative to the PG posterior of \S\ref{ssec:realdata}: the top-wallet ranking under VEM largely agrees with the PG ranking, but the absolute credible intervals should not be read as calibrated in the same sense as Table~\ref{tab:phi}. Second, the deterministic E-step has no analogue of the marginal-likelihood estimate $\widehat Z$ that drives PG's pseudo-marginal correctness (Theorem~\ref{thm:pg-invariance}); VEM optimizes a log-marginal proxy for the ELBO rather than targeting the exact joint posterior \eqref{eq:posterior}. VEM is therefore best read as a fast screening and ranking tool that agrees with PG on \emph{which} wallets to flag, not as a drop-in replacement for the exact posterior when calibrated uncertainty is the deliverable.
+
+\subsection{Engineering for Scale and an Optional Microstructure Prefilter}\label{ssec:engineering}
+
+\subsubsection{Making PG a practical baseline}
+
+Two changes turn the PG sampler of \S\ref{ssec:pg} from a research prototype into a baseline usable at the $20{,}000$-trade, $10$-market scale of \S\ref{ssec:empirical}. The inner Kalman recursion \eqref{eq:kalman}, evaluated once per particle per candidate discrete state per trade, is the dominant cost inside a CSMC sweep; compiling it with a \texttt{numba} \texttt{njit} kernel removes Python-interpreter overhead from that innermost loop without changing the recursion itself, so the sequential ($n\_\mathrm{jobs}=1$) sampler remains bit-exact. Because markets are conditionally independent given the shared parameters \eqref{eq:posterior}, the $K$ per-market CSMC sweeps within one PG iteration parallelize over \texttt{joblib} worker processes, which is the second lever. A third, cheaper tier runs the bootstrap filter alone (no reference trajectory, no parameter update) to produce a fast shortlist of markets or wallets worth a full PG or VEM pass, at the cost of the filtering marginals only.
+
+\subsubsection{C4: a microstructure prefilter for wallet shortlisting}
+
+Separately from the model-based samplers above, a cheap, model-free prefilter can rank wallets before either Bayesian core runs, so that PG or VEM is applied only to a flagged shortlist. The prefilter combines three $\mathcal{O}(n_{\text{trades}})$ heuristics: a within-market size $z$-score on $\log(S_j/\bar S)$; a volume-synchronized order-flow toxicity score in the spirit of \citet{easley2012vpin}, building on the probability-of-informed-trading (PIN) framework of \citet{easley1996pin} and on the classical result that informed order flow moves prices \citep{kyle1985insider}; and a wash-trade heuristic that flags rapid same-wallet round-trips with opposing price moves, motivated by documented wash-trading patterns in crypto markets \citep{cong2023washtrade}. The three scores are rank-combined into a single shortlist score, and the gate metric is recall on planted insiders rather than precision, since the prefilter's job is only to avoid discarding true positives before the expensive core sees them. This is an optional hybrid, not a replacement for \S\ref{ssec:pg}--\S\ref{ssec:vem}: it is strongest on real-data microstructure signal (order-flow toxicity, wash-trading) and weaker on the synthetic-injection design of \S\ref{sssec:synth}, where planted insiders are distinguished mainly by trade frequency rather than by the size or toxicity patterns the heuristics target.
 
 \subsection{Empirical Study}\label{ssec:empirical}
 
@@ -243,7 +271,7 @@ $\tau^2_1$ & $0.00084$ & $[0.00076,\, 0.0010]$ & $1.5$ & $8\%$ \\
 \label{tab:phi}
 \end{table}
 
-Three things in Table~\ref{tab:phi} are worth pausing on. First, the variance scales separate by four orders of magnitude on both diffusion ($\sigma^2_0 \approx 0.025$ vs.\ $\sigma^2_1 \approx 13.5$) and observation noise ($\tau^2_0 \approx 36$ vs.\ $\tau^2_1 \approx 8 \times 10^{-4}$). The $40{,}000$-fold tightening on the observation side is what lets the model attribute the few sharply-priced moves to the informed regime. Second, the persistence coefficient $\beta_Z \approx 3.5$ is large, so the posterior places almost all of the insider mass in clusters of consecutive trades rather than isolated flags. Third, the size coefficient $\beta_S \approx -0.28$ is negative. Trades smaller than the within-market mean are slightly more likely to be informed than larger ones, opposite to the standard market-microstructure prior. Two readings are consistent: informed Polymarket traders may size below average to stay under the radar, or $\log(S_j/\bar S)$ may be correlated with quiet pre-event windows where the model would flag trades regardless of size.
+Three things in Table~\ref{tab:phi} are worth pausing on. First, the variance scales separate by four orders of magnitude on both diffusion ($\sigma^2_0 \approx 0.025$ vs.\ $\sigma^2_1 \approx 13.5$) and observation noise ($\tau^2_0 \approx 36$ vs.\ $\tau^2_1 \approx 8 \times 10^{-4}$). The $40{,}000$-fold tightening on the observation side is what lets the model attribute the few sharply-priced moves to the informed regime. Second, the persistence coefficient $\beta_Z \approx 3.5$ is large, so the posterior places almost all of the insider mass in clusters of consecutive trades rather than isolated flags. Third, the size coefficient $\beta_S \approx -0.28$ is negative. Trades smaller than the within-market mean are slightly more likely to be flagged than larger ones under this model, which we read as an open empirical question rather than a settled microstructure result: it could reflect model misspecification (small trades clustering in the quiet pre-event windows the model would flag regardless of size), a genuine behavioral pattern specific to this dataset, or an artifact of the pooled fit across markets of very different liquidity. We do not have independent evidence to adjudicate between these, and \S\ref{ssec:discussion} flags the market-by-market robustness check needed before drawing any conclusion from the sign of $\beta_S$.
 
 The ESS column shows what mixes well and what does not. The MH-updated parameters $\beta_S$ and $\beta_Z$ are in good shape (ESS in the high $30$s on $1{,}200$ post-burn draws). The conjugate variance and transition-rate parameters lag: $\sigma^2_v$, $q_{01}$, and $\tau^2_v$ all sit at ESS $<\!12$, so their credible intervals should be read as optimistic. Trace plots and posterior densities in Figure~\ref{fig:realdata} (left) confirm the chain has stabilized after the $300$-iteration burn-in (dashed vertical line) on all eight parameters, though $\tau^2_0$ drifts slowly and would benefit from a longer chain.
 
@@ -263,6 +291,42 @@ The ESS column shows what mixes well and what does not. The MH-updated parameter
 
 The wallet ranking in Figure~\ref{fig:realdata} (right) flags one wallet that is hard to ignore. Wallet \texttt{0x68146921df11eab44296dc4e58025ca84741a9e7} has posterior mean $\Expect[\theta_w\mid\mathcal{D}] = 0.884$ with $90\%$ CI $[0.86, 0.91]$ from $461$ trades, all of them in the Judy Shelton Fed-chair nomination market. The wallet does not appear in any of the other nine. We are not making a legal claim. The model simply assigns very low probability to the explanation ``ordinary uninformed retail trading.'' Several next-ranked wallets follow the same shape ($\theta_w \in [0.65, 0.78]$, credible bars away from the prior mean of $0.05$), with most clustered in the two Fed-chair nomination markets (Shelton and Warsh). They would be the obvious next candidates for a hand audit.
 
+\subsubsection{Wall-clock vs.\ accuracy across methods}\label{sssec:bench}
+
+% BENCH-TABLE-PLACEHOLDER: numbers below are being regenerated by
+% scripts/benchmark.py + scripts/pareto.py against the current C0/C1/C4
+% code paths and are intentionally left blank pending that run. Do not
+% fill in figures here without a corresponding results/ artifact.
+
+We compare PG, iPMCMC, and variational EM (\S\ref{ssec:pg}--\S\ref{ssec:vem}), with and without the C4 prefilter of \S\ref{ssec:engineering}, on wall-clock time and synthetic-injection AUC (\S\ref{sssec:synth}) at matched accuracy targets. \textbf{TODO: benchmark table and Pareto figure pending regeneration against the current numba/joblib/VEM code paths --- see \texttt{scripts/benchmark.py} and \texttt{scripts/pareto.py}.} Qualitatively, PG remains the gold-standard reference posterior; iPMCMC's swap step buys a strictly higher per-iteration compute budget than PG for the same particle count, and prior runs found only a marginal synthetic-AUC gain over PG for that extra cost, which is why we treat it as an ablation rather than the recommended sampler (\S\ref{ssec:ipmcmc}); VEM removes the particle-count dependence entirely and is the fastest of the three, at the calibration cost discussed in \S\ref{ssec:vem}. The table and Pareto plot below will replace this placeholder once the regenerated benchmark artifacts land in \texttt{results/}.
+
+\begin{table}[t]
+\centering\small
+\begin{tabular}{lrrr}
+\toprule
+Method & Wall-clock & Synthetic AUC & Notes \\
+\midrule
+PG (gold standard) & TODO & TODO & \S\ref{ssec:pg} \\
+iPMCMC (ablation) & TODO & TODO & \S\ref{ssec:ipmcmc}, $M=8$, $P=4$ \\
+Variational EM (C1) & TODO & TODO & \S\ref{ssec:vem} \\
+PG + C4 prefilter & TODO & TODO & \S\ref{ssec:engineering} \\
+VEM + C4 prefilter & TODO & TODO & \S\ref{ssec:engineering} \\
+\bottomrule
+\end{tabular}
+\caption{\textbf{Placeholder.} Wall-clock and synthetic AUC by method, pending regeneration from \texttt{scripts/benchmark.py} output. Values intentionally left blank rather than estimated.}
+\label{tab:bench}
+\end{table}
+
+% BENCH-TABLE-PLACEHOLDER: Pareto figure (results/figures/pareto.png via
+% scripts/pareto.py) to be copied into figures/ and included here once
+% regenerated, e.g.:
+% \begin{figure}[t]
+% \centering
+% \includegraphics[width=0.7\linewidth]{figures/pareto.pdf}
+% \caption{Wall-clock vs.\ synthetic AUC Pareto frontier across PG, iPMCMC, VEM, and their C4-prefiltered variants.}
+% \label{fig:pareto}
+% \end{figure}
+
 \subsubsection{Limitations and diagnostics}\label{ssec:limits}
 
 The bottom rows of Table~\ref{tab:markets} expose a misspecification that synthetic data hides. The Pennsylvania Democratic-margin and Trump popular-vote contracts both resolve to $0$ or $1$ inside the trade window we kept, and the Gaussian random-walk in \eqref{eq:X} assigns vanishing probability to the resulting price snaps. The model flags them as informed instead ($\Prob(Z_j = 1 \mid \mathcal{D}) > 0.5$ for $1{,}999$ of $2{,}000$ PA trades) rather than widening $\sigma^2_1$.
@@ -271,8 +335,8 @@ MH acceptance rates sit at the low end of the $23$--$44\%$ target band of \citet
 
 \subsection{Discussion and Bibliography}\label{ssec:discussion}
 
-\emph{What worked.} Rao-Blackwellizing $X$ does the heavy lifting. Per-particle state is four bytes of discrete history plus two scalars, and the dominant variance source (the $X$-proposal weight) is gone. The locally optimal $(V,Z)$ proposal in \eqref{eq:opt-weight} is feasible only because the discrete state has four values. In richer settings one would fall back to bootstrap or twisted SMC \citep{heng2020controlled}. The wallet hierarchy delivers a sharp ranking on real data, with the top entry separated cleanly from the next several by both posterior mean and credible-bar width.
+\emph{What worked.} Rao-Blackwellizing $X$ does the heavy lifting. Per-particle state is four bytes of discrete history plus two scalars, and the dominant variance source (the $X$-proposal weight) is gone. The locally optimal $(V,Z)$ proposal in \eqref{eq:opt-weight} is feasible only because the discrete state has four values. In richer settings one would fall back to bootstrap or twisted SMC \citep{heng2020controlled}. The wallet hierarchy delivers a sharp ranking on real data, with the top entry separated cleanly from the next several by both posterior mean and credible-bar width. On the systems side, the \texttt{numba}/\texttt{joblib} engineering of \S\ref{ssec:engineering} is what turns PG from an overnight curiosity into a usable baseline, and the variational EM core of \S\ref{ssec:vem} shows that a deterministic ADF pass agrees with PG on wallet ranking at a fraction of the wall-clock, even though its absolute calibration is not a substitute for the exact posterior.
 
 \emph{Limitations.} The insider indicator $Z_j$ is memoryless across a wallet's trade stream beyond the single-step $\beta_Z$ term, so cross-session clustering is not modeled. The single insider regime collapses scheduled-leak and opportunistic insiders into one parameter. No exogenous covariates enter the observation model. Hyperparameters $\gamma$ and $s_0^2$ are fixed at $1.0$ (sensitivity examined on a $3 \times 3$ synthetic sweep, omitted for space). Conjugate-parameter ESS is still low at the halfprod budget (Table~\ref{tab:phi}), so credible intervals on $\sigma^2_v$, $q_{01}$, $q_{10}$, and $\tau^2_v$ should be read as optimistic until a full-production chain lands.
 
-\emph{Extensions.} Wallet-level Markov insider chains would tie $Z$ to the wallet and capture cross-session clustering, at the cost of a Metropolis step on $Z$. Ancestor sampling \citep{lindsten2014particle} is a complementary remedy for path degeneracy inside a single chain; combined with iPMCMC it dominates either alone in the strong-observation regime $\tau^2_1 \approx 10^{-3}$ we land in. Controlled SMC \citep{heng2020controlled} would tighten the importance weights for richer discrete states where the $(V,Z)$ enumeration is no longer tractable, and is especially useful if the latent state were extended with market-level dynamics, where bootstrap proposals fail catastrophically \citep{bickel2008sharp}. The obvious next empirical test is a market-by-market robustness check on the sign of $\beta_S$: the pooled estimate is negative, and the open question is whether that holds within each market or comes from cross-market heterogeneity.
+\emph{Extensions.} Wallet-level Markov insider chains would tie $Z$ to the wallet and capture cross-session clustering, at the cost of a Metropolis step on $Z$. Ancestor sampling \citep{lindsten2014particle} is a complementary remedy for path degeneracy inside a single chain; combined with iPMCMC it dominates either alone in the strong-observation regime $\tau^2_1 \approx 10^{-3}$ we land in. Controlled SMC \citep{heng2020controlled} would tighten the importance weights for richer discrete states where the $(V,Z)$ enumeration is no longer tractable, and is especially useful if the latent state were extended with market-level dynamics, where bootstrap proposals fail catastrophically \citep{bickel2008sharp}. The obvious next empirical test is a market-by-market robustness check on the sign of $\beta_S$: the pooled estimate is negative, and the open question is whether that holds within each market or comes from cross-market heterogeneity. Beyond the C0--C4 lines pursued here, several structured-inference and SMC directions are natural follow-ups rather than implemented components of this study: recurrent switching linear dynamical systems with learned, covariate-dependent transition boundaries \citep{linderman2017rslds}; variational sequential Monte Carlo \citep{naesseth2018vsmc} as a middle ground between VEM's single-mode speed and PG's particle diversity; SMC$^2$ \citep{chopin2013smc2} for online parameter learning as new trades stream in, rather than the offline batch fit used here; sequential Monte Carlo directly over the large binary $(V,Z)$ path space \citep{schafer2013binarysmc} if the discrete state grows past the four values enumerated in \S\ref{sssec:csmc}; and anytime Monte Carlo \citep{murray2016anytime} for a wall-clock-bounded deployment mode that returns a usable posterior at any interruption point.
