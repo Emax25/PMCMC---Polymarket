@@ -593,6 +593,60 @@ def test_benchmark_filter_gate_smoke(tmp_path):
     assert payload["method"] == "filter"
 
 
+_BENCHMARK_IPMCMC = [
+    "--synthetic",
+    "--synthetic-K",
+    "2",
+    "--synthetic-T",
+    "60",
+    "--synthetic-n-wallets",
+    "10",
+    "--config",
+    "dev",
+    "--n-iter",
+    "5",
+    "--n-burnin",
+    "1",
+    "--n-particles",
+    "20",
+    "--n-runs",
+    "1",
+    "--threads",
+    "2",
+    "--log-level",
+    "WARNING",
+]
+
+
+def test_benchmark_ipmcmc_gate_smoke(tmp_path):
+    """benchmark.py --method ipmcmc --gate runs and records M/P in JSON config."""
+    json_path = tmp_path / "bench_ipmcmc.json"
+    rc = benchmark.main(
+        [
+            *_BENCHMARK_IPMCMC,
+            "--method",
+            "ipmcmc",
+            "--gate",
+            "--json-out",
+            str(json_path),
+        ],
+    )
+    assert rc == 0
+    payload = json.loads(json_path.read_text())
+    assert payload["method"] == "ipmcmc"
+    assert payload["config"]["M"] == 8
+    assert payload["config"]["P"] == 4
+    assert payload["gate"] is not None
+
+
+def test_benchmark_ipmcmc_rejects_p_gt_m():
+    """benchmark.py --method ipmcmc exits clearly when P > M."""
+    with pytest.raises(SystemExit):
+        benchmark.main(
+            [*_BENCHMARK_IPMCMC, "--method", "ipmcmc", "--M", "2", "--P", "4"]
+        )
+
+
 # ---------------- eval_c4.py ----------------
 
 

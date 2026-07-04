@@ -1,6 +1,6 @@
 """CLI: benchmark inference wall-clock and optional synthetic accuracy gate.
 
-Measures end-to-end runtime for Particle Gibbs, Variational EM, or a
+Measures end-to-end runtime for Particle Gibbs, iPMCMC, Variational EM, or a
 filter-only screening pass across repeated seeds, attributes self-time to
 coarse buckets via cProfile for PG only, and optionally runs the synthetic
 validation gate.
@@ -17,6 +17,9 @@ Examples:
 
     # Filter-only screening pass
     python -m scripts.benchmark --method filter --synthetic-K 2
+
+    # iPMCMC ablation row (identical instrumentation to PG)
+    python -m scripts.benchmark --method ipmcmc --gate --M 8 --P 4
 
     # Half-prod-ish PG benchmark (dev preset + overrides)
     python -m scripts.benchmark --n-particles 250 --n-iter 1500 --n-burnin 300
@@ -147,6 +150,31 @@ def _run_pg_timed(
     return chain, elapsed
 
 
+def _run_ipmcmc_timed(
+    markets: list[Any],
+    cfg: Any,
+    *,
+    seed: int,
+    n_wallets: int,
+) -> tuple[Any, float]:
+    """Run one iPMCMC pass (M chains, P conditional) and return ``(chain, wall_seconds)``."""
+    import numpy as np
+
+    from src.inference.ipmcmc import ipmcmc
+
+    rng = np.random.default_rng(seed)
+    t0 = time.perf_counter()
+    chain = ipmcmc(
+        markets,
+        cfg,
+        rng=rng,
+        n_wallets=n_wallets,
+        progress=False,
+    )
+    elapsed = time.perf_counter() - t0
+    return chain, elapsed
+
+
 def _run_vem_timed(
     markets: list[Any],
     cfg: Any,
@@ -254,6 +282,16 @@ def _time_runs(
             sec_per_run.append(elapsed)
             sec_per_iter.append(elapsed / cfg.n_iter)
             last_artifacts = chain
+        elif method == "ipmcmc":
+            chain, elapsed = _run_ipmcmc_timed(
+                markets,
+                cfg,
+                seed=seed,
+                n_wallets=n_wallets,
+            )
+            sec_per_run.append(elapsed)
+            sec_per_iter.append(elapsed / cfg.n_iter)
+            last_artifacts = chain
         elif method == "vem":
             out, elapsed = _run_vem_timed(
                 markets,
@@ -337,15 +375,26 @@ def _profile_breakdown(
     return {**buckets, "total": total}
 
 
-def _artifacts_from_pg(chain: Any, *, n_burnin: int) -> _RunArtifacts:
-    """Build gate artifacts from a PG chain."""
+def _artifacts_from_mcmc_chain(chain: Any, *, n_burnin: int) -> _RunArtifacts:
+    """Build gate artifacts from a PG or iPMCMC chain.
+
+    ``posterior_Z_probability`` already pools iPMCMC's extra conditional-chain
+    axis internally (src/analysis/results.py), but ``theta_w`` does not go
+    through that helper, so iPMCMC's ``(n_iter, P, n_wallets)`` array is
+    flattened to ``(n_iter*P, n_wallets)`` here before averaging to match PG's
+    ``(n_iter, n_wallets)`` shape.
+    """
     from src.analysis.results import posterior_Z_probability
+    from src.inference.ipmcmc import iPMCMCOutput
 
     z_scores = [
         posterior_Z_probability(chain, market_idx=idx, n_burnin=n_burnin)
         for idx in range(len(chain.Z))
     ]
-    theta_w = chain.theta_w[n_burnin:].mean(axis=0)
+    theta_samples = chain.theta_w[n_burnin:]
+    if isinstance(chain, iPMCMCOutput):
+        theta_samples = theta_samples.reshape(-1, theta_samples.shape[-1])
+    theta_w = theta_samples.mean(axis=0)
     return _RunArtifacts(theta_w=theta_w, z_scores_per_market=z_scores)
 
 
@@ -365,10 +414,10 @@ def _run_gate(
     if not inputs.is_synthetic:
         raise ValueError("--gate requires synthetic inputs")
 
-    if method == "pg":
+    if method in ("pg", "ipmcmc"):
         if not hasattr(artifacts, "theta_w") or not hasattr(artifacts, "Z"):
-            raise TypeError("PG gate requires a PGOutput chain")
-        gate_artifacts = _artifacts_from_pg(artifacts, n_burnin=n_burnin)
+            raise TypeError(f"{method} gate requires an MCMC chain output")
+        gate_artifacts = _artifacts_from_mcmc_chain(artifacts, n_burnin=n_burnin)
     else:
         gate_artifacts = artifacts
 
@@ -390,8 +439,9 @@ def _theta_vector(artifacts: _RunArtifacts | Any, *, method: str, n_burnin: int)
     """Extract per-wallet theta/score vector for save/compare."""
     import numpy as np
 
-    if method == "pg":
-        return np.asarray(_artifacts_from_pg(artifacts, n_burnin=n_burnin).theta_w)
+    if method in ("pg", "ipmcmc"):
+        theta_w = _artifacts_from_mcmc_chain(artifacts, n_burnin=n_burnin).theta_w
+        return np.asarray(theta_w)
     if isinstance(artifacts, _RunArtifacts):
         return np.asarray(artifacts.theta_w, dtype=float)
     raise TypeError(f"cannot extract theta for method={method}")
@@ -407,7 +457,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     add_common_args(p)
     p.add_argument(
         "--method",
-        choices=("pg", "vem", "filter"),
+        choices=("pg", "vem", "filter", "ipmcmc"),
         default="pg",
         help="Inference method to benchmark (default: pg).",
     )
@@ -440,6 +490,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         nargs="+",
         default=None,
         help="Explicit RNG seeds for timed runs (default: base_seed + 0..n_runs-1).",
+    )
+    p.add_argument(
+        "--M",
+        type=int,
+        default=None,
+        help="Total chains for --method ipmcmc; defaults to preset (8).",
+    )
+    p.add_argument(
+        "--P",
+        type=int,
+        default=None,
+        help="Conditional chains for --method ipmcmc; defaults to preset (4).",
     )
     p.add_argument(
         "--vem-iters",
@@ -506,6 +568,7 @@ def _format_report(
         "pg": "Particle Gibbs",
         "vem": "Variational EM",
         "filter": "Filter screen",
+        "ipmcmc": "iPMCMC",
     }
     lines = [
         f"=== {method_labels.get(method, method)} benchmark ===",
@@ -530,7 +593,7 @@ def _format_report(
             f"Wall-clock (full {method} run, seconds):",
         ],
     )
-    iter_label = "sec/iter" if method == "pg" else "sec/iter_equiv"
+    iter_label = "sec/iter" if method in ("pg", "ipmcmc") else "sec/iter_equiv"
     for seed, elapsed, spi in zip(seeds, sec_per_run, sec_per_iter):
         lines.append(f"  seed={seed}: {elapsed:.3f}s  ({spi:.4f}s/{iter_label})")
     if len(sec_per_run) > 1:
@@ -617,6 +680,22 @@ def main(argv: list[str] | None = None) -> int:
         args.synthetic = True
 
     cfg = replace(build_config(args), n_jobs=args.n_jobs)
+    if args.method == "ipmcmc":
+        # iPMCMC has no market-level n_jobs (no joblib.Parallel over K); the
+        # flag is silently inert there, so warn instead of misleading the
+        # JSON config block into implying it did something.
+        if args.n_jobs != 1:
+            log.warning(
+                "--n-jobs=%d has no effect for --method ipmcmc "
+                "(no market-level parallelism); ignoring",
+                args.n_jobs,
+            )
+        if args.M is not None:
+            cfg = replace(cfg, M=args.M)
+        if args.P is not None:
+            cfg = replace(cfg, P=args.P)
+        if cfg.M < cfg.P:
+            raise SystemExit(f"Need M >= P; got M={cfg.M}, P={cfg.P}.")
     base_seed = args.seed if args.seed is not None else cfg.seed
     seeds = (
         args.seeds
@@ -718,16 +797,20 @@ def main(argv: list[str] | None = None) -> int:
     if args.json_out is not None:
         run_mean, run_hw = _mean_ci(sec_per_run)
         iter_mean, iter_hw = _mean_ci(sec_per_iter)
+        config_block: dict[str, Any] = {
+            "N": cfg.N,
+            "n_iter": cfg.n_iter,
+            "n_burnin": cfg.n_burnin,
+            "n_jobs": cfg.n_jobs,
+            "seed_base": base_seed,
+            "threads": args.threads,
+        }
+        if args.method == "ipmcmc":
+            config_block["M"] = cfg.M
+            config_block["P"] = cfg.P
         payload: dict[str, Any] = {
             "method": args.method,
-            "config": {
-                "N": cfg.N,
-                "n_iter": cfg.n_iter,
-                "n_burnin": cfg.n_burnin,
-                "n_jobs": cfg.n_jobs,
-                "seed_base": base_seed,
-                "threads": args.threads,
-            },
+            "config": config_block,
             "inputs": {
                 "K": len(inputs.markets),
                 "synthetic": inputs.is_synthetic,
