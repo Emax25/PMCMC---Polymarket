@@ -216,12 +216,15 @@ Via `src/analysis/results.py` and `plots.py`.
 | `csmc.py` | Conditional SMC | `REFERENCE_INDEX = 0`; 4-state optimal proposal |
 | `particle_gibbs.py` | PG sampler | Defines `MarketData` |
 | `ipmcmc.py` | iPMCMC + swap | M=8, P=4; P0: parallelize |
+| `variational_em.py` | Variational EM (C1) | ADF E-step + moment-matched M-step; 50 EM iterations default; gate: AUC 0.885, 68.8 s mean |
 | `parameter_updates.py` | Gibbs/MH | `theta_w` = per-wallet RWMH on logit scale (full logistic Z model; correct for β≠0) |
 | `diagnostics.py` | R-hat, ESS | arviz |
 
 **PG iteration:** CSMC → sample path → FFBS → `gibbs_sweep` (per market, params pooled).
 
 **iPMCMC iteration:** M SMC passes → swap references → FFBS → Gibbs per conditional slot.
+
+**VEM iteration:** Approximate E-step (ADF) → M-step (moment matching); runs 50 iterations over full dataset.
 
 ### 6.1 Real-data numerical edge cases
 
@@ -266,9 +269,9 @@ src/utils/transforms.py
 src/data/polymarket_api.py    # Gamma + Data API only
 src/data/preprocess.py
 src/data/synthetic.py
-src/inference/{kalman,smc,csmc,particle_gibbs,ipmcmc,parameter_updates,diagnostics}.py
-src/analysis/{results,plots}.py
-scripts/{_shortlist,_runner,pull_data,run_pg,run_ipmcmc,make_figures}.py
+src/inference/{kalman,smc,csmc,particle_gibbs,ipmcmc,variational_em,parameter_updates,diagnostics}.py
+src/analysis/{prefilter,results,plots}.py
+scripts/{_shortlist,_runner,pull_data,run_pg,run_ipmcmc,benchmark,pareto,eval_c4,make_figures}.py
 tests/
 Monte_Carlo_Simulation/       # LaTeX paper
 agent_reference/              # ARCHITECTURE.md + STATUS.md + CODE_QUALITY.md
@@ -331,9 +334,12 @@ Per-market $T \leq 3000$. See also §6.1 for inference-side fixes on real data.
 pip install -r requirements.txt
 python -m scripts.pull_data --output-dir data/processed --tail-trades 2000
 python -m scripts.run_pg --config dev                          # fast check
+python -m scripts.run_pg --config half-prod --n-jobs 8         # multi-market parallel
 python -m scripts.run_ipmcmc --config prod \
   --n-iter 1500 --n-burnin 300 --n-particles 250                 # half-prod
 python -m scripts.run_pg --synthetic --config dev              # validation
+python -m scripts.benchmark.py --method vem --config dev       # VEM gate; {pg,vem,filter,ipmcmc}
+python -m scripts.pareto.py --output results/figures/pareto.png
 python -m scripts.make_figures --chain results/chains/*.pkl
 python -m pytest tests/ -q
 ```
@@ -343,6 +349,12 @@ python -m pytest tests/ -q
 | dev | 50 | 200 | 50 | Fast (~22 min PG) |
 | half-prod | 250 | 1500 | 300 | **Default refinement** |
 | prod | 500 | 3000 | 500 | If half-prod noisy |
+
+**Flags:**
+- `run_pg --n-jobs K` — parallelize over K markets; default 1 (bit-exact sequential). Uses `dataclasses.replace` on config.
+- `benchmark.py --method {pg|vem|filter|ipmcmc}` — fourth method (VEM); shared gate/timing/JSON instrumentation via `_artifacts_from_mcmc_chain`; warns on inert `--n-jobs`.
+- `pareto.py` — AUC-vs-wall-clock Pareto figure from bench JSONs; output to PNG + CSV.
+- `eval_c4.py` — C4 full-scale eval (K=10, T=2000) [deferred].
 
 ---
 
@@ -395,12 +407,15 @@ Correct **iff** synthetic injection passes:
 
 **See [STATUS.md](STATUS.md)** for live tracker. Summary:
 
-| Issue | Priority |
-|-------|----------|
-| numba + joblib | P0 |
-| Pre-resolution filter | P1 — DONE |
-| `theta_w` approx fix | P3 — DONE (RWMH, full logistic) |
-| Negative `β_S` | P3 — open |
+| Issue | Priority | Status |
+|-------|----------|--------|
+| numba + joblib | P0 | DONE |
+| Pre-resolution filter | P1 | DONE |
+| VEM (C1) inference | P0 | DONE — gate PASS (AUC 0.885, 68.8 s) |
+| Filter-only screening | P0 ablation | DONE — gate FAIL (AUC 0.524 @ K=10/T=2000) |
+| `--n-jobs` market parallelism | P0 | DONE — `run_pg --n-jobs K` |
+| `theta_w` approx fix | P3 | DONE (RWMH, full logistic) |
+| Negative `β_S` | P3 | open — pending real-data half-prod |
 
 ---
 

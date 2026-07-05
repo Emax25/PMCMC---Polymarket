@@ -1,5 +1,10 @@
 # Handoff: Fast Insider Detection Plan Implementation
 
+> **CLOSED 2026-07-04.** All gates resolved: C1 VEM promoted as paper core (revised gate PASS
+> on 4 synthetic seeds), C3 not implemented, global-τ criterion invalidated by a matched
+> PG-vs-PG control (τ = 0.787). See STATUS.md for current state; this file is historical.
+> Deferred bench stages live in `results/_bench_queue_resume.sh`.
+
 > **For the next agent.** Read this after [ARCHITECTURE.md](ARCHITECTURE.md) and [STATUS.md](STATUS.md).
 > Source plan: `.cursor/plans/fast_insider_detection_83f741e8.plan.md` (lines 1–72 body + YAML todos).
 > Session date: 2026-07-03. Work is **uncommitted** on branch `main` (or current checkout); see §9.
