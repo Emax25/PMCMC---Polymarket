@@ -157,7 +157,10 @@ def _run_ipmcmc_timed(
     seed: int,
     n_wallets: int,
 ) -> tuple[Any, float]:
-    """Run one iPMCMC pass (M chains, P conditional) and return ``(chain, wall_seconds)``."""
+    """Run one iPMCMC pass (M chains, P conditional).
+
+    Returns ``(chain, wall_seconds)``.
+    """
     import numpy as np
 
     from src.inference.ipmcmc import ipmcmc
@@ -173,6 +176,14 @@ def _run_ipmcmc_timed(
     )
     elapsed = time.perf_counter() - t0
     return chain, elapsed
+
+
+# MCMC methods share the (markets, cfg, *, seed, n_wallets) -> (chain, elapsed)
+# runner signature and identical timing bookkeeping in _time_runs.
+_MCMC_RUNNERS = {
+    "pg": _run_pg_timed,
+    "ipmcmc": _run_ipmcmc_timed,
+}
 
 
 def _run_vem_timed(
@@ -272,18 +283,8 @@ def _time_runs(
     last_artifacts: _RunArtifacts | Any = None
 
     for seed in seeds:
-        if method == "pg":
-            chain, elapsed = _run_pg_timed(
-                markets,
-                cfg,
-                seed=seed,
-                n_wallets=n_wallets,
-            )
-            sec_per_run.append(elapsed)
-            sec_per_iter.append(elapsed / cfg.n_iter)
-            last_artifacts = chain
-        elif method == "ipmcmc":
-            chain, elapsed = _run_ipmcmc_timed(
+        if method in _MCMC_RUNNERS:
+            chain, elapsed = _MCMC_RUNNERS[method](
                 markets,
                 cfg,
                 seed=seed,
@@ -577,6 +578,8 @@ def _format_report(
         f"n_iter={cfg.n_iter}  n_burnin={cfg.n_burnin}  "
         f"synthetic={inputs.is_synthetic}",
     ]
+    if method == "ipmcmc":
+        lines.append(f"iPMCMC chains: M={cfg.M}  P={cfg.P}")
     if method == "vem" and vem_n_iter_run is not None:
         lines.append(
             f"VEM: n_iter_run={vem_n_iter_run}  final_elbo={vem_final_elbo:.4f}  "
@@ -681,21 +684,24 @@ def main(argv: list[str] | None = None) -> int:
 
     cfg = replace(build_config(args), n_jobs=args.n_jobs)
     if args.method == "ipmcmc":
-        # iPMCMC has no market-level n_jobs (no joblib.Parallel over K); the
-        # flag is silently inert there, so warn instead of misleading the
-        # JSON config block into implying it did something.
+        # iPMCMC has no market-level n_jobs (no joblib.Parallel over K), so
+        # warn and reset to the effective value rather than record the inert
+        # flag in the JSON config block.
         if args.n_jobs != 1:
             log.warning(
                 "--n-jobs=%d has no effect for --method ipmcmc "
                 "(no market-level parallelism); ignoring",
                 args.n_jobs,
             )
+            cfg = replace(cfg, n_jobs=1)
         if args.M is not None:
             cfg = replace(cfg, M=args.M)
         if args.P is not None:
             cfg = replace(cfg, P=args.P)
         if cfg.M < cfg.P:
             raise SystemExit(f"Need M >= P; got M={cfg.M}, P={cfg.P}.")
+    elif args.M is not None or args.P is not None:
+        log.warning("--M/--P only apply to --method ipmcmc; ignoring")
     base_seed = args.seed if args.seed is not None else cfg.seed
     seeds = (
         args.seeds

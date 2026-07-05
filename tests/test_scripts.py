@@ -11,6 +11,7 @@ import pickle
 from pathlib import Path
 
 import matplotlib
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -645,6 +646,43 @@ def test_benchmark_ipmcmc_rejects_p_gt_m():
         benchmark.main(
             [*_BENCHMARK_IPMCMC, "--method", "ipmcmc", "--M", "2", "--P", "4"]
         )
+
+
+def test_artifacts_from_mcmc_chain_flattens_ipmcmc_theta():
+    """iPMCMC theta_w (n_iter, P, n_wallets) pools conditional chains post-burn-in."""
+    n_iter, M, P, n_wallets, T = 4, 3, 2, 3, 5
+    rng = np.random.default_rng(0)
+    theta_w = rng.uniform(size=(n_iter, P, n_wallets))
+    param = np.ones((n_iter, P))
+    latent = np.zeros((n_iter, P, T))
+    chain = iPMCMCOutput(
+        sigma2_0=param,
+        sigma2_1=param,
+        q_01=param,
+        q_10=param,
+        beta_S=param,
+        beta_Z=param,
+        tau2_0=param,
+        tau2_1=param,
+        theta_w=theta_w,
+        X=[latent],
+        V=[latent],
+        Z=[rng.integers(0, 2, size=(n_iter, P, T)).astype(float)],
+        log_marg=np.zeros((n_iter, M)),
+        chain_indices=np.zeros((n_iter, P), dtype=int),
+        acc_beta_S=np.ones((n_iter, P), dtype=bool),
+        acc_beta_Z=np.ones((n_iter, P), dtype=bool),
+        acc_tau2_0=np.ones((n_iter, P), dtype=bool),
+        acc_tau2_1=np.ones((n_iter, P), dtype=bool),
+        final_mh_step_beta_S=0.1,
+        final_mh_step_beta_Z=0.1,
+        final_mh_step_log_tau2_0=0.1,
+        final_mh_step_log_tau2_1=0.1,
+    )
+    n_burnin = 1
+    artifacts = benchmark._artifacts_from_mcmc_chain(chain, n_burnin=n_burnin)
+    expected = theta_w[n_burnin:].reshape(-1, n_wallets).mean(axis=0)
+    np.testing.assert_allclose(artifacts.theta_w, expected)
 
 
 # ---------------- eval_c4.py ----------------
