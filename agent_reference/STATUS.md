@@ -3,7 +3,7 @@
 > **Quick-update file.** Edit this when priorities, work items, or decisions change.
 > Stable architecture detail lives in [ARCHITECTURE.md](ARCHITECTURE.md).
 
-**Last updated:** 2026-07-04
+**Last updated:** 2026-07-05
 
 > **Session handoff:** See [HANDOFF_FAST_INSIDER_DETECTION.md](HANDOFF_FAST_INSIDER_DETECTION.md) for full gate results, uncommitted changes, and next steps (2026-07-03 orchestration session).
 
@@ -11,7 +11,7 @@
 
 ## Current focus
 
-**P0 — Stage 2 gate CLOSED (2026-07-04):** C1 VEM **GATE PASS** (AUC 0.885, 68.8 s mean, 100% recall@K across seeds). C0 PG half-prod **GATE PASS** (N=250/1500-iter: 3117.5 s, AUC 0.962). Kendall τ criterion invalidated by PG-vs-PG control (τ=0.787). **New acceptance criteria:** 100% insider recall@K + ≥0.85 pooled AUC (per-market floors + descriptive top-K overlap). Filter-only ablation **GATE FAIL** (AUC 0.524). **Next:** Deferred bench stages (N=100 PG control, C4 full-scale eval, gated iPMCMC ablation); real-data half-prod runs; paper bench table.
+**P0 — Stage 2 gate CLOSED (2026-07-04):** C1 VEM **GATE PASS** (AUC 0.885, 68.8 s mean, 100% recall@K across seeds). C0 PG half-prod **GATE PASS** (N=250/1500-iter: 3117.5 s, AUC 0.962). Kendall τ criterion invalidated by PG-vs-PG control (τ=0.787). **New acceptance criteria:** 100% insider recall@K + ≥0.85 pooled AUC (per-market floors + descriptive top-K overlap). Filter-only ablation **GATE FAIL** (AUC 0.524). **Next:** Deferred bench stages (N=100 PG control, C4 full-scale eval, gated iPMCMC ablation); real-data half-prod runs.
 
 ---
 
@@ -25,7 +25,7 @@ Status key: `PLANNED` → `WIP` → `DONE`
 | P1 | Pre-resolution filter (`--pre-resolution-days`) | DONE | Default 7 days before close; wired through `pull_data.py` |
 | P2 | Half-prod inference runs for paper | PLANNED | `--n-iter 1500 --n-burnin 300 --n-particles 250` on real data |
 | P3 | Fix `theta_w` update; investigate negative `β_S` | WIP | `theta_w` RWMH fix DONE; `β_S` still open |
-| P4 | Refreshed paper figures + Pareto curve | DONE | Pareto (AUC-vs-wall-clock) committed; bench table pending |
+| P4 | Refreshed paper figures + Pareto curve | DONE | Pareto (AUC-vs-wall-clock) committed; bench table filled (355fa0a) |
 | P5 | γ / s₀² sensitivity script | PLANNED | Synthetic grid only |
 | P6 | Paper refs + narrative update | DONE | +11 BibTeX entries; narrative shifted to C1 core, iPMCMC ablation |
 
@@ -54,6 +54,7 @@ Newest first. One line per meaningful change.
 
 | Date | Change |
 |------|--------|
+| 2026-07-05 | /finish cycle CLOSED: full fast suite green (240 passed pre-fix, 22/22 script tests post-fix). Code-review fixes (commit 4ff274f): scripts/benchmark.py --method ipmcmc resets cfg.n_jobs=1 when warning flag is inert; JSON config block records effective value; warns when --M/--P passed to non-ipmcmc methods; prints M/P in ipmcmc report header; collapses duplicate pg/ipmcmc timing branches into _MCMC_RUNNERS dispatch map. tests/test_scripts.py adds test_artifacts_from_mcmc_chain_flattens_ipmcmc_theta pinning iPMCMC (n_iter, P, n_wallets) -> (n_iter*P, n_wallets) post-burn-in theta_w pooling. |
 | 2026-07-04 | Stage 2 gate CLOSED: C1 VEM gate PASS (AUC 0.885, 68.8s, 100% recall@K); C0 PG gate PASS (AUC 0.962, 3117.5s). Kendall τ criterion invalidated (PG-vs-PG ctrl τ=0.787). New criteria: 100% recall + ≥0.85 AUC. Filter-only ablation FAIL (AUC 0.524). Deferred: C4 full-scale, gated iPMCMC. Paper: +11 refs, narrative to C1 core. Scripts: benchmark --method {pg,vem,filter,ipmcmc}, run_pg --n-jobs, pareto.py. |
 | 2026-06-26 | Stage 2 C1: `src/inference/variational_em.py` — single-mode ADF E-step + moment-matched M-step; `VEMOutput` dataclass; 6 non-slow tests pass. |
 | 2026-06-26 | Stage 1 C0: `filter_screen` + `_filter_screen_worker` in `particle_gibbs.py` — fast per-wallet Z_prob shortlist tier; 4 new tests. |
