@@ -3,7 +3,7 @@
 > **Quick-update file.** Edit this when priorities, work items, or decisions change.
 > Stable architecture detail lives in [ARCHITECTURE.md](ARCHITECTURE.md).
 
-**Last updated:** 2026-07-05
+**Last updated:** 2026-07-23
 
 > **Session handoff:** See [HANDOFF_FAST_INSIDER_DETECTION.md](HANDOFF_FAST_INSIDER_DETECTION.md) for full gate results, uncommitted changes, and next steps (2026-07-03 orchestration session).
 
@@ -11,7 +11,9 @@
 
 ## Current focus
 
-**P0 — Stage 2 gate CLOSED (2026-07-04):** C1 VEM **GATE PASS** (AUC 0.885, 68.8 s mean, 100% recall@K across seeds). C0 PG half-prod **GATE PASS** (N=250/1500-iter: 3117.5 s, AUC 0.962). Kendall τ criterion invalidated by PG-vs-PG control (τ=0.787). **New acceptance criteria:** 100% insider recall@K + ≥0.85 pooled AUC (per-market floors + descriptive top-K overlap). Filter-only ablation **GATE FAIL** (AUC 0.524). **Next:** Deferred bench stages (N=100 PG control, C4 full-scale eval, gated iPMCMC ablation); real-data half-prod runs.
+**P0 — Stage 2 gate CLOSED (2026-07-04):** C1 VEM **GATE PASS** (AUC 0.885, 68.8 s mean, 100% recall@K across seeds). C0 PG half-prod **GATE PASS** (N=250/1500-iter: 3117.5 s, AUC 0.962). Kendall τ criterion invalidated by PG-vs-PG control (τ=0.787). **New acceptance criteria:** 100% insider recall@K + ≥0.85 pooled AUC (per-market floors + descriptive top-K overlap). Filter-only ablation **GATE FAIL** (AUC 0.524).
+
+**Current focus (2026-07-23):** PG/iPMCMC retired from all new computation — frozen as cited historical baseline (see Resolved decisions). Roadmap re-anchored on the 2026-07-23 five-plan VEM series: **plan 1 (WIP)** weighted-logistic IRLS M-step with Cauchy(0, 2.5) prior for `beta_S`/`beta_Z`; plan 2 Laplace uncertainty; plan 3 SBC/PSIS validation + `theta_w` coverage; plan 4 online scorer; plan 5 Kalshi anonymous-mode variant.
 
 ---
 
@@ -23,11 +25,12 @@ Status key: `PLANNED` → `WIP` → `DONE`
 |---|-----------|--------|---------------|
 | P0 | Stage 2 gate: VEM vs PG benchmark | DONE | C1 VEM (AUC 0.885, 68.8s), C0 PG (AUC 0.962, 3117.5s); new criteria adopted |
 | P1 | Pre-resolution filter (`--pre-resolution-days`) | DONE | Default 7 days before close; wired through `pull_data.py` |
-| P2 | Half-prod inference runs for paper | PLANNED | `--n-iter 1500 --n-burnin 300 --n-particles 250` on real data |
-| P3 | Fix `theta_w` update; investigate negative `β_S` | WIP | `theta_w` RWMH fix DONE; `β_S` still open |
+| P2 | VEM real-data runs | PLANNED | Half-prod real-data inference via VEM fast path (was PG spec; PG retired 2026-07-23) |
+| P3 | Fix `theta_w` update; investigate negative `β_S` | WIP | `theta_w` RWMH fix DONE; `β_S` still open — via VEM estimates once beta M-step lands |
 | P4 | Refreshed paper figures + Pareto curve | DONE | Pareto (AUC-vs-wall-clock) committed; bench table filled (355fa0a) |
 | P5 | γ / s₀² sensitivity script | PLANNED | Synthetic grid only |
 | P6 | Paper refs + narrative update | DONE | +11 BibTeX entries; narrative shifted to C1 core, iPMCMC ablation |
+| P7 | Deferred PG bench stages (N=100 PG control, C4 full-scale eval, gated iPMCMC ablation) | CANCELLED | PG/iPMCMC retired 2026-07-23; frozen as historical baseline (AUC 0.962, 3117.5 s) |
 
 ---
 
@@ -54,6 +57,7 @@ Newest first. One line per meaningful change.
 
 | Date | Change |
 |------|--------|
+| 2026-07-23 | PG/iPMCMC retired from all new computation: frozen as cited historical baseline (C0 PG AUC 0.962, 3117.5 s). Opened 2026-07-23 five-plan VEM logistic M-step series: plan 1 (WIP) weighted-logistic IRLS M-step with Cauchy(0, 2.5) prior for `beta_S`/`beta_Z`; plan 2 Laplace uncertainty; plan 3 SBC/PSIS validation + `theta_w` coverage; plan 4 online scorer; plan 5 Kalshi anonymous-mode variant. Validation path is SBC/PSIS (Talts et al. 2018; Yao et al. 2018), never PG comparison. Deferred PG bench stages / C4-on-PG marked CANCELLED. PG code and tests untouched as historical baseline. |
 | 2026-07-05 | /finish cycle CLOSED: full fast suite green (240 passed pre-fix, 22/22 script tests post-fix). Code-review fixes (commit 4ff274f): scripts/benchmark.py --method ipmcmc resets cfg.n_jobs=1 when warning flag is inert; JSON config block records effective value; warns when --M/--P passed to non-ipmcmc methods; prints M/P in ipmcmc report header; collapses duplicate pg/ipmcmc timing branches into _MCMC_RUNNERS dispatch map. tests/test_scripts.py adds test_artifacts_from_mcmc_chain_flattens_ipmcmc_theta pinning iPMCMC (n_iter, P, n_wallets) -> (n_iter*P, n_wallets) post-burn-in theta_w pooling. |
 | 2026-07-04 | Stage 2 gate CLOSED: C1 VEM gate PASS (AUC 0.885, 68.8s, 100% recall@K); C0 PG gate PASS (AUC 0.962, 3117.5s). Kendall τ criterion invalidated (PG-vs-PG ctrl τ=0.787). New criteria: 100% recall + ≥0.85 AUC. Filter-only ablation FAIL (AUC 0.524). Deferred: C4 full-scale, gated iPMCMC. Paper: +11 refs, narrative to C1 core. Scripts: benchmark --method {pg,vem,filter,ipmcmc}, run_pg --n-jobs, pareto.py. |
 | 2026-06-26 | Stage 2 C1: `src/inference/variational_em.py` — single-mode ADF E-step + moment-matched M-step; `VEMOutput` dataclass; 6 non-slow tests pass. |
@@ -71,6 +75,7 @@ Newest first. One line per meaningful change.
 
 | Topic | Decision |
 |-------|----------|
+| PG/iPMCMC retirement | **CLOSED (2026-07-23):** frozen as cited historical baseline (AUC 0.962, 3117.5 s); all new computation on the VEM fast path; validation via SBC/PSIS (Talts et al. 2018; Yao et al. 2018), never PG comparison. |
 | Stage 2 gate — C1 VEM promotion | **CLOSED (2026-07-04):** C1 VEM gate PASS; C3 twisted-CSMC NOT implemented; C2 rSLDS moot. |
 | Kendall τ acceptance criterion | **INVALIDATED:** PG-vs-PG control (N=250, 1500-iter, different seed) → τ=0.787 (below 0.85 threshold). Replacement: 100% insider recall@K (top_cutoff rule) across ≥3 synthetic seeds + pooled AUC ≥0.85 (per-market floors); weighted τ / top-K overlap reported descriptively. |
 | Filter-only screening ablation | **GATE FAIL:** Pooled AUC 0.524 at K=10/T=2000. Kept as negative-result ablation row. |
