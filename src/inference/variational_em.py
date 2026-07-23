@@ -11,8 +11,24 @@ E-step: single-mode ADF forward pass - 4 (V,Z) combos share one incoming
 M-step: conjugate Beta updates for theta_w and q-transitions; IG MAP for
         sigma2; moment-matched update for tau2. beta_S, beta_Z held fixed.
 
+Predictor covariates are centered/standardized (Gelman et al. 2008) before
+entering the logistic Z predictor, with no free intercept — the theta_w
+Beta hierarchy already carries the level:
+    x_S~ = (log_size_ratio - m_S) * 0.5 / s_S   (mean 0, sd 0.5)
+    x_Z~ = E[Z_prev] - m_Z                       (centered only)
+`(m_S, s_S, m_Z)` are fit once per `variational_em` call (m_S, s_S pooled
+over all markets' log_size_ratio; m_Z a running pooled mean of E[Z_prev]
+updated after each E-step) and stored on `VEMOutput` for reuse by a future
+weighted-logistic M-step. Standardizing keeps `beta_S`/`beta_Z` on a common,
+interpretable scale, but the resulting slopes are only *approximately*
+centering-invariant: wallet-specific theta_w shrinkage is heavy below
+~20 trades (ARCHITECTURE.md §9.5), so the logistic predictor and the Beta
+hierarchy interact rather than factoring cleanly.
+
 Reference: Ghahramani & Hinton (2000) "Variational Learning for Switching
 State-Space Models"; also known as Assumed Density Filtering for SSMs.
+Gelman, A. (2008) "Scaling regression inputs by dividing by two standard
+deviations", Statistics in Medicine 27(15).
 """
 
 from __future__ import annotations
@@ -31,6 +47,13 @@ from src.utils.transforms import log1pexp, logit
 if TYPE_CHECKING:
     pass
 
+# Below this pooled std of log_size_ratio, treat the size covariate as
+# degenerate (all trades effectively the same size) and skip the 0.5/s_S
+# scale factor. A truly constant column has std ~1e-16 from floating-point
+# rounding, not exactly 0.0, so the guard uses a floor well above that noise
+# floor rather than an exact `s_S > 0` check.
+_S_STD_FLOOR = 1e-8
+
 
 @dataclass
 class VEMOutput:
@@ -43,6 +66,10 @@ class VEMOutput:
     X_mean: list[np.ndarray]     # per-market (T_k,) mixed E[X_t | Y_{0:t}]
     elbo_trace: np.ndarray       # (n_iter_run,) log-marginal per EM iteration (proxy for ELBO)
     n_iter_run: int              # actual EM iterations completed
+    m_S: float                   # pooled mean of log_size_ratio (standardization)
+    s_S: float                   # pooled std of log_size_ratio; ~0 if degenerate
+                                  # (constant size) -- see _S_STD_FLOOR
+    m_Z: float                   # running pooled mean of E[Z_prev] (centering)
 
 
 def _vem_e_step(
@@ -52,6 +79,9 @@ def _vem_e_step(
     wallet_ids: np.ndarray,
     theta_w: np.ndarray,
     params: ModelParams,
+    m_S: float,
+    s_S: float,
+    m_Z: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
     """Single-mode ADF forward pass for one market.
 
@@ -62,6 +92,12 @@ def _vem_e_step(
         wallet_ids: (T,) integer wallet index per trade.
         theta_w: (n_wallets,) current per-wallet propensity estimates.
         params: Current model parameters.
+        m_S: Pooled mean of log_size_ratio, for standardizing the size covariate.
+        s_S: Pooled std of log_size_ratio; below `_S_STD_FLOOR` (degenerate
+            constant-size market/dataset), the 0.5/s_S scale factor is
+            skipped and only centering is applied, avoiding an unstable or
+            divide-by-zero scale factor.
+        m_Z: Pooled mean of E[Z_prev], for centering the persistence covariate.
 
     Returns:
         q_vz: (T, 4) soft (V_t, Z_t) assignments — q_vz[t, k] = q(V_t=v, Z_t=z)
@@ -104,10 +140,22 @@ def _vem_e_step(
             log_p_V = np.array(
                 [np.log(max(p_V0, 1e-300)), np.log(max(p_V1, 1e-300))]
             )
+            # Standardize/center covariates (Gelman et al. 2008) before the
+            # logistic predictor: no free intercept here, theta_w's Beta
+            # hierarchy carries the level. Guard s_S below a small floor
+            # (degenerate/near-constant-size data) rather than exactly 0:
+            # a constant column's std is only ~machine-epsilon due to
+            # floating-point rounding, not exactly zero, and dividing by
+            # that residual noise would amplify it into an arbitrary value.
+            x_S_centered = float(log_size_ratio[t]) - m_S
+            x_S_tilde = (
+                x_S_centered * 0.5 / s_S if s_S > _S_STD_FLOOR else x_S_centered
+            )
+            x_Z_tilde = prev_E_Z - m_Z
             logit_pi = (
                 float(logit_theta[int(wallet_ids[t])])
-                + params.beta_S * float(log_size_ratio[t])
-                + params.beta_Z * prev_E_Z
+                + params.beta_S * x_S_tilde
+                + params.beta_Z * x_Z_tilde
             )
             lp = float(log1pexp(logit_pi))
             log_p_Z = np.array([-lp, logit_pi - lp])
@@ -290,7 +338,8 @@ def variational_em(
             always sequential.
 
     Returns:
-        VEMOutput with fitted params, posterior marginals, and convergence trace.
+        VEMOutput with fitted params, posterior marginals, convergence trace,
+        and the standardization/centering constants (m_S, s_S, m_Z).
     """
     if n_wallets is None:
         n_wallets = int(max(int(m.wallet_ids.max()) for m in markets)) + 1
@@ -305,6 +354,18 @@ def variational_em(
         theta_w = np.full(n_wallets, params.a / (params.a + params.b))
     else:
         theta_w = np.array(theta_w_init, copy=True)
+
+    # Standardization constants (Gelman et al. 2008), fit once per call from
+    # the pooled dataset over all markets. s_S is ~0 for a degenerate
+    # constant-size dataset; _vem_e_step guards that case (centering only).
+    log_size_ratio_all = np.concatenate([m.log_size_ratio for m in markets])
+    m_S = float(np.mean(log_size_ratio_all))
+    s_S = float(np.std(log_size_ratio_all))
+    # m_Z centers the persistence covariate E[Z_prev]; unlike (m_S, s_S) it
+    # cannot be known before any E-step has run, so it starts at 0.0 (matching
+    # the Z_0 := 0 convention) and is refreshed as a running pooled mean of
+    # E[Z_prev] after each E-step, for use in the next iteration's predictor.
+    m_Z = 0.0
 
     elbo_trace: list[float] = []
     prev_lm = float("-inf")
@@ -327,6 +388,9 @@ def variational_em(
                 md.wallet_ids,
                 theta_w,
                 params,
+                m_S,
+                s_S,
+                m_Z,
             )
             q_vz_list.append(q_vz)
             mu_filt_list.append(mu_f)
@@ -334,6 +398,15 @@ def variational_em(
             total_lm += lm
 
         elbo_trace.append(total_lm)
+
+        # Refresh m_Z from this iteration's E[Z_prev] values (indices 0..T-2
+        # of each market, i.e. exactly the values the predictor consumed as
+        # "prev_E_Z"), pooled across markets, for the next E-step.
+        prev_E_Z_all = np.concatenate(
+            [q_vz[:-1, 1] + q_vz[:-1, 3] for q_vz in q_vz_list if len(q_vz) > 1]
+        )
+        if prev_E_Z_all.size > 0:
+            m_Z = float(np.mean(prev_E_Z_all))
 
         # ---- Convergence check ----
         if em_it > 0:
@@ -367,4 +440,7 @@ def variational_em(
         X_mean=mu_filt_list,
         elbo_trace=np.asarray(elbo_trace),
         n_iter_run=n_iter_run,
+        m_S=m_S,
+        s_S=s_S,
+        m_Z=m_Z,
     )
