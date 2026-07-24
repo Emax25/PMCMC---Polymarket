@@ -209,13 +209,13 @@ def test_vem_z_prob_discriminates_insiders():
     KNOWN LIMITATION (see the module/U3 FLAG on E-step Z-identifiability): on
     this generator Z modulates only the observation variance tau2_Z and the
     ADF E-step recovers Z only weakly (Z_prob spread ~1e-3), so the ranking is
-    fragile. With `estimate_betas=True` (U3's default) a *spurious*, Cauchy-
-    shrunk beta_S ~ -0.06 fitted to beta=0 data adds a size-correlated tilt
-    that overwhelms that weak signal and drops the AUC to ~0.55. The
-    discrimination capability itself is intact — it holds cleanly on the
+    fragile. With opt-in `estimate_betas=True` a *spurious*, Cauchy-shrunk
+    beta_S ~ -0.06 fitted to beta=0 data adds a size-correlated tilt that
+    overwhelms that weak signal and drops the AUC to ~0.55. The discrimination
+    capability itself is intact — it holds cleanly on the (now default)
     beta-fixed path (AUC ~0.90) — so the capability is asserted there while the
-    default-path degradation is flagged for the orchestrator to weigh (E-step
-    fix vs. gating beta estimation on Z-identifiability).
+    beta-estimation degradation is flagged for the orchestrator to weigh
+    (E-step fix vs. gating beta estimation on Z-identifiability).
     """
     rng = np.random.default_rng(0)
     p_true = ModelParams.warm_start(rng.standard_normal(200))
@@ -652,12 +652,13 @@ def test_vem_elbo_trace_finite_and_at_least_prechange():
     """ELBO trace (test 9): finite throughout; terminal value not materially
     below the pre-change (beta-fixed-at-0) terminal value on the standard fixture.
 
-    `elbo_trace` records the ADF *proxy* log-marginal, which is not the
-    objective the ECM M-step maximizes (the M-step maximizes the expected
-    complete-data log-posterior). On this beta=0 fixture, estimating betas
-    every M-step therefore nudges the proxy marginal by a negligible amount
-    (~3e-5 relative) rather than strictly increasing it — the assertion allows
-    that small approximation slack instead of demanding a strict `>=`.
+    `elbo_trace` records the ADF *proxy* log-marginal. This runs at the default
+    `estimate_betas=False`, so with the beta=0 `params_init` the betas stay
+    fixed at 0 for every M-step and the run reproduces the pre-change
+    beta-fixed-at-0 path — its terminal proxy marginal therefore matches the
+    fixture terminal to Newton/ADF roundoff. The assertion allows a small
+    approximation slack instead of demanding a strict `>=`; it doubles as a
+    guard that the default stays beta-fixed.
     """
     fixture = np.load(FIXTURES / "vem_prechange_beta0.npz")
     mkt, params = _make_synth(T=80, n_wallets=10, n_insider=2, seed=3)
@@ -680,34 +681,39 @@ _STABILITY_AUC_GATE = 0.85  # same discrimination bar the synthetic gate uses
 @pytest.mark.xfail(
     strict=False,
     reason=(
-        "Default estimate_betas=True is unstable on the beta=0 generator (U4 "
-        "gate measurement). The IRLS M-step fits a spurious size-correlated "
-        "beta_S (consistently negative, ~-0.7 internal) whose tilt collapses "
-        "the per-trade insider-Z AUC to ~0.51 (vs ~0.94 beta-fixed, far below "
-        "the 0.85 gate bar), while beta_Z is numerical noise (~+/-2e-3) whose "
-        "sign flips seed to seed. Both the beta_Z sign-consistency and the "
-        "AUC-level assertions therefore fail under the current default. The "
-        "capability is intact on the beta-fixed path "
-        "(test_vem_z_prob_discriminates_insiders, AUC ~0.90); this xfail pins "
-        "the default-path degradation the U4 gate run surfaced (pooled AUC "
-        "0.68 < 0.85 at K=10/T=2000). Remove the xfail once beta estimation is "
-        "gated on E-step Z-identifiability or the default flips to beta-fixed; "
-        "see the module FLAG on E-step Z-identifiability."
+        "The opt-in beta-estimation path (estimate_betas=True, passed "
+        "explicitly here — no longer the default) is unstable on the beta=0 "
+        "generator (U4 gate measurement). The IRLS M-step fits a spurious "
+        "size-correlated beta_S (consistently negative, ~-0.7 internal) whose "
+        "tilt collapses the per-trade insider-Z AUC to ~0.51 (vs ~0.94 "
+        "beta-fixed, far below the 0.85 gate bar), while beta_Z is numerical "
+        "noise (~+/-2e-3) whose sign flips seed to seed. Both the beta_Z "
+        "sign-consistency and the AUC-level assertions therefore fail on the "
+        "beta-estimation path. The capability is intact on the (now default) "
+        "beta-fixed path (test_vem_z_prob_discriminates_insiders, AUC ~0.90); "
+        "this xfail pins the beta-estimation degradation the U4 gate run "
+        "surfaced (pooled AUC 0.68 < 0.85 at K=10/T=2000). The call passes "
+        "estimate_betas=True explicitly so the default flip to beta-fixed "
+        "cannot silently XPASS this test. Remove the xfail once beta "
+        "estimation is gated on E-step Z-identifiability; see the module FLAG "
+        "on E-step Z-identifiability."
     ),
 )
 def test_vem_default_betas_multiseed_stability():
-    """Default (estimate_betas=True) VEM should be stable across data seeds.
+    """Opt-in (estimate_betas=True) VEM should be stable across data seeds.
 
-    A well-behaved default would, across independent data seeds, keep each
-    fitted beta's *sign* consistent, keep the pooled insider-Z AUC *spread*
-    tight (< 0.05), and keep that AUC at a *usable* discrimination level
-    (>= the 0.85 gate bar). On this generator the true betas are zero, so the
-    IRLS M-step fits spurious coefficients that violate the sign and level
-    checks; this test is xfail-pinned to that measured default-path behavior
-    (see the decorator's reason and the U4 gate diagnostic). Seeds are fixed
-    and VEM is deterministic given data, so the failure is reproducible, not
-    flaky. Reduced scale (K=4, T=400) reproduces the gate-scale (K=10, T=2000)
-    degradation while keeping the run to ~25 s.
+    A well-behaved beta-estimation path would, across independent data seeds,
+    keep each fitted beta's *sign* consistent, keep the pooled insider-Z AUC
+    *spread* tight (< 0.05), and keep that AUC at a *usable* discrimination
+    level (>= the 0.85 gate bar). On this generator the true betas are zero, so
+    the IRLS M-step fits spurious coefficients that violate the sign and level
+    checks; this test is xfail-pinned to that measured behavior (see the
+    decorator's reason and the U4 gate diagnostic). `estimate_betas=True` is
+    passed explicitly because the default is now False (beta-fixed) — this
+    keeps the test exercising the degraded path so it cannot silently XPASS on
+    the flip. Seeds are fixed and VEM is deterministic given data, so the
+    failure is reproducible, not flaky. Reduced scale (K=4, T=400) reproduces
+    the gate-scale (K=10, T=2000) degradation while keeping the run to ~25 s.
     """
     rng = np.random.default_rng(0)
     p_true = ModelParams.warm_start(rng.standard_normal(200))
@@ -731,7 +737,9 @@ def test_vem_default_betas_multiseed_stability():
             for _ in range(4)
         ]
         mds = [_to_market_data(m) for m in mkts]
-        out = variational_em(mds, cfg, n_wallets=20, n_iter=50, tol=1e-4)
+        out = variational_em(
+            mds, cfg, n_wallets=20, n_iter=50, tol=1e-4, estimate_betas=True
+        )
         beta_S_seeds.append(float(out.params.beta_S))
         beta_Z_seeds.append(float(out.params.beta_Z))
         z_true = np.concatenate([m.Z.astype(int) for m in mkts])

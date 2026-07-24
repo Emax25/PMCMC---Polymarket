@@ -31,6 +31,14 @@ an iteration even though the blocks are not updated jointly:
       is evaluated at the *current* beta, which keeps the estimate finite
       even under complete separation of q(Z) on a covariate.
 
+Block (c) is *opt-in*: `variational_em` defaults to `estimate_betas=False`
+(betas held fixed). On the current synthetic generator the ADF E-step cannot
+identify Z (q(Z) is near-flat — Z modulates only the observation variance
+tau2_Z), so default-on beta estimation fits a spurious size-correlated beta_S
+(~-0.40) that drops gate AUC from ~0.89 to ~0.68. Beta estimation is enabled
+explicitly (Laplace layer, real-data runs, Z-identifiability work) until the
+E-step identifies Z.
+
 Predictor covariates are centered/standardized (Gelman et al. 2008) before
 entering the logistic Z predictor, with no free intercept — the theta_w
 Beta hierarchy already carries the level:
@@ -730,7 +738,7 @@ def variational_em(
     n_iter: int = 50,
     tol: float = 1e-3,
     n_jobs: int = 1,
-    estimate_betas: bool = True,
+    estimate_betas: bool = False,
 ) -> VEMOutput:
     """Fit the switching SSM by variational EM (ADF E-step + ECM M-step).
 
@@ -750,11 +758,17 @@ def variational_em(
         tol: Convergence tolerance on the relative change in log-marginal.
         n_jobs: Reserved for future joblib parallelism over markets; currently
             always sequential.
-        estimate_betas: If False, hold beta_S/beta_Z fixed at `params_init`'s
-            value across all iterations instead of fitting them via IRLS each
-            M-step. Default True (betas estimated every M-step). Setting this
-            False with the default beta_S = beta_Z = 0.0 recovers the
-            pre-regression theta_w-only M-step exactly (regression anchor).
+        estimate_betas: If False (default), hold beta_S/beta_Z fixed at
+            `params_init`'s value across all iterations instead of fitting them
+            via IRLS each M-step. With the default beta_S = beta_Z = 0.0 this
+            recovers the pre-regression theta_w-only M-step exactly. Default is
+            False because the ADF E-step cannot identify Z on the current
+            synthetic generator (q(Z) is near-flat — Z modulates only the
+            observation variance tau2_Z), so enabling beta estimation fits a
+            spurious size-correlated beta_S (~-0.40) whose tilt drops the gate
+            AUC from ~0.89 to ~0.68. Beta estimation is therefore opt-in
+            (Laplace layer, real-data runs, Z-identifiability investigation)
+            until the E-step identifies Z; pass True to enable it explicitly.
 
     Returns:
         VEMOutput with fitted params, posterior marginals, convergence trace,
