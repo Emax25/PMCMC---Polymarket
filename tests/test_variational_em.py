@@ -1,6 +1,7 @@
 """Tests for src.inference.variational_em."""
 from __future__ import annotations
 
+import inspect
 import warnings
 from dataclasses import replace
 from pathlib import Path
@@ -8,8 +9,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from config.default_params import InferenceConfig, ModelParams
+from config.default_params import InferenceConfig, ModelParams, PhiPrior
 from src.data.synthetic import generate_market
+from src.inference import variational_em as vem_module
 from src.inference.particle_gibbs import MarketData
 from src.inference.variational_em import (
     VEMOutput,
@@ -758,3 +760,94 @@ def test_vem_default_betas_multiseed_stability():
     assert min(auc_seeds) >= _STABILITY_AUC_GATE, (
         f"pooled AUC below gate bar: {auc_seeds}"
     )
+
+
+# ---------------- U1: PhiPrior M-step refactor (R8, KTD3) ----------------
+
+
+def test_mstep_prior_refactor_preserves_params():
+    """R8 regression: PhiPrior-default M-step reproduces the pre-refactor params.
+
+    The prior hyperparameters were hoisted out of `_vem_m_step` into
+    `config.default_params.PhiPrior` with defaults equal to the old effective
+    values, so the sequential inference path is behaviour-preserving. The pinned
+    values in `vem_r8_prechange_params.npz` were captured from the pre-refactor
+    code on the standard fixture (T=80, seed=3, n_iter=10, estimate_betas=False,
+    identical to `test_vem_runs_end_to_end`'s config).
+
+    sigma2/q/beta reproduce the old values to ~machine precision. tau2 gains a
+    *new* weak InvGamma pseudo-count prior (its Laplace block needs defined
+    curvature), which reduces to the old moment-match SS/N as the prior -> 0;
+    with the tiny defaults the shift is numerically negligible (< 1e-6 relative,
+    empirically ~2e-9 here) — the single documented deviation from bit-exactness.
+    """
+    pre = np.load(FIXTURES / "vem_r8_prechange_params.npz")
+    mkt, params = _make_synth(T=80, n_wallets=10, n_insider=2, seed=3)
+    md = _to_market_data(mkt)
+    cfg = InferenceConfig(N=20)
+    out = variational_em(
+        [md], cfg, n_wallets=10, params_init=params, n_iter=10, estimate_betas=False
+    )
+    p = out.params
+
+    # Blocks with unchanged priors: essentially bit-exact (tau2 feedback into the
+    # E-step perturbs sigma2 at ~1e-9, far under this bound).
+    for name in ("sigma2_0", "sigma2_1", "q_01", "q_10", "beta_S", "beta_Z"):
+        np.testing.assert_allclose(
+            getattr(p, name), float(pre[name]), rtol=1e-6, atol=1e-9,
+            err_msg=f"{name} drifted after the R8 refactor",
+        )
+    # tau2: the documented negligible weak-prior shift.
+    for name in ("tau2_0", "tau2_1"):
+        old = float(pre[name])
+        rel = abs(getattr(p, name) - old) / abs(old)
+        assert rel < 1e-6, f"{name} shift {rel:.2e} exceeds the negligible band"
+
+
+def test_mstep_body_has_no_hardcoded_prior_constants():
+    """Prior-consistency audit: `_vem_m_step` sources all priors from PhiPrior.
+
+    Anchors on the specific prior-constant identifiers that lived in the old
+    M-step body — they must be gone — and asserts the PhiPrior accessors that
+    replaced them are present, so the spec stays the single source of truth.
+    """
+    src = inspect.getsource(_vem_m_step)
+    for banned in ("alpha_prior_s", "beta_prior_s", "a_prior", "b_prior"):
+        assert banned not in src, f"residual hardcoded prior constant '{banned}'"
+    for required in (
+        "prior.q_map",
+        "prior.sigma2_map",
+        "prior.tau2_map",
+        "prior.beta_cauchy_scale",
+    ):
+        assert required in src, f"M-step no longer consumes '{required}'"
+    # The Cauchy scale constant must not linger anywhere in the module.
+    assert "_CAUCHY_PRIOR_SCALE" not in inspect.getsource(vem_module)
+
+
+def test_phiprior_map_helpers_match_mstep_algebra():
+    """PhiPrior MAP helpers reproduce the exact M-step update formulas."""
+    prior = PhiPrior()
+    # sigma2 IG(2,1) mode = (beta + SS/2)/(alpha + N/2 + 1).
+    assert prior.sigma2_map(10.0, 8.0) == pytest.approx((1.0 + 5.0) / (2.0 + 4.0 + 1.0))
+    # q Beta(1,1) posterior mean = (1 + n_switch)/(2 + n_switch + n_stay).
+    assert prior.q_map(3.0, 7.0) == pytest.approx((1.0 + 3.0) / (2.0 + 3.0 + 7.0))
+    # tau2 pseudo-count MAP -> SS/N as the prior -> 0.
+    assert prior.tau2_map(10.0, 8.0) == pytest.approx(
+        (10.0 + 2e-9) / (8.0 + 2e-9)
+    )
+    assert prior.tau2_map(10.0, 8.0) == pytest.approx(10.0 / 8.0, rel=1e-6)
+
+
+def test_phiprior_log_prior_finite_and_beta11_uniform():
+    """log_prior is finite on a valid phi; Beta(1,1) blocks contribute 0."""
+    prior = PhiPrior()
+    phi = np.array([0.3, 1.7, 0.2, 0.6, 0.5, -0.4, 0.05, 0.02])
+    lp = prior.log_prior(phi)
+    assert np.isfinite(lp)
+    # Batched evaluation reduces the trailing length-8 axis.
+    batch = prior.log_prior(np.stack([phi, phi]))
+    assert batch.shape == (2,)
+    np.testing.assert_allclose(batch, lp)
+    # The Beta(1,1) q-block density is identically 0 (uniform).
+    assert PhiPrior._beta_logpdf(np.array(0.4), 1.0, 1.0) == pytest.approx(0.0)

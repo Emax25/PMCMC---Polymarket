@@ -84,7 +84,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 from scipy.special import logsumexp
 
-from config.default_params import InferenceConfig, ModelParams
+from config.default_params import InferenceConfig, ModelParams, PhiPrior
 from src.inference.kalman import _kalman_step_all_combos
 from src.inference.particle_gibbs import MarketData
 from src.utils.transforms import log1pexp, logit, sigmoid
@@ -99,10 +99,12 @@ if TYPE_CHECKING:
 # floor rather than an exact `s_S > 0` check.
 _S_STD_FLOOR = 1e-8
 
-# Cauchy(0, scale) weakly-informative prior on each standardized beta
-# (Gelman et al. 2008); the approximate-EM IRLS modification below evaluates
-# its curvature/gradient contribution at the current coefficient each step.
-_CAUCHY_PRIOR_SCALE = 2.5
+# The Cauchy(0, scale) weakly-informative prior on each standardized beta
+# (Gelman et al. 2008) now lives in `config.default_params.PhiPrior`
+# (`beta_cauchy_scale`, default 2.5) so every consumer — the IRLS M-step here,
+# the Laplace layer, and PSIS — shares one definition (plan 2026-07-23-002 R8).
+# The approximate-EM IRLS modification below still evaluates the prior's
+# curvature/gradient contribution at the current coefficient each step.
 _IRLS_MAX_ITER = 25
 _IRLS_REL_TOL = 1e-6
 
@@ -462,8 +464,9 @@ def _update_beta_irls(
     m_Z: float,
     beta_S_init: float,
     beta_Z_init: float,
+    cauchy_scale: float | None = None,
 ) -> tuple[float, float, np.ndarray]:
-    """Pooled IRLS update for (beta_S, beta_Z) with a Cauchy(0, 2.5) prior (KTD1/2/6).
+    """Pooled IRLS update for (beta_S, beta_Z) with a Cauchy(0, scale) prior (KTD1/2/6).
 
     Fits a no-intercept logistic regression of the fractional target
     `y_t = q(Z_t = 1)` on `[x_S~_t, x_Z~_t]`, offset by `logit(theta_w[wallet(t)])`
@@ -492,12 +495,18 @@ def _update_beta_irls(
         m_Z: Pooled mean of E[Z_prev] (centering).
         beta_S_init: Warm-start internal-scale beta_S (previous iteration).
         beta_Z_init: Warm-start internal-scale beta_Z (previous iteration).
+        cauchy_scale: Scale of the Cauchy(0, scale) prior on each standardized
+            coefficient. ``None`` (the default, used by direct callers/tests)
+            resolves to `PhiPrior().beta_cauchy_scale` so the single prior spec
+            remains authoritative.
 
     Returns:
         `(beta_S, beta_Z, fisher_info)`: the internal-scale coefficients and
         the final 2x2 Fisher information matrix (data + prior curvature, at
         the converged beta).
     """
+    if cauchy_scale is None:
+        cauchy_scale = PhiPrior().beta_cauchy_scale
     logit_theta = logit(theta_w)
     wallet_idx, x_S, x_Z, y = _pooled_zj_covariates(markets, q_vz_list, m_S, s_S, m_Z)
 
@@ -514,11 +523,11 @@ def _update_beta_irls(
         """Expected complete-data log-lik + Cauchy(0, 2.5) log-prior at `b`."""
         eta = offset + X @ b
         log_lik = float(np.sum(y * eta - log1pexp(eta)))
-        log_prior = float(-np.sum(np.log1p((b / _CAUCHY_PRIOR_SCALE) ** 2)))
+        log_prior = float(-np.sum(np.log1p((b / cauchy_scale) ** 2)))
         return log_lik + log_prior
 
     obj = _penalized_obj(beta)
-    fisher = np.diag(2.0 / (_CAUCHY_PRIOR_SCALE**2 + beta**2))
+    fisher = np.diag(2.0 / (cauchy_scale**2 + beta**2))
     converged = False
     for _ in range(_IRLS_MAX_ITER):
         eta = offset + X @ beta
@@ -527,7 +536,7 @@ def _update_beta_irls(
         grad_data = X.T @ (y - mu)
         hess_data = (X * w[:, None]).T @ X
 
-        c = 2.0 / (_CAUCHY_PRIOR_SCALE**2 + beta**2)
+        c = 2.0 / (cauchy_scale**2 + beta**2)
         grad = grad_data - c * beta
         fisher = hess_data + np.diag(c)
 
@@ -572,7 +581,7 @@ def _update_beta_irls(
     mu = sigmoid(eta)
     w = mu * (1.0 - mu)
     hess_data = (X * w[:, None]).T @ X
-    c = 2.0 / (_CAUCHY_PRIOR_SCALE**2 + beta**2)
+    c = 2.0 / (cauchy_scale**2 + beta**2)
     fisher = hess_data + np.diag(c)
 
     return float(beta[0]), float(beta[1]), fisher
@@ -590,6 +599,7 @@ def _vem_m_step(
     s_S: float,
     m_Z: float,
     *,
+    prior: PhiPrior | None = None,
     estimate_betas: bool = True,
 ) -> tuple[ModelParams, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """ECM M-step: theta_w Newton, then moment-matched updates, then beta IRLS.
@@ -611,6 +621,10 @@ def _vem_m_step(
         m_S: Pooled mean of log_size_ratio (standardization).
         s_S: Pooled std of log_size_ratio (standardization); see `_S_STD_FLOOR`.
         m_Z: Pooled mean of E[Z_prev] (centering).
+        prior: The single M-step prior spec (`PhiPrior`); `None` resolves to
+            `PhiPrior()` (the behaviour-preserving defaults). Supplies the
+            sigma2/tau2 Inverse-Gamma, q Beta, and beta Cauchy hyperparameters
+            — no prior constant is hardcoded in this body (plan R8/KTD3).
         estimate_betas: If False, skip block (c) and hold beta_S/beta_Z fixed
             at their `params` value for every iteration (regression-anchor /
             debugging path — with the offset then uniformly 0 at the default
@@ -620,6 +634,9 @@ def _vem_m_step(
     Returns:
         `(params, theta_w, theta_w_logit_mean, theta_w_logit_var, beta_fisher_info)`.
     """
+    if prior is None:
+        prior = PhiPrior()
+
     # ---- (a) theta_w: offset-adjusted per-wallet penalized Newton ----
     theta_w_new, theta_w_logit_mean, theta_w_logit_var = _update_theta_w(
         markets,
@@ -635,8 +652,7 @@ def _vem_m_step(
         logit(theta_w),
     )
 
-    # ---- q_01, q_10: product-of-marginals Beta update ----
-    a_prior = b_prior = 1.0
+    # ---- q_01, q_10: product-of-marginals Beta update (prior.q_beta_a/b) ----
     n_00 = n_01 = n_10 = n_11 = 0.0
     for q_vz in q_vz_list:
         q_V0 = q_vz[:, 0] + q_vz[:, 1]
@@ -645,15 +661,13 @@ def _vem_m_step(
         n_01 += float((q_V0[:-1] * q_V1[1:]).sum())
         n_10 += float((q_V1[:-1] * q_V0[1:]).sum())
         n_11 += float((q_V1[:-1] * q_V1[1:]).sum())
-    q_01_new = (a_prior + n_01) / (2 * a_prior + n_01 + n_00)
-    q_10_new = (a_prior + n_10) / (2 * a_prior + n_10 + n_11)
+    q_01_new = prior.q_map(n_01, n_00)
+    q_10_new = prior.q_map(n_10, n_11)
     # Clamp to (0,1) open interval to avoid degenerate regimes
     q_01_new = float(np.clip(q_01_new, 1e-6, 1.0 - 1e-6))
     q_10_new = float(np.clip(q_10_new, 1e-6, 1.0 - 1e-6))
 
     # ---- sigma2_0, sigma2_1: IG MAP update (mode = beta/(alpha+1)) ----
-    alpha_prior_s = 2.0
-    beta_prior_s = 1.0
     SS_v = [0.0, 0.0]
     N_v = [0.0, 0.0]
     for md, q_vz, mu_f, sigma2_f in zip(
@@ -671,17 +685,14 @@ def _vem_m_step(
                 (q_V_v[valid] * (resid2[valid] + extra_var[valid]) / dt[valid]).sum()
             )
             N_v[v] += float(q_V_v[valid].sum())
-    sigma2_0_new = max(
-        (beta_prior_s + SS_v[0] / 2.0) / (alpha_prior_s + N_v[0] / 2.0 + 1.0),
-        1e-6,
-    )
-    sigma2_1_new = max(
-        (beta_prior_s + SS_v[1] / 2.0) / (alpha_prior_s + N_v[1] / 2.0 + 1.0),
-        1e-6,
-    )
+    sigma2_0_new = max(prior.sigma2_map(SS_v[0], N_v[0]), 1e-6)
+    sigma2_1_new = max(prior.sigma2_map(SS_v[1], N_v[1]), 1e-6)
     sigma2_1_new = max(sigma2_1_new, sigma2_0_new)
 
-    # ---- tau2_0, tau2_1: moment-matched update ----
+    # ---- tau2_0, tau2_1: weak-IG pseudo-count MAP (prior.tau2_map) ----
+    # Reduces to the pre-refactor moment-match SS/N as the tau2 prior -> 0; the
+    # weak default prior gives the Laplace tau2 block a defined curvature at the
+    # cost of a numerically negligible estimate shift (plan R8).
     SS_z = [0.0, 0.0]
     N_z = [0.0, 0.0]
     for md, q_vz, mu_f, sigma2_f in zip(
@@ -693,8 +704,8 @@ def _vem_m_step(
             q_Z_z = q_vz[:, z] + q_vz[:, 2 + z]
             SS_z[z] += float((q_Z_z * (resid2 + sigma2_f) * denom_t).sum())
             N_z[z] += float(q_Z_z.sum())
-    tau2_0_new = max(SS_z[0] / max(N_z[0], 1e-10), 1e-6)
-    tau2_1_new = max(SS_z[1] / max(N_z[1], 1e-10), 1e-6)
+    tau2_0_new = max(prior.tau2_map(SS_z[0], N_z[0]), 1e-6)
+    tau2_1_new = max(prior.tau2_map(SS_z[1], N_z[1]), 1e-6)
     # Insiders have tighter obs variance (more price-informative trades)
     tau2_1_new = min(tau2_1_new, tau2_0_new)
 
@@ -709,6 +720,7 @@ def _vem_m_step(
             m_Z,
             params.beta_S,
             params.beta_Z,
+            cauchy_scale=prior.beta_cauchy_scale,
         )
     else:
         beta_S_new, beta_Z_new = params.beta_S, params.beta_Z
@@ -738,6 +750,7 @@ def variational_em(
     n_iter: int = 50,
     tol: float = 1e-3,
     n_jobs: int = 1,
+    prior: PhiPrior | None = None,
     estimate_betas: bool = False,
 ) -> VEMOutput:
     """Fit the switching SSM by variational EM (ADF E-step + ECM M-step).
@@ -758,6 +771,8 @@ def variational_em(
         tol: Convergence tolerance on the relative change in log-marginal.
         n_jobs: Reserved for future joblib parallelism over markets; currently
             always sequential.
+        prior: The single M-step prior spec (`PhiPrior`); `None` uses the
+            behaviour-preserving defaults. Threaded unchanged into every M-step.
         estimate_betas: If False (default), hold beta_S/beta_Z fixed at
             `params_init`'s value across all iterations instead of fitting them
             via IRLS each M-step. With the default beta_S = beta_Z = 0.0 this
@@ -774,6 +789,9 @@ def variational_em(
         VEMOutput with fitted params, posterior marginals, convergence trace,
         and the standardization/centering constants (m_S, s_S, m_Z).
     """
+    if prior is None:
+        prior = PhiPrior()
+
     if n_wallets is None:
         n_wallets = int(max(int(m.wallet_ids.max()) for m in markets)) + 1
 
@@ -868,6 +886,7 @@ def variational_em(
                 m_S,
                 s_S,
                 m_Z,
+                prior=prior,
                 estimate_betas=estimate_betas,
             )
         )
