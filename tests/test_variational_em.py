@@ -669,3 +669,84 @@ def test_vem_elbo_trace_finite_and_at_least_prechange():
     slack = 1e-3 * abs(prechange_terminal)  # ~0.19 on a ~-188 marginal
     assert np.all(np.isfinite(out.elbo_trace))
     assert out.elbo_trace[-1] >= prechange_terminal - slack
+
+
+# ---------------- U4: multi-seed stability of the default betas path ----------------
+
+_STABILITY_AUC_GATE = 0.85  # same discrimination bar the synthetic gate uses
+
+
+@pytest.mark.slow
+@pytest.mark.xfail(
+    strict=False,
+    reason=(
+        "Default estimate_betas=True is unstable on the beta=0 generator (U4 "
+        "gate measurement). The IRLS M-step fits a spurious size-correlated "
+        "beta_S (consistently negative, ~-0.7 internal) whose tilt collapses "
+        "the per-trade insider-Z AUC to ~0.51 (vs ~0.94 beta-fixed, far below "
+        "the 0.85 gate bar), while beta_Z is numerical noise (~+/-2e-3) whose "
+        "sign flips seed to seed. Both the beta_Z sign-consistency and the "
+        "AUC-level assertions therefore fail under the current default. The "
+        "capability is intact on the beta-fixed path "
+        "(test_vem_z_prob_discriminates_insiders, AUC ~0.90); this xfail pins "
+        "the default-path degradation the U4 gate run surfaced (pooled AUC "
+        "0.68 < 0.85 at K=10/T=2000). Remove the xfail once beta estimation is "
+        "gated on E-step Z-identifiability or the default flips to beta-fixed; "
+        "see the module FLAG on E-step Z-identifiability."
+    ),
+)
+def test_vem_default_betas_multiseed_stability():
+    """Default (estimate_betas=True) VEM should be stable across data seeds.
+
+    A well-behaved default would, across independent data seeds, keep each
+    fitted beta's *sign* consistent, keep the pooled insider-Z AUC *spread*
+    tight (< 0.05), and keep that AUC at a *usable* discrimination level
+    (>= the 0.85 gate bar). On this generator the true betas are zero, so the
+    IRLS M-step fits spurious coefficients that violate the sign and level
+    checks; this test is xfail-pinned to that measured default-path behavior
+    (see the decorator's reason and the U4 gate diagnostic). Seeds are fixed
+    and VEM is deterministic given data, so the failure is reproducible, not
+    flaky. Reduced scale (K=4, T=400) reproduces the gate-scale (K=10, T=2000)
+    degradation while keeping the run to ~25 s.
+    """
+    rng = np.random.default_rng(0)
+    p_true = ModelParams.warm_start(rng.standard_normal(200))
+    assert p_true.beta_S == 0.0 and p_true.beta_Z == 0.0  # true betas are zero
+    cfg = InferenceConfig(N=50)
+
+    beta_S_seeds: list[float] = []
+    beta_Z_seeds: list[float] = []
+    auc_seeds: list[float] = []
+    for seed in (11, 22, 33):
+        seed_rng = np.random.default_rng(seed)
+        mkts = [
+            generate_market(
+                p_true,
+                n_trades=400,
+                n_wallets=20,
+                n_insider_wallets=3,
+                mean_inter_trade_time=1.0,
+                rng=seed_rng,
+            )
+            for _ in range(4)
+        ]
+        mds = [_to_market_data(m) for m in mkts]
+        out = variational_em(mds, cfg, n_wallets=20, n_iter=50, tol=1e-4)
+        beta_S_seeds.append(float(out.params.beta_S))
+        beta_Z_seeds.append(float(out.params.beta_Z))
+        z_true = np.concatenate([m.Z.astype(int) for m in mkts])
+        z_prob = np.concatenate(out.Z_prob)
+        auc = _z_prob_auc(z_prob, z_true)
+        assert auc is not None  # both classes present across 4 insider markets
+        auc_seeds.append(auc)
+
+    beta_S_signs = {int(np.sign(b)) for b in beta_S_seeds}
+    beta_Z_signs = {int(np.sign(b)) for b in beta_Z_seeds}
+    auc_spread = max(auc_seeds) - min(auc_seeds)
+
+    assert len(beta_S_signs) == 1, f"beta_S sign inconsistent: {beta_S_seeds}"
+    assert len(beta_Z_signs) == 1, f"beta_Z sign inconsistent: {beta_Z_seeds}"
+    assert auc_spread < 0.05, f"AUC spread {auc_spread:.4f} >= 0.05: {auc_seeds}"
+    assert min(auc_seeds) >= _STABILITY_AUC_GATE, (
+        f"pooled AUC below gate bar: {auc_seeds}"
+    )
