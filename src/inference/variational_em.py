@@ -1,4 +1,4 @@
-"""Variational EM (ADF + moment-matched M-step) for the switching SSM.
+"""Variational EM (ADF + moment-matched/IRLS M-step) for the switching SSM.
 
 Replaces CSMC Monte Carlo with deterministic assumed-density filtering:
 one forward pass per market per EM iteration, O(4T) per market vs O(NT)
@@ -8,8 +8,28 @@ posterior uncertainty is not required.
 E-step: single-mode ADF forward pass - 4 (V,Z) combos share one incoming
         Kalman state (the mixture mean/variance from the previous step).
         This collapses the path structure but keeps the algorithm O(T).
-M-step: conjugate Beta updates for theta_w and q-transitions; IG MAP for
-        sigma2; moment-matched update for tau2. beta_S, beta_Z held fixed.
+
+M-step is an ECM sweep (Meng & Rubin 1993) of three ordered blocks; each
+block maximizes the expected complete-data log-posterior holding the other
+two fixed, so the (approximate) EM objective is monotone *blockwise* within
+an iteration even though the blocks are not updated jointly:
+  (a) theta_w  - offset-adjusted per-wallet penalized Newton on
+      logit(theta_w[w]), using the *previous* iteration's (beta_S, beta_Z)
+      as a fixed per-trade offset. The Beta(a, b) prior is placed on
+      logit(theta_w) via the exact change-of-variables Jacobian, which is
+      equivalent to "a prior successes / b prior failures" pseudo-counts in
+      logit space. With the offset uniformly zero (beta_S = beta_Z = 0)
+      this reduces exactly to the closed-form Beta-Bernoulli conjugate mean
+      alpha_w / (alpha_w + beta_w) of the original count-based update — the
+      new update is a strict generalization, not a parallel code path.
+  (b) q_01, q_10, sigma2_*, tau2_*  - unchanged moment-matched/IG updates.
+  (c) beta_S, beta_Z  - pooled IRLS over all markets (trades j >= 1 only;
+      Z_0 := 0 excludes trade 0), offset by logit(theta_w) at the freshly
+      updated block-(a) posterior means, with a Cauchy(0, 2.5) prior on each
+      standardized coefficient via the Gelman et al. (2008, §3)
+      approximate-EM modification: at each IRLS step the prior's curvature
+      is evaluated at the *current* beta, which keeps the estimate finite
+      even under complete separation of q(Z) on a covariate.
 
 Predictor covariates are centered/standardized (Gelman et al. 2008) before
 entering the logistic Z predictor, with no free intercept — the theta_w
@@ -18,22 +38,39 @@ Beta hierarchy already carries the level:
     x_Z~ = E[Z_prev] - m_Z                       (centered only)
 `(m_S, s_S, m_Z)` are fit once per `variational_em` call (m_S, s_S pooled
 over all markets' log_size_ratio; m_Z a running pooled mean of E[Z_prev]
-updated after each E-step) and stored on `VEMOutput` for reuse by a future
-weighted-logistic M-step. Standardizing keeps `beta_S`/`beta_Z` on a common,
-interpretable scale, but the resulting slopes are only *approximately*
-centering-invariant: wallet-specific theta_w shrinkage is heavy below
-~20 trades (ARCHITECTURE.md §9.5), so the logistic predictor and the Beta
-hierarchy interact rather than factoring cleanly.
+updated after each E-step) and stored on `VEMOutput`. Standardizing keeps
+`beta_S`/`beta_Z` on a common, interpretable scale, but the resulting slopes
+are only *approximately* centering-invariant: wallet-specific theta_w
+shrinkage is heavy below ~20 trades (ARCHITECTURE.md §9.5), so the logistic
+predictor and the Beta hierarchy interact rather than factoring cleanly.
+
+Caveat (regression dilution): x_Z~ plugs in the *filtered* E[Z_prev] rather
+than the true (unobserved) Z_prev. This mean-field/plug-in treatment of the
+lagged covariate is a known source of attenuation bias in errors-in-variables
+regression — `beta_Z` should be expected to systematically *underestimate*
+the data-generating slope, worse at shorter T where E[Z_prev] is noisier.
+
+`ModelParams.beta_S` / `beta_Z` are on the *internal* (standardized) scale
+consumed directly by the E-step's logistic predictor above. `VEMOutput`
+additionally reports `beta_S_orig` / `beta_Z_orig`, back-transformed to the
+original `log_size_ratio` units, for interpretation.
 
 Reference: Ghahramani & Hinton (2000) "Variational Learning for Switching
 State-Space Models"; also known as Assumed Density Filtering for SSMs.
 Gelman, A. (2008) "Scaling regression inputs by dividing by two standard
 deviations", Statistics in Medicine 27(15).
+Gelman, A., Jakulin, A., Pittau, M.G., Su, Y.S. (2008) "A weakly informative
+default prior distribution for logistic and other regression models",
+Annals of Applied Statistics 2(4) — §3's approximate-EM IRLS modification
+for a Cauchy prior.
+Meng, X.L. & Rubin, D.B. (1993) "Maximum likelihood estimation via the ECM
+algorithm: A general framework", Biometrika 80(2).
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import warnings
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -42,7 +79,7 @@ from scipy.special import logsumexp
 from config.default_params import InferenceConfig, ModelParams
 from src.inference.kalman import _kalman_step_all_combos
 from src.inference.particle_gibbs import MarketData
-from src.utils.transforms import log1pexp, logit
+from src.utils.transforms import log1pexp, logit, sigmoid
 
 if TYPE_CHECKING:
     pass
@@ -54,13 +91,32 @@ if TYPE_CHECKING:
 # floor rather than an exact `s_S > 0` check.
 _S_STD_FLOOR = 1e-8
 
+# Cauchy(0, scale) weakly-informative prior on each standardized beta
+# (Gelman et al. 2008); the approximate-EM IRLS modification below evaluates
+# its curvature/gradient contribution at the current coefficient each step.
+_CAUCHY_PRIOR_SCALE = 2.5
+_IRLS_MAX_ITER = 25
+_IRLS_REL_TOL = 1e-6
+
+# theta_w's per-wallet update is a strictly concave 1-D problem (the Beta
+# prior's pseudo-count curvature (a+b)*sigmoid(phi)(1-sigmoid(phi)) never
+# vanishes), so it has a unique finite mode. Strict concavity does NOT make
+# an *undamped* Newton step globally convergent, though: from a cold phi_init
+# a full step overshoots on a high-count wallet and can diverge to a NaN, so
+# each step is backtracked (halved) until the objective does not decrease. A
+# tight tolerance is cheap and lets the beta=0 reduction to the closed-form
+# conjugate mean hold to high precision.
+_THETA_W_MAX_ITER = 25
+_THETA_W_REL_TOL = 1e-10
+_THETA_W_MAX_HALVINGS = 40
+
 
 @dataclass
 class VEMOutput:
     """Output of variational_em: deterministic posterior summaries + fitted params."""
 
     params: ModelParams
-    theta_w: np.ndarray          # (n_wallets,) posterior mean of theta_w
+    theta_w: np.ndarray          # (n_wallets,) posterior mean of theta_w (probability scale)
     Z_prob: list[np.ndarray]     # per-market (T_k,) q(Z_t=1) = filter-marginal P(Z_t=1|Y)
     V_prob: list[np.ndarray]     # per-market (T_k,) q(V_t=1) = filter-marginal P(V_t=1|Y)
     X_mean: list[np.ndarray]     # per-market (T_k,) mixed E[X_t | Y_{0:t}]
@@ -70,6 +126,12 @@ class VEMOutput:
     s_S: float                   # pooled std of log_size_ratio; ~0 if degenerate
                                   # (constant size) -- see _S_STD_FLOOR
     m_Z: float                   # running pooled mean of E[Z_prev] (centering)
+    theta_w_logit_mean: np.ndarray  # (n_wallets,) logit-normal posterior mean = Newton mode
+    theta_w_logit_var: np.ndarray   # (n_wallets,) logit-normal posterior var = 1/curvature
+    beta_S_orig: float           # beta_S back-transformed to original log_size_ratio units
+    beta_Z_orig: float           # == beta_Z (centering-only transform has unit slope)
+    beta_fisher_info: np.ndarray  # (2, 2) final IRLS Fisher info (internal scale, incl.
+                                  # prior curvature); consumed by the Laplace layer (plan 2)
 
 
 def _vem_e_step(
@@ -196,6 +258,318 @@ def _vem_e_step(
     return q_vz, mu_filt, sigma2_filt, log_marginal
 
 
+def _pooled_zj_covariates(
+    markets: list[MarketData],
+    q_vz_list: list[np.ndarray],
+    m_S: float,
+    s_S: float,
+    m_Z: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Pool the standardized (x_S~, x_Z~) design and q(Z) targets, trades j>=1.
+
+    Shared by `_update_theta_w` and `_update_beta_irls`: both fit the insider
+    predictor on trades j >= 1 across all markets (trade 0 is excluded by the
+    Z_0 := 0 convention) using the same standardized/centered covariates the
+    E-step uses.
+
+    Args:
+        markets: Input market data.
+        q_vz_list: Per-market soft (V,Z) assignments, each (T_k, 4).
+        m_S: Pooled mean of log_size_ratio, for standardizing the size covariate.
+        s_S: Pooled std of log_size_ratio; see `_S_STD_FLOOR` for the
+            degenerate-scale fallback.
+        m_Z: Pooled mean of E[Z_prev], for centering the persistence covariate.
+
+    Returns:
+        `(wallet_idx, x_S, x_Z, y)`, each a flat array over all pooled trades:
+        integer wallet index, standardized size covariate, centered lagged
+        insider-probability covariate, and fractional Bernoulli target q(Z_j).
+    """
+    wallet_parts = []
+    x_S_parts = []
+    x_Z_parts = []
+    y_parts = []
+    for md, q_vz in zip(markets, q_vz_list):
+        if len(md.Y) < 2:
+            continue
+        x_S_centered = md.log_size_ratio[1:].astype(float) - m_S
+        x_S = x_S_centered * 0.5 / s_S if s_S > _S_STD_FLOOR else x_S_centered
+        E_Z = q_vz[:, 1] + q_vz[:, 3]
+        wallet_parts.append(md.wallet_ids[1:])
+        x_S_parts.append(x_S)
+        x_Z_parts.append(E_Z[:-1] - m_Z)
+        y_parts.append(E_Z[1:])
+
+    if not wallet_parts:
+        return (
+            np.empty(0, dtype=int),
+            np.empty(0),
+            np.empty(0),
+            np.empty(0),
+        )
+    return (
+        np.concatenate(wallet_parts),
+        np.concatenate(x_S_parts),
+        np.concatenate(x_Z_parts),
+        np.concatenate(y_parts),
+    )
+
+
+def _update_theta_w(
+    markets: list[MarketData],
+    q_vz_list: list[np.ndarray],
+    n_wallets: int,
+    beta_S: float,
+    beta_Z: float,
+    m_S: float,
+    s_S: float,
+    m_Z: float,
+    a: float,
+    b: float,
+    phi_init: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Offset-adjusted per-wallet penalized Newton update for theta_w (R8).
+
+    Maximizes, independently for each wallet w, the 1-D penalized objective
+
+        J(phi_w) = sum_t [y_t (offset_t + phi_w) - log1pexp(offset_t + phi_w)]
+                   + a * phi_w - (a + b) * log1pexp(phi_w)
+
+    where `phi_w = logit(theta_w[w])`, the sum runs over wallet w's trades
+    (j >= 1), `offset_t = beta_S * x_S~_t + beta_Z * x_Z~_t` is fixed (not
+    optimized — the previous iteration's betas, per the ECM block order), and
+    `y_t = q(Z_t = 1)`. The Beta(a, b) log-density in the last two terms is
+    the exact change-of-variables of a Beta(a, b) prior on theta_w[w] onto
+    logit(theta_w[w]) (the Jacobian theta(1-theta) adds exactly 1 to each
+    shape parameter), which is algebraically identical to a prior of "a
+    successes, b failures" pseudo-trades in logit space. This is why, with
+    `offset_t` uniformly 0 (beta_S = beta_Z = 0), J reduces to
+    `(a + S_w) phi_w - (a + b + S_w + F_w) log1pexp(phi_w)` and its mode maps
+    via sigmoid to exactly `(a + S_w) / (a + b + S_w + F_w)` — the original
+    Beta-count posterior mean.
+
+    J is strictly concave in phi_w (curvature >= (a+b) * sigmoid(phi_w) *
+    (1 - sigmoid(phi_w)) > 0 from the prior term alone), so it has a unique
+    finite mode. Newton steps are backtracked per wallet (halved until the
+    objective does not decrease): undamped Newton on a logistic still
+    overshoots from a cold start and would otherwise diverge to a NaN on a
+    high-count wallet, even though the mode itself is finite.
+
+    Args:
+        markets: Input market data.
+        q_vz_list: Per-market soft (V,Z) assignments, each (T_k, 4).
+        n_wallets: Total wallet count.
+        beta_S: Previous iteration's internal-scale size coefficient (offset).
+        beta_Z: Previous iteration's internal-scale persistence coefficient
+            (offset).
+        m_S: Pooled mean of log_size_ratio (standardization).
+        s_S: Pooled std of log_size_ratio (standardization); see `_S_STD_FLOOR`.
+        m_Z: Pooled mean of E[Z_prev] (centering).
+        a: Beta prior shape (successes pseudo-count).
+        b: Beta prior shape (failures pseudo-count).
+        phi_init: (n_wallets,) initial logit(theta_w), typically the previous
+            iteration's estimate.
+
+    Returns:
+        `(theta_w, logit_mean, logit_var)`: posterior-mean theta_w on the
+        probability scale (`sigmoid(logit_mean)`), the Newton-mode logit-scale
+        mean, and the curvature-based logit-scale variance `1 / Hessian`.
+    """
+    wallet_idx, x_S, x_Z, y = _pooled_zj_covariates(markets, q_vz_list, m_S, s_S, m_Z)
+    offset = beta_S * x_S + beta_Z * x_Z
+
+    def _obj(phi_vec: np.ndarray) -> np.ndarray:
+        """Per-wallet penalized objective J(phi_w), shape (n_wallets,)."""
+        eta = offset + phi_vec[wallet_idx]
+        data = np.zeros(n_wallets)
+        np.add.at(data, wallet_idx, y * eta - log1pexp(eta))
+        return data + a * phi_vec - (a + b) * log1pexp(phi_vec)
+
+    def _grad_hess(phi_vec: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Per-wallet gradient and (positive) Hessian of J at phi_vec."""
+        pi_t = sigmoid(offset + phi_vec[wallet_idx])
+        grad_data = np.zeros(n_wallets)
+        hess_data = np.zeros(n_wallets)
+        np.add.at(grad_data, wallet_idx, y - pi_t)
+        np.add.at(hess_data, wallet_idx, pi_t * (1.0 - pi_t))
+        sig_phi = sigmoid(phi_vec)
+        grad = grad_data + a - (a + b) * sig_phi
+        hess = hess_data + (a + b) * sig_phi * (1.0 - sig_phi)
+        return grad, hess
+
+    phi = np.asarray(phi_init, dtype=float).copy()
+    obj = _obj(phi)
+    _, hess = _grad_hess(phi)  # seeds logit_var for the n_wallets==0 / no-trade edge
+    for _ in range(_THETA_W_MAX_ITER):
+        grad, hess = _grad_hess(phi)
+        step = grad / hess
+
+        # Per-wallet backtracking line search. J is strictly concave (the
+        # Beta prior's (a+b)*sigmoid(phi)(1-sigmoid(phi)) curvature never
+        # vanishes), but an *undamped* Newton step from a cold phi_init still
+        # overshoots on a high-count wallet — full Newton on a logistic can
+        # diverge from a far start — driving sigmoid(phi) to a float 0/1,
+        # zeroing the curvature and producing NaN. Halving each wallet's step
+        # until its objective does not decrease guarantees monotone ascent to
+        # the (finite) mode. Wallets converge independently, so the search is
+        # per-wallet and vectorized.
+        accepted = np.zeros(n_wallets, dtype=bool)
+        scale = np.ones(n_wallets)
+        phi_new = phi.copy()
+        obj_new = obj.copy()
+        for _ in range(_THETA_W_MAX_HALVINGS):
+            active = ~accepted
+            if not active.any():
+                break
+            cand = phi + scale * step
+            cand_obj = _obj(cand)
+            now = active & (cand_obj >= obj - 1e-12)
+            phi_new[now] = cand[now]
+            obj_new[now] = cand_obj[now]
+            accepted |= now
+            scale[active & ~now] *= 0.5
+
+        step_taken = phi_new - phi
+        phi = phi_new
+        obj = obj_new
+        phi_norm = max(1.0, float(np.max(np.abs(phi)))) if phi.size else 1.0
+        max_step = float(np.max(np.abs(step_taken))) if step_taken.size else 0.0
+        if max_step / phi_norm < _THETA_W_REL_TOL:
+            break
+
+    # Curvature at the converged mode -> logit-scale posterior variance.
+    _, hess = _grad_hess(phi)
+    logit_mean = phi
+    logit_var = 1.0 / hess
+    theta_w_new = sigmoid(logit_mean)
+    return theta_w_new, logit_mean, logit_var
+
+
+def _update_beta_irls(
+    markets: list[MarketData],
+    q_vz_list: list[np.ndarray],
+    theta_w: np.ndarray,
+    m_S: float,
+    s_S: float,
+    m_Z: float,
+    beta_S_init: float,
+    beta_Z_init: float,
+) -> tuple[float, float, np.ndarray]:
+    """Pooled IRLS update for (beta_S, beta_Z) with a Cauchy(0, 2.5) prior (KTD1/2/6).
+
+    Fits a no-intercept logistic regression of the fractional target
+    `y_t = q(Z_t = 1)` on `[x_S~_t, x_Z~_t]`, offset by `logit(theta_w[wallet(t)])`
+    at the (freshly updated) per-wallet posterior means — theta_w's Beta
+    hierarchy carries the level, so beta_S/beta_Z are pure slopes. Pooled over
+    all markets, trades j >= 1 only (Z_0 := 0 excludes trade 0).
+
+    Each standardized coefficient carries an independent Cauchy(0, 2.5) prior,
+    handled by the Gelman et al. (2008, §3) approximate-EM IRLS modification:
+    at the current beta, the prior's contribution to the score is
+    `-2 beta_j / (2.5^2 + beta_j^2)` and to the curvature is
+    `2 / (2.5^2 + beta_j^2)` — these match the exact first and (a stabilizing
+    local) second derivative of the Cauchy log-density, so the augmented
+    Fisher information stays positive definite (hence finite estimates) even
+    when q(Z) is perfectly separated by a covariate, where the data alone
+    would drive the curvature to 0.
+
+    Args:
+        markets: Input market data.
+        q_vz_list: Per-market soft (V,Z) assignments, each (T_k, 4).
+        theta_w: (n_wallets,) current per-wallet propensity estimates (used as
+            the fixed offset, per the ECM block order — these are the
+            block-(a) values updated earlier in this same M-step).
+        m_S: Pooled mean of log_size_ratio (standardization).
+        s_S: Pooled std of log_size_ratio (standardization); see `_S_STD_FLOOR`.
+        m_Z: Pooled mean of E[Z_prev] (centering).
+        beta_S_init: Warm-start internal-scale beta_S (previous iteration).
+        beta_Z_init: Warm-start internal-scale beta_Z (previous iteration).
+
+    Returns:
+        `(beta_S, beta_Z, fisher_info)`: the internal-scale coefficients and
+        the final 2x2 Fisher information matrix (data + prior curvature, at
+        the converged beta).
+    """
+    logit_theta = logit(theta_w)
+    wallet_idx, x_S, x_Z, y = _pooled_zj_covariates(markets, q_vz_list, m_S, s_S, m_Z)
+
+    if wallet_idx.size == 0:
+        # No trades with j >= 1 anywhere (every market has <= 1 trade): hold
+        # the previous betas and report zero information.
+        return beta_S_init, beta_Z_init, np.zeros((2, 2))
+
+    X = np.column_stack([x_S, x_Z])
+    offset = logit_theta[wallet_idx]
+    beta = np.array([beta_S_init, beta_Z_init], dtype=float)
+
+    def _penalized_obj(b: np.ndarray) -> float:
+        """Expected complete-data log-lik + Cauchy(0, 2.5) log-prior at `b`."""
+        eta = offset + X @ b
+        log_lik = float(np.sum(y * eta - log1pexp(eta)))
+        log_prior = float(-np.sum(np.log1p((b / _CAUCHY_PRIOR_SCALE) ** 2)))
+        return log_lik + log_prior
+
+    obj = _penalized_obj(beta)
+    fisher = np.diag(2.0 / (_CAUCHY_PRIOR_SCALE**2 + beta**2))
+    converged = False
+    for _ in range(_IRLS_MAX_ITER):
+        eta = offset + X @ beta
+        mu = sigmoid(eta)
+        w = mu * (1.0 - mu)
+        grad_data = X.T @ (y - mu)
+        hess_data = (X * w[:, None]).T @ X
+
+        c = 2.0 / (_CAUCHY_PRIOR_SCALE**2 + beta**2)
+        grad = grad_data - c * beta
+        fisher = hess_data + np.diag(c)
+
+        try:
+            step = np.linalg.solve(fisher, grad)
+        except np.linalg.LinAlgError:
+            step = np.linalg.lstsq(fisher, grad, rcond=None)[0]
+
+        # Step-halving: only accept a step that does not decrease the
+        # penalized objective (KTD6) — protects against IRLS overshoot near
+        # separation, where the data curvature can be poorly scaled.
+        step_scale = 1.0
+        beta_new = beta
+        obj_new = obj
+        for _ in range(20):
+            candidate = beta + step_scale * step
+            candidate_obj = _penalized_obj(candidate)
+            if candidate_obj >= obj - 1e-12:
+                beta_new, obj_new = candidate, candidate_obj
+                break
+            step_scale *= 0.5
+
+        rel_change = float(np.max(np.abs(beta_new - beta))) / max(
+            1.0, float(np.max(np.abs(beta)))
+        )
+        beta, obj = beta_new, obj_new
+        if rel_change < _IRLS_REL_TOL:
+            converged = True
+            break
+
+    if not converged:
+        warnings.warn(
+            f"_update_beta_irls hit the {_IRLS_MAX_ITER}-iteration cap without "
+            "converging to the relative-change tolerance; returning the "
+            "current estimate.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+    # Fisher info at the final beta (data + prior curvature) for the caller.
+    eta = offset + X @ beta
+    mu = sigmoid(eta)
+    w = mu * (1.0 - mu)
+    hess_data = (X * w[:, None]).T @ X
+    c = 2.0 / (_CAUCHY_PRIOR_SCALE**2 + beta**2)
+    fisher = hess_data + np.diag(c)
+
+    return float(beta[0]), float(beta[1]), fisher
+
+
 def _vem_m_step(
     markets: list[MarketData],
     q_vz_list: list[np.ndarray],
@@ -204,33 +578,54 @@ def _vem_m_step(
     params: ModelParams,
     theta_w: np.ndarray,
     n_wallets: int,
-) -> tuple[ModelParams, np.ndarray]:
-    """Moment-matched M-step: update params and theta_w from soft assignments.
+    m_S: float,
+    s_S: float,
+    m_Z: float,
+    *,
+    estimate_betas: bool = True,
+) -> tuple[ModelParams, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """ECM M-step: theta_w Newton, then moment-matched updates, then beta IRLS.
+
+    Block order is fixed (KTD7): (a) theta_w using the previous iteration's
+    betas as a fixed offset; (b) q-transitions/variances (unchanged from the
+    beta-free update); (c) beta_S/beta_Z IRLS using the freshly updated
+    theta_w (from block (a)) as the offset. See the module docstring for why
+    this ordering keeps the EM objective monotone blockwise.
 
     Args:
         markets: Input market data.
         q_vz_list: Per-market soft (V,Z) assignments, each (T_k, 4).
         mu_filt_list: Per-market mixed Kalman means, each (T_k,).
         sigma2_filt_list: Per-market mixed Kalman variances, each (T_k,).
-        params: Current model parameters.
+        params: Current model parameters (beta_S/beta_Z are internal-scale).
         theta_w: Current per-wallet propensity estimates.
         n_wallets: Total wallet count.
+        m_S: Pooled mean of log_size_ratio (standardization).
+        s_S: Pooled std of log_size_ratio (standardization); see `_S_STD_FLOOR`.
+        m_Z: Pooled mean of E[Z_prev] (centering).
+        estimate_betas: If False, skip block (c) and hold beta_S/beta_Z fixed
+            at their `params` value for every iteration (regression-anchor /
+            debugging path — with the offset then uniformly 0 at the default
+            beta_S = beta_Z = 0.0, block (a) reduces exactly to the original
+            Beta-count theta_w update).
 
     Returns:
-        Updated (params, theta_w).
+        `(params, theta_w, theta_w_logit_mean, theta_w_logit_var, beta_fisher_info)`.
     """
-    from dataclasses import replace
-
-    # ---- theta_w: Beta conjugate update ----
-    alpha_w = np.full(n_wallets, params.a)
-    beta_w = np.full(n_wallets, params.b)
-    for md, q_vz in zip(markets, q_vz_list):
-        E_Z = q_vz[:, 1] + q_vz[:, 3]
-        for t in range(1, len(md.Y)):
-            w = int(md.wallet_ids[t])
-            alpha_w[w] += E_Z[t]
-            beta_w[w] += 1.0 - E_Z[t]
-    theta_w_new = alpha_w / (alpha_w + beta_w)
+    # ---- (a) theta_w: offset-adjusted per-wallet penalized Newton ----
+    theta_w_new, theta_w_logit_mean, theta_w_logit_var = _update_theta_w(
+        markets,
+        q_vz_list,
+        n_wallets,
+        params.beta_S,
+        params.beta_Z,
+        m_S,
+        s_S,
+        m_Z,
+        params.a,
+        params.b,
+        logit(theta_w),
+    )
 
     # ---- q_01, q_10: product-of-marginals Beta update ----
     a_prior = b_prior = 1.0
@@ -295,6 +690,22 @@ def _vem_m_step(
     # Insiders have tighter obs variance (more price-informative trades)
     tau2_1_new = min(tau2_1_new, tau2_0_new)
 
+    # ---- (c) beta_S, beta_Z: pooled IRLS, offset by the freshly updated theta_w ----
+    if estimate_betas:
+        beta_S_new, beta_Z_new, beta_fisher_info = _update_beta_irls(
+            markets,
+            q_vz_list,
+            theta_w_new,
+            m_S,
+            s_S,
+            m_Z,
+            params.beta_S,
+            params.beta_Z,
+        )
+    else:
+        beta_S_new, beta_Z_new = params.beta_S, params.beta_Z
+        beta_fisher_info = np.zeros((2, 2))
+
     new_params = replace(
         params,
         q_01=q_01_new,
@@ -303,8 +714,10 @@ def _vem_m_step(
         sigma2_1=sigma2_1_new,
         tau2_0=tau2_0_new,
         tau2_1=tau2_1_new,
+        beta_S=beta_S_new,
+        beta_Z=beta_Z_new,
     )
-    return new_params, theta_w_new
+    return new_params, theta_w_new, theta_w_logit_mean, theta_w_logit_var, beta_fisher_info
 
 
 def variational_em(
@@ -317,8 +730,9 @@ def variational_em(
     n_iter: int = 50,
     tol: float = 1e-3,
     n_jobs: int = 1,
+    estimate_betas: bool = True,
 ) -> VEMOutput:
-    """Fit the switching SSM by variational EM (ADF E-step + moment-matched M-step).
+    """Fit the switching SSM by variational EM (ADF E-step + ECM M-step).
 
     Substantially faster than Particle Gibbs: no sampling, no MCMC chains.
     Suitable for the "fast tier" wallet ranking. Approximate posteriors are
@@ -336,6 +750,11 @@ def variational_em(
         tol: Convergence tolerance on the relative change in log-marginal.
         n_jobs: Reserved for future joblib parallelism over markets; currently
             always sequential.
+        estimate_betas: If False, hold beta_S/beta_Z fixed at `params_init`'s
+            value across all iterations instead of fitting them via IRLS each
+            M-step. Default True (betas estimated every M-step). Setting this
+            False with the default beta_S = beta_Z = 0.0 recovers the
+            pre-regression theta_w-only M-step exactly (regression anchor).
 
     Returns:
         VEMOutput with fitted params, posterior marginals, convergence trace,
@@ -373,6 +792,13 @@ def variational_em(
     q_vz_list: list[np.ndarray] = []
     mu_filt_list: list[np.ndarray] = []
     sigma2_filt_list: list[np.ndarray] = []
+    # Persist the last completed M-step's per-wallet Laplace summary and beta
+    # Fisher info across iterations: the EM loop can break out (convergence)
+    # right after an E-step, before that iteration's M-step runs, so the
+    # final VEMOutput must report the *last computed* values, not recompute.
+    theta_w_logit_mean = logit(theta_w)
+    theta_w_logit_var = np.zeros(n_wallets)
+    beta_fisher_info = np.zeros((2, 2))
 
     for em_it in range(n_iter):
         # ---- E-step ----
@@ -416,14 +842,20 @@ def variational_em(
         prev_lm = total_lm
 
         # ---- M-step ----
-        params, theta_w = _vem_m_step(
-            markets,
-            q_vz_list,
-            mu_filt_list,
-            sigma2_filt_list,
-            params,
-            theta_w,
-            n_wallets,
+        params, theta_w, theta_w_logit_mean, theta_w_logit_var, beta_fisher_info = (
+            _vem_m_step(
+                markets,
+                q_vz_list,
+                mu_filt_list,
+                sigma2_filt_list,
+                params,
+                theta_w,
+                n_wallets,
+                m_S,
+                s_S,
+                m_Z,
+                estimate_betas=estimate_betas,
+            )
         )
 
     n_iter_run = len(elbo_trace)
@@ -431,6 +863,14 @@ def variational_em(
     # Final posterior summaries
     Z_prob_list = [q_vz[:, 1] + q_vz[:, 3] for q_vz in q_vz_list]
     V_prob_list = [q_vz[:, 2] + q_vz[:, 3] for q_vz in q_vz_list]
+
+    # Back-transform beta_S to original log_size_ratio units (§ module
+    # docstring); beta_Z is unaffected since x_Z~ is centering-only.
+    if s_S > _S_STD_FLOOR:
+        beta_S_orig = params.beta_S * 0.5 / s_S
+    else:
+        beta_S_orig = params.beta_S
+    beta_Z_orig = params.beta_Z
 
     return VEMOutput(
         params=params,
@@ -443,4 +883,9 @@ def variational_em(
         m_S=m_S,
         s_S=s_S,
         m_Z=m_Z,
+        theta_w_logit_mean=theta_w_logit_mean,
+        theta_w_logit_var=theta_w_logit_var,
+        beta_S_orig=beta_S_orig,
+        beta_Z_orig=beta_Z_orig,
+        beta_fisher_info=beta_fisher_info,
     )
