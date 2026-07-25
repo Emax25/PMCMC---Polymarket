@@ -26,7 +26,9 @@ from scripts import (
     pull_data,
     run_ipmcmc,
     run_pg,
+    validate_vem,
 )
+from src.analysis.validation import PSIS_KHAT_KEY
 from src.data.polymarket_api import MarketMeta, RawTrade
 from src.inference.ipmcmc import iPMCMCOutput
 from src.inference.particle_gibbs import PGOutput
@@ -713,6 +715,112 @@ def test_eval_c4_smoke(tmp_path):
     payload = json.loads(json_path.read_text())
     assert "gate_pass" in payload
     assert payload["inputs"]["synthetic"] is True
+
+
+# ---------------- validate_vem.py ----------------
+
+# Deliberately tiny: 2 markets x 100 trades, 2 restarts, 5 EM iterations and the
+# PSIS tail-fit minimum of draws. Every knob that costs an ADF forward pass is at
+# its floor so the fast suite pays seconds, not minutes.
+_VALIDATE_VEM_TINY = [
+    "--synthetic-K",
+    "2",
+    "--synthetic-T",
+    "100",
+    "--synthetic-n-wallets",
+    "8",
+    "--config",
+    "dev",
+    "--n-restarts",
+    "2",
+    "--psis-draws",
+    "50",
+    "--vem-iters",
+    "5",
+    "--log-level",
+    "WARNING",
+]
+
+
+@pytest.fixture(scope="module")
+def validate_vem_run(tmp_path_factory):
+    """Run validate_vem.py once at tiny scale; yield ``(rc, payload, out_dir)``.
+
+    Module-scoped because the run costs a handful of ADF passes and several
+    tests assert on different parts of the same artifact.
+    """
+    out_dir = tmp_path_factory.mktemp("validation")
+    json_path = out_dir / "vem_validation.json"
+    rc = validate_vem.main(
+        [
+            *_VALIDATE_VEM_TINY,
+            "--out-dir",
+            str(out_dir),
+            "--json-out",
+            str(json_path),
+        ],
+    )
+    payload = json.loads(json_path.read_text()) if json_path.exists() else {}
+    return rc, payload, out_dir
+
+
+def test_validate_vem_smoke(validate_vem_run):
+    """validate_vem.py exits 0 and writes a JSON artifact with every section."""
+    rc, payload, _ = validate_vem_run
+    assert rc == 0
+    assert set(payload) >= {
+        "config",
+        "inputs",
+        "prior",
+        "restarts",
+        "stability",
+        "best_restart",
+        "heldout",
+        "psis",
+        "figures",
+    }
+    assert payload["inputs"]["synthetic"] is True
+    assert len(payload["restarts"]) == 2
+    assert payload["psis"]["psis_n_draws"] == 50
+    assert np.isfinite(payload["psis"][PSIS_KHAT_KEY])
+    assert "psis_scope_note" in payload["psis"]
+    assert payload["heldout"]["pooled_n"] > 0
+    assert len(payload["heldout"]["per_market"]) == 2
+
+
+def test_validate_vem_writes_figures(validate_vem_run):
+    """All three validation figures land under --out-dir and are non-empty."""
+    _, payload, out_dir = validate_vem_run
+    assert len(payload["figures"]) >= 3
+    for rel in payload["figures"]:
+        path = Path(rel)
+        assert path.exists() and path.stat().st_size > 0
+        assert path.parent == out_dir
+
+
+def test_validate_vem_restarts_differ_by_seed(validate_vem_run):
+    """Restarts use distinct seeds, so their terminal ELBOs are not identical."""
+    _, payload, _ = validate_vem_run
+    seeds = [r["seed"] for r in payload["restarts"]]
+    assert len(set(seeds)) == len(seeds)
+    elbos = [r["terminal_elbo"] for r in payload["restarts"]]
+    assert len(set(elbos)) > 1
+    assert payload["stability"]["terminal_elbo"]["spread"] > 0.0
+
+
+def test_validate_vem_rejects_too_few_psis_draws(tmp_path):
+    """--psis-draws below the PSIS tail-fit minimum fails fast with a message."""
+    with pytest.raises(SystemExit):
+        validate_vem.main(
+            [
+                *_VALIDATE_VEM_TINY,
+                "--out-dir",
+                str(tmp_path),
+                # Later occurrence wins in argparse, overriding the 50 above.
+                "--psis-draws",
+                "10",
+            ],
+        )
 
 
 # ---------------- pareto.py ----------------

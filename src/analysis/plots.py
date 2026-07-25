@@ -573,6 +573,168 @@ def figure_synthetic_validation(
     return fig
 
 
+# ---------------- VEM validation figures ----------------
+
+
+def plot_elbo_traces(
+    traces: Iterable[np.ndarray],
+    *,
+    labels: Iterable[str] | None = None,
+    ax: plt.Axes | None = None,
+) -> plt.Axes:
+    """Overlay the per-restart ELBO (log-marginal) trace of a multi-start VEM fit.
+
+    One line per restart. Restarts that climb to visibly different plateaus are
+    the multimodality signal the stability check exists to expose; traces that
+    land on top of each other are the reassuring case.
+
+    Args:
+        traces: One 1-D array per restart, each holding the ELBO proxy per EM
+            iteration. Traces may differ in length (early convergence stops
+            the loop at different iterations).
+        labels: Legend entries aligned with ``traces``; defaults to
+            ``restart 0, restart 1, ...``.
+        ax: Axes to draw on; a new single-panel figure is created if None.
+
+    Returns:
+        Axes containing one ELBO trace per restart.
+    """
+    if ax is None:
+        _, ax = plt.subplots(figsize=(4.5, 3.0))
+    traces = list(traces)
+    names = (
+        list(labels)
+        if labels is not None
+        else [f"restart {i}" for i in range(len(traces))]
+    )
+    for i, (trace, name) in enumerate(zip(traces, names)):
+        values = np.asarray(trace, dtype=float)
+        ax.plot(
+            np.arange(1, values.size + 1),
+            values,
+            color=f"C{i % 10}",
+            lw=1.0,
+            marker="o",
+            label=name,
+        )
+    ax.set_xlabel("EM iteration")
+    ax.set_ylabel("ELBO proxy (ADF log-marginal)")
+    if traces:
+        ax.legend(loc="lower right", fontsize=7)
+    return ax
+
+
+def _log_self_normalize(log_weights: np.ndarray) -> np.ndarray:
+    """Normalize log weights so their natural-scale exponentials sum to one."""
+    x = np.asarray(log_weights, dtype=float)
+    shift = x.max()
+    return x - (shift + np.log(np.sum(np.exp(x - shift))))
+
+
+def plot_psis_diagnostic(
+    log_weights: np.ndarray,
+    log_weights_smoothed: np.ndarray,
+    khat: float,
+    *,
+    ax: plt.Axes | None = None,
+) -> plt.Axes:
+    """Plot sorted raw vs Pareto-smoothed log importance weights with khat.
+
+    The two curves are the diagnostic's own content: PSIS replaces only the
+    largest ~n/5 weights, so the curves coincide over the body and separate in
+    the upper tail — the heavy tail that ``khat`` quantifies. Both series are
+    *self-normalized* (their natural-scale weights each sum to one), which is
+    the form importance sampling actually uses, so the visible gap is a real
+    difference in the weight distribution rather than the arbitrary additive
+    constant an unnormalized log ratio carries.
+
+    Args:
+        log_weights: Raw log importance ratios, shape ``(n_draws,)``.
+        log_weights_smoothed: PSIS-smoothed log weights, same shape.
+        khat: Fitted generalized-Pareto tail shape; annotated in the title
+            together with the Yao et al. (2018) band the value falls in.
+        ax: Axes to draw on; a new single-panel figure is created if None.
+
+    Returns:
+        Axes containing both weight curves.
+    """
+    if ax is None:
+        _, ax = plt.subplots(figsize=(4.5, 3.0))
+    raw = np.sort(_log_self_normalize(log_weights))
+    smoothed = np.sort(_log_self_normalize(log_weights_smoothed))
+    ranks = np.arange(1, raw.size + 1)
+    ax.plot(ranks, raw, color="C0", lw=1.0, label="raw")
+    ax.plot(ranks, smoothed, color="C1", lw=1.0, ls="--", label="PSIS-smoothed")
+    band = "good" if khat < 0.5 else ("ok" if khat <= 0.7 else "bad")
+    ax.set_title(f"khat = {khat:.3f} ({band})")
+    ax.set_xlabel("draw rank (ascending weight)")
+    ax.set_ylabel("log self-normalized weight")
+    ax.legend(loc="upper left", fontsize=7)
+    return ax
+
+
+def plot_heldout_ll(
+    per_market_mean: np.ndarray,
+    *,
+    labels: Iterable[str] | None = None,
+    pooled_mean: float | None = None,
+    ax: plt.Axes | None = None,
+) -> plt.Axes:
+    """Bar chart of per-market held-out one-step predictive log-likelihood.
+
+    Values are per-held-out-trade means so markets with different tail lengths
+    are comparable; the pooled mean (trade-weighted) is drawn as a reference
+    line. Bars are log densities, hence negative — less negative is better.
+
+    The bars stand on a data-derived baseline rather than zero: held-out log
+    densities sit several nats below zero while differing between markets by
+    fractions of a nat, so a zero baseline would render every market as the same
+    full-height bar and hide the entire signal.
+
+    Args:
+        per_market_mean: Mean held-out log predictive density per market,
+            shape ``(K,)``.
+        labels: Bar labels aligned with ``per_market_mean``; defaults to
+            ``market 0, market 1, ...``.
+        pooled_mean: Optional pooled (trade-weighted) mean drawn as a dashed
+            horizontal reference.
+        ax: Axes to draw on; a new single-panel figure is created if None.
+
+    Returns:
+        Axes containing the per-market bars.
+    """
+    if ax is None:
+        _, ax = plt.subplots(figsize=(4.5, 3.0))
+    values = np.asarray(per_market_mean, dtype=float)
+    names = (
+        list(labels)
+        if labels is not None
+        else [f"market {k}" for k in range(values.size)]
+    )
+    positions = np.arange(values.size)
+    marks = np.append(values, pooled_mean) if pooled_mean is not None else values
+    lo, hi = float(np.nanmin(marks)), float(np.nanmax(marks))
+    # Pad by the spread, falling back to a fixed margin when every market scores
+    # identically (spread 0 would collapse the axis onto the bars).
+    pad = 0.1 * (hi - lo) if hi > lo else max(0.05 * abs(hi), 0.1)
+    floor = lo - pad
+    ax.bar(positions, values - floor, bottom=floor, color="C0", alpha=0.8)
+    ax.set_ylim(floor, hi + pad)
+    if pooled_mean is not None:
+        ax.axhline(
+            pooled_mean,
+            color="C3",
+            lw=1.0,
+            ls="--",
+            label=f"pooled = {pooled_mean:.3f}",
+        )
+        ax.legend(loc="best", fontsize=7)
+    ax.set_xticks(positions)
+    ax.set_xticklabels(names, rotation=45, ha="right")
+    ax.set_ylabel("held-out mean log predictive density")
+    return ax
+
+
 def _format_wall_time(seconds: float) -> str:
     """Format elapsed seconds as a compact human-readable duration."""
     if seconds < 60.0:
