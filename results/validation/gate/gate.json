@@ -25,6 +25,35 @@
     "n_trades": 20000,
     "synthetic": true
   },
+  "convergence_status": {
+    "converged": false,
+    "n_restarts": 5,
+    "n_restarts_converged": 0,
+    "n_restarts_at_iter_cap": 5,
+    "vem_iters": 50,
+    "vem_tol": 0.0001,
+    "final_rel_elbo_change": {
+      "min": 0.0012189866888053607,
+      "max": 0.0013133778793648083,
+      "mean": 0.0012696475165855738,
+      "sd": 3.743882697392754e-05,
+      "spread": 9.439119055944765e-05
+    },
+    "final_elbo_gain": {
+      "min": 74.86903953143337,
+      "max": 80.759088949344,
+      "mean": 78.02970575889631,
+      "sd": 2.3361136965462017,
+      "spread": 5.890049417910632
+    },
+    "median_final_elbo_gain": 79.15759309341956,
+    "terminal_elbo_spread": 64.63759203013615,
+    "best_restart_selection_meaningful": false,
+    "warnings": [
+      "PRE-CONVERGENCE: 5 of 5 restarts stopped at the 50-iteration cap; the final relative ELBO change reached 0.00131 against tol=0.0001 and the ELBO was still climbing at ~79.2 nats/iteration. Terminal ELBO, pooled AUC, held-out LL and khat are trajectory snapshots, not converged-mode quantities.",
+      "BEST-RESTART SELECTION NOT MEANINGFUL: the across-restart terminal-ELBO spread (64.64) is smaller than the median final per-iteration ELBO gain (79.16), so argmax(terminal_elbo) selects whichever trajectory is furthest along, not a better mode. Do not read the chosen restart as the highest-ELBO mode."
+    ]
+  },
   "prior": {
     "sigma2_ig_alpha": 2.0,
     "sigma2_ig_beta": 1.0,

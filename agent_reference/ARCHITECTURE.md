@@ -85,8 +85,16 @@ Summary (fixed order unless user directs otherwise):
 | P4 | Paper figures |
 | P5 | γ / s₀² sensitivity script |
 | P6 | Trading infrastructure |
+| P8–P13 | Post-VEM-validation open items (Laplace/PSIS foundation, `SS_v` smoothed moments, `sigma2` order clamp, `tau2` prior, artifact re-runs, `slow` marker) — see [STATUS.md](STATUS.md) |
 
-**Default refinement run (half-prod):**
+**Default refinement run (VEM, canonical since 2026-07-23):**
+
+```bash
+python -m scripts.benchmark --method vem --config half-prod
+python -m scripts.validate_vem --config dev        # validation ladder (§12)
+```
+
+**Historical / frozen (PG-iPMCMC baseline — do not use for new computation):**
 
 ```bash
 python -m scripts.run_ipmcmc --config prod \
@@ -101,7 +109,7 @@ python -m scripts.run_ipmcmc --config prod \
 |---|----------|----------|
 | 1 | Negative `β_S` | Open empirical question; investigate with half-prod before model changes |
 | 2 | Resolution over-flagging | Implement pre-resolution filter (P1) |
-| 3 | Canonical inference run | Half-prod default |
+| 3 | Canonical inference run | **VEM fast path** (superseded 2026-07-23; was "half-prod PG/iPMCMC default"). PG/iPMCMC frozen as cited historical baseline; half-prod remains the default *preset size*, not the default *engine* |
 | 4 | numba / joblib | Implement (P0); keep in requirements |
 | 5 | Approximate `theta_w` update | Fix in P3 |
 | 6 | CSMC reference index | **0** — code authoritative, paper follows |
@@ -196,6 +204,8 @@ Y_i | · ~ N(X_{t_i}, τ²_{Z_i} / max(1 + γ log(S/S̄), 0.1))
 
 $\phi = (\sigma^2_0, \sigma^2_1, q_{01}, q_{10}, \beta_S, \beta_Z, \tau^2_0, \tau^2_1, a, b)$. Fixed for now: $\gamma=1$, $s_0^2=1$.
 
+**Spec vs. implementation:** the VEM M-step centers/standardizes the logistic covariates internally (Gelman et al. 2008) and reports coefficients on the original scale — the model spec above is unchanged by this. Priors on $\phi$ live in one place: `PhiPrior` in `config/default_params.py` (shared by the M-step, the Laplace layer and PSIS).
+
 ### 5.4 Outputs
 
 1. $\mathbb{P}(Z_i=1 \mid \mathcal{D})$ — anomaly / trading signal
@@ -214,17 +224,18 @@ Via `src/analysis/results.py` and `plots.py`.
 | `kalman.py` | RBPF Kalman + FFBS | P0: numba target; `log_lik` floor = -500 |
 | `smc.py` | Bootstrap SMC | Sanity check / iPMCMC unconditional chains |
 | `csmc.py` | Conditional SMC | `REFERENCE_INDEX = 0`; 4-state optimal proposal |
-| `particle_gibbs.py` | PG sampler | Defines `MarketData` |
-| `ipmcmc.py` | iPMCMC + swap | M=8, P=4; P0: parallelize |
-| `variational_em.py` | Variational EM (C1) | ADF E-step + moment-matched M-step; 50 EM iterations default; gate: AUC 0.885, 68.8 s mean |
+| `particle_gibbs.py` | PG sampler | **Historical/frozen** (2026-07-23) — cited baseline only; defines `MarketData`, still used by the VEM path |
+| `ipmcmc.py` | iPMCMC + swap | **Historical/frozen** (2026-07-23) — M=8, P=4 |
+| `variational_em.py` | Variational EM (C1) — **canonical engine** | ADF E-step + moment-matched **+ IRLS-Cauchy logistic M-step** (Gelman et al. 2008); `beta_S`/`beta_Z` estimated **when opted in** (`estimate_betas=False` default); `theta_w` offset-adjusted (logit-normal); 50 EM iterations default; gate: AUC 0.885, 68.8 s mean (single-initialization, deterministic warm start, at the iteration cap) |
+| `laplace.py` | Curvature Gaussian over unconstrained `phi` | `PhiPosterior`, `laplace_from_vem`; block-diagonal. **Foundation unsound** — ECM curvature, not observed information; see §14 / STATUS P8 |
 | `parameter_updates.py` | Gibbs/MH | `theta_w` = per-wallet RWMH on logit scale (full logistic Z model; correct for β≠0) |
 | `diagnostics.py` | R-hat, ESS | arviz |
 
-**PG iteration:** CSMC → sample path → FFBS → `gibbs_sweep` (per market, params pooled).
+**PG iteration (historical):** CSMC → sample path → FFBS → `gibbs_sweep` (per market, params pooled).
 
-**iPMCMC iteration:** M SMC passes → swap references → FFBS → Gibbs per conditional slot.
+**iPMCMC iteration (historical):** M SMC passes → swap references → FFBS → Gibbs per conditional slot.
 
-**VEM iteration:** Approximate E-step (ADF) → M-step (moment matching); runs 50 iterations over full dataset.
+**VEM iteration:** Approximate E-step (ADF) → M-step (moment matching for `sigma2`/`tau2`/`q`, weighted-logistic IRLS with a Cauchy(0, 2.5) prior for `beta_S`/`beta_Z` when enabled, offset-adjusted Newton for `theta_w`); runs 50 iterations over full dataset.
 
 ### 6.1 Real-data numerical edge cases
 
@@ -236,6 +247,17 @@ These only surfaced on live Polymarket data (synthetic data does not trigger the
 | Same-second trades have `delta=0`; dividing by zero in σ² Gibbs update → NaN params | `parameter_updates.py` | Drop `delta=0` steps from σ² sufficient statistics |
 
 Regression tests: `test_parameter_updates.py` (delta-zero case); SMC/CSMC suites cover Kalman floor.
+
+### 6.2 VEM numerical / identifiability notes
+
+Observed 2026-07-25 on synthetic data; these are properties of the estimator, not transient bugs.
+
+| Issue | Location | Status |
+|-------|----------|--------|
+| `sigma2_1 = max(sigma2_1, sigma2_0)` order constraint binds **exactly** at every fitted point (`sigma2_0 == sigma2_1` to the last bit, 5/5 dev restarts, and still at convergence). The V regime is then non-identified: the ADF log-marginal moves < 5e-13 over ±4 sd in both `logit q_01` and `logit q_10`. ~75% of Laplace draws violate the estimator's own order constraints | `variational_em.py`, `laplace.py` | Open — identifiability/model decision (STATUS P10) |
+| `SS_v` uses filtered rather than smoothed moments and omits the lag-one cross-covariance `-2Cov(X_t, X_{t-1})` — most likely cause of the `sigma2` mis-centring | `variational_em.py` | Open — inference-path change, would move gate numbers (STATUS P9) |
+| `m_Z` (the `E[Z_prev]` centering constant) is refreshed between the E-step and the same iteration's M-step, so the module's blockwise-monotonicity claim holds only conditionally. Latent today (induced shift 1.7e-5 at `beta_Z=0`) but live as soon as beta estimation is enabled | `variational_em.py` | Docstring corrected; reorder deferred |
+| ADF E-step does not identify `Z` on the synthetic generator (`q(Z)` near-flat) → spurious `beta_S` ≈ −0.40 | `variational_em.py` | Beta estimation opt-in; gate FAILS with `--estimate-betas` (AUC 0.547 vs 0.9435) |
 
 ---
 
@@ -264,14 +286,14 @@ ranking, `theta_w` Spearman). Run before/after hot-path changes. NB: cProfile
 ## 8. Module Map
 
 ```
-config/default_params.py
+config/default_params.py      # presets + PhiPrior (single authoritative prior spec)
 src/utils/transforms.py
 src/data/polymarket_api.py    # Gamma + Data API only
 src/data/preprocess.py
 src/data/synthetic.py
-src/inference/{kalman,smc,csmc,particle_gibbs,ipmcmc,variational_em,parameter_updates,diagnostics}.py
-src/analysis/{prefilter,results,plots}.py
-scripts/{_shortlist,_runner,pull_data,run_pg,run_ipmcmc,benchmark,pareto,eval_c4,make_figures}.py
+src/inference/{kalman,smc,csmc,particle_gibbs,ipmcmc,variational_em,laplace,parameter_updates,diagnostics}.py
+src/analysis/{prefilter,results,plots,validation}.py
+scripts/{_shortlist,_runner,pull_data,run_pg,run_ipmcmc,benchmark,validate_vem,pareto,eval_c4,make_figures}.py
 tests/
 Monte_Carlo_Simulation/       # LaTeX paper
 agent_reference/              # ARCHITECTURE.md + STATUS.md + CODE_QUALITY.md
@@ -292,6 +314,9 @@ class MarketData:
 - `ProcessedMarket.to_market_data()` — real data
 - `WalletIndex` — global address → int; `wallet_index.json`
 - `pickle_run()` / `load_run()` — `scripts/_runner.py`
+- `PhiPrior` — `config/default_params.py`; the one prior spec consumed by the VEM M-step, `laplace.py` and PSIS
+- `PhiPosterior`, `laplace_from_vem()` — `src/inference/laplace.py`; block-diagonal curvature Gaussian over unconstrained `phi`
+- `src/analysis/validation.py` — samplerless validation layer: `jittered_init`, `top_k_wallets`, `pooled_synthetic_auc`, `restart_record`, `spread`, `mean_pairwise_jaccard`, `stability_block`, `elbo_convergence`, `convergence_block`, `phi_centring_gradient`, plus held-out predictive LL and PSIS-k̂. **Import these from here, never from `scripts/`** (they were moved out of the CLI on 2026-07-25 for plan 3's benefit)
 
 ---
 
@@ -333,12 +358,13 @@ Per-market $T \leq 3000$. See also §6.1 for inference-side fixes on real data.
 ```bash
 pip install -r requirements.txt
 python -m scripts.pull_data --output-dir data/processed --tail-trades 2000
-python -m scripts.run_pg --config dev                          # fast check
-python -m scripts.run_pg --config half-prod --n-jobs 8         # multi-market parallel
+python -m scripts.benchmark.py --method vem --config dev       # VEM gate (canonical); {pg,vem,filter,ipmcmc}
+python -m scripts.validate_vem --config dev                    # validation ladder → results/validation/
+python -m scripts.run_pg --config dev                          # historical/frozen: fast check
+python -m scripts.run_pg --config half-prod --n-jobs 8         # historical/frozen: multi-market parallel
 python -m scripts.run_ipmcmc --config prod \
-  --n-iter 1500 --n-burnin 300 --n-particles 250                 # half-prod
+  --n-iter 1500 --n-burnin 300 --n-particles 250                 # historical/frozen: half-prod
 python -m scripts.run_pg --synthetic --config dev              # validation
-python -m scripts.benchmark.py --method vem --config dev       # VEM gate; {pg,vem,filter,ipmcmc}
 python -m scripts.pareto.py --output results/figures/pareto.png
 python -m scripts.make_figures --chain results/chains/*.pkl
 python -m pytest tests/ -q
@@ -347,12 +373,14 @@ python -m pytest tests/ -q
 | Preset | N | n_iter | n_burnin | Use |
 |--------|---|--------|----------|-----|
 | dev | 50 | 200 | 50 | Fast (~22 min PG) |
-| half-prod | 250 | 1500 | 300 | **Default refinement** |
+| half-prod | 250 | 1500 | 300 | **Default refinement size** (engine = VEM since 2026-07-23) |
 | prod | 500 | 3000 | 500 | If half-prod noisy |
 
 **Flags:**
 - `run_pg --n-jobs K` — parallelize over K markets; default 1 (bit-exact sequential). Uses `dataclasses.replace` on config.
 - `benchmark.py --method {pg|vem|filter|ipmcmc}` — fourth method (VEM); shared gate/timing/JSON instrumentation via `_artifacts_from_mcmc_chain`; warns on inert `--n-jobs`.
+- `benchmark.py --estimate-betas` — enable the VEM logistic M-step for `beta_S`/`beta_Z`; **default False**. The VEM bench JSON records the effective value. Turning it on currently FAILS the synthetic gate (AUC 0.547 vs 0.9435) — see §6.2.
+- `validate_vem.py --config {dev|half-prod|...}` — samplerless validation ladder (§12): ELBO traces, jittered-restart stability, held-out one-step predictive LL, PSIS-k̂ + `phi_centring_gradient`; writes `results/validation/*.json` with a `convergence_status` block.
 - `pareto.py` — AUC-vs-wall-clock Pareto figure from bench JSONs; output to PNG + CSV.
 - `eval_c4.py` — C4 full-scale eval (K=10, T=2000) [deferred].
 
@@ -382,6 +410,21 @@ Correct **iff** synthetic injection passes:
 1. `pytest tests/ -q`
 2. ROC AUC > 0.85; insider wallets ranked top
 3. No speed regression on dev-iteration benchmark (once `benchmark.py` exists)
+
+### 12.1 Samplerless validation ladder (VEM)
+
+`scripts/validate_vem.py` + `src/analysis/validation.py`. Validation is never a PG comparison (PG is frozen).
+
+| Rung | What it answers | Reported as |
+|------|-----------------|-------------|
+| ELBO traces / `convergence_block` | Did the fit actually converge? | Final relative ELBO change vs `tol`; `convergence_status` block in every artifact. Artifacts must not be read as converged unless this says so |
+| Restart stability | Is the answer an artifact of the initialization? | Jittered restarts (init jitter log-sd 0.1) → pooled-AUC `spread` + top-K `mean_pairwise_jaccard`. **Distinct from data-seed sensitivity** — report both, never conflate |
+| Held-out one-step predictive LL | Does the fit predict unseen trades? | Per-trade held-out LL |
+| PSIS-k̂ + `phi_centring_gradient` | Is the Laplace proposal adequate for the target? | k̂, plus the target gradient at the centre in Laplace-sd units. **Stop condition: k̂ > 0.7 escalates to the user** — it has fired (k̂ = 5.82 dev / 24.0 gate) |
+
+The PSIS target is **conditional on `theta_w_hat`** (held fixed across draws) — it is not a marginal over parameters.
+
+SBC (Talts et al. 2018) and `theta_w` coverage are deferred to plan 3, which is **blocked** on the Laplace-foundation rebuild (STATUS P8).
 
 ---
 
@@ -416,6 +459,13 @@ Correct **iff** synthetic injection passes:
 | `--n-jobs` market parallelism | P0 | DONE — `run_pg --n-jobs K` |
 | `theta_w` approx fix | P3 | DONE (RWMH, full logistic) |
 | Negative `β_S` | P3 | open — pending real-data half-prod |
+| VEM logistic M-step (`beta_S`/`beta_Z`) | P3 | DONE but **opt-in**; gate FAILS when enabled (AUC 0.547 vs 0.9435) — recorded gate PASS covers the beta-fixed path only |
+| Laplace/PSIS foundation (`laplace.py`) | P8 | **UNSOUND** — ECM curvature, not observed information (Louis 1982); VEM fixed point is not stationary for the PSIS target. Dev-scale, at convergence: gradient ≈ 10 Laplace-sd on `log sigma2_0`; observed information 2.24 vs Laplace 252.3 (113× over-precise); observed information on `tau2_1` NEGATIVE (−3.96). ~75% of draws violate the estimator's order constraints. Enriching the variational family does NOT fix this. **Blocks plan 3 SBC** |
+| Restart (initialization) instability | P8/P9 | **Open finding** — pooled AUC across jittered restarts spans 0.376–0.915 (dev), 0.388–0.877 (gate); gate top-K Jaccard 0.171. Deterministic warm start is stable across *data* seeds (0.885/0.899/0.893/0.915). Headline AUC 0.885 = single-initialization, deterministic-warm-start, at-the-cap |
+| Committed validation artifacts pre-convergence | P12 | `results/validation/{dev.json,gate/gate.json}` hit the 50-iteration cap (rel. ELBO change 5.35e-4 / 1.31e-3 vs tol 1e-4). Best-restart selection not meaningful there (terminal-ELBO spread < one iteration's gain) |
+| `sigma2` order clamp / `SS_v` moments / `m_Z` ordering | P9/P10 | open — see §6.2 |
+| `PhiPrior` `tau2` = IG(1e-9, 1e-9) ≈ improper Jeffreys | P11 | open — blocks SBC prior draws |
+| `slow` pytest marker unregistered | P13 | open — no pytest config file in repo |
 
 ---
 
