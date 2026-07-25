@@ -771,12 +771,14 @@ def test_validate_vem_smoke(validate_vem_run):
     assert set(payload) >= {
         "config",
         "inputs",
+        "convergence_status",
         "prior",
         "restarts",
         "stability",
         "best_restart",
         "heldout",
         "psis",
+        "laplace",
         "figures",
     }
     assert payload["inputs"]["synthetic"] is True
@@ -786,6 +788,70 @@ def test_validate_vem_smoke(validate_vem_run):
     assert "psis_scope_note" in payload["psis"]
     assert payload["heldout"]["pooled_n"] > 0
     assert len(payload["heldout"]["per_market"]) == 2
+
+
+def test_validate_vem_records_convergence_status(validate_vem_run):
+    """The artifact says whether the restarts converged, and warns if not.
+
+    The tiny run caps at 5 EM iterations, so it is guaranteed pre-convergence:
+    a reader must be able to see that from the JSON alone rather than inferring
+    it by comparing ``n_iter_run`` against ``--vem-iters`` by hand.
+    """
+    _, payload, _ = validate_vem_run
+    status = payload["convergence_status"]
+    assert status["vem_iters"] == 5
+    assert status["n_restarts_at_iter_cap"] == 2
+    assert status["converged"] is False
+    assert any("PRE-CONVERGENCE" in w for w in status["warnings"])
+    assert isinstance(status["best_restart_selection_meaningful"], bool)
+    assert np.isfinite(status["median_final_elbo_gain"])
+    for r in payload["restarts"]:
+        assert r["hit_iter_cap"] is True
+        assert r["converged"] is False
+        assert np.isfinite(r["final_rel_elbo_change"])
+
+
+def test_validate_vem_stability_carries_its_escalation_flag(validate_vem_run):
+    """The stability block states the AUC-spread threshold and its verdict."""
+    _, payload, _ = validate_vem_run
+    stability = payload["stability"]
+    assert stability["pooled_auc_spread_threshold"] > 0.0
+    assert isinstance(stability["pooled_auc_unstable"], bool)
+    assert isinstance(stability["warnings"], list)
+    # The flag and the warning list agree: one implies the other.
+    assert stability["pooled_auc_unstable"] == bool(stability["warnings"])
+
+
+def test_validate_vem_artifact_is_self_describing(validate_vem_run):
+    """The payload records what was fit, not only how well it scored (H6)."""
+    _, payload, _ = validate_vem_run
+    cfg = payload["config"]
+    assert (cfg["synthetic_K"], cfg["synthetic_T"], cfg["synthetic_n_wallets"]) == (
+        2,
+        100,
+        8,
+    )
+    assert cfg["real"] is False
+    # Fitted phi and the Laplace layer it induced, so the run is reproducible
+    # and auditable from the artifact alone.
+    assert payload["best_restart"]["params"]["sigma2_0"] > 0.0
+    laplace = payload["laplace"]
+    assert len(laplace["dims"]) == 8
+    assert len(laplace["mean_u"]) == 8
+    assert np.asarray(laplace["cov_u"]).shape == (8, 8)
+
+
+def test_validate_vem_reports_proposal_centring(validate_vem_run):
+    """khat ships with the centring gradient that qualifies how to read it."""
+    _, payload, _ = validate_vem_run
+    psis = payload["psis"]
+    grad = psis["centring_grad_sd_units"]
+    assert set(grad) == set(payload["laplace"]["dims"])
+    assert all(np.isfinite(v) for v in grad.values())
+    assert psis["centring_grad_max_abs_dim"] in grad
+    assert psis["centring_grad_max_abs_sd"] == pytest.approx(
+        max(abs(v) for v in grad.values()),
+    )
 
 
 def test_validate_vem_writes_figures(validate_vem_run):

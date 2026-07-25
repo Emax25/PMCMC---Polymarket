@@ -1,9 +1,11 @@
 """Default model hyperparameters and inference configuration for PMCMC.
 
-Defines two dataclasses consumed throughout the codebase:
+Defines three dataclasses consumed throughout the codebase:
 
   * ``ModelParams``     — statistical model parameters (regime variances,
                           insider logistic coefficients, observation noise).
+  * ``PhiPrior``        — the single prior spec the VEM M-step optimizes
+                          against, shared with the Laplace layer and PSIS.
   * ``InferenceConfig`` — particle filter / iPMCMC tuning knobs.
 
 The module-level ``PRODUCTION`` preset is the reference configuration for

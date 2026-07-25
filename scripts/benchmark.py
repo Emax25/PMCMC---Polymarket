@@ -15,6 +15,9 @@ Examples:
     # Variational EM benchmark with synthetic gate
     python -m scripts.benchmark --method vem --gate --vem-iters 50
 
+    # Same, with the opt-in IRLS logistic M-step for beta_S/beta_Z
+    python -m scripts.benchmark --method vem --gate --estimate-betas
+
     # Filter-only screening pass
     python -m scripts.benchmark --method filter --synthetic-K 2
 
@@ -194,11 +197,17 @@ def _run_vem_timed(
     n_wallets: int,
     n_iter: int,
     tol: float,
+    estimate_betas: bool,
 ) -> tuple[Any, float]:
     """Run one VEM fit and return ``(VEMOutput, wall_seconds)``.
 
     VEM is deterministic given inputs; ``seed`` is accepted for timing
     parity with PG runs but does not affect the fit.
+
+    ``estimate_betas`` is threaded through so ``--method vem --gate`` can
+    exercise the IRLS logistic M-step; it defaults to False at the CLI, which
+    matches ``variational_em``'s own default and keeps previously recorded
+    gate numbers reproducible.
     """
     from src.inference.variational_em import variational_em
 
@@ -210,6 +219,7 @@ def _run_vem_timed(
         n_wallets=n_wallets,
         n_iter=n_iter,
         tol=tol,
+        estimate_betas=estimate_betas,
     )
     elapsed = time.perf_counter() - t0
     return out, elapsed
@@ -276,6 +286,7 @@ def _time_runs(
     n_wallets: int,
     vem_iters: int,
     vem_tol: float,
+    vem_estimate_betas: bool = False,
 ) -> tuple[list[float], list[float], _RunArtifacts | Any]:
     """Time inference runs; return seconds, sec/iter, and last-run artifacts."""
     sec_per_run: list[float] = []
@@ -301,6 +312,7 @@ def _time_runs(
                 n_wallets=n_wallets,
                 n_iter=vem_iters,
                 tol=vem_tol,
+                estimate_betas=vem_estimate_betas,
             )
             sec_per_run.append(elapsed)
             sec_per_iter.append(elapsed / out.n_iter_run)
@@ -517,6 +529,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="ELBO convergence tolerance for --method vem (default: 1e-4).",
     )
     p.add_argument(
+        "--estimate-betas",
+        action="store_true",
+        help="Fit beta_S/beta_Z by IRLS each M-step for --method vem. Off by "
+        "default, matching variational_em: the ADF E-step cannot identify Z on "
+        "the current synthetic generator, so enabling this fits a spurious "
+        "size-correlated beta_S and drops the gate AUC.",
+    )
+    p.add_argument(
         "--gate",
         action="store_true",
         help="Run synthetic accuracy gate on the last timed run.",
@@ -559,6 +579,7 @@ def _format_report(
     gate: dict[str, Any] | None,
     vem_n_iter_run: int | None,
     vem_final_elbo: float | None,
+    vem_estimate_betas: bool,
     kendall_tau_vs_baseline: float | None,
 ) -> str:
     """Build a human-readable benchmark report."""
@@ -583,11 +604,13 @@ def _format_report(
     if method == "vem" and vem_n_iter_run is not None:
         lines.append(
             f"VEM: n_iter_run={vem_n_iter_run}  final_elbo={vem_final_elbo:.4f}  "
+            f"estimate_betas={vem_estimate_betas}  "
             f"(deterministic given inputs; seeds only affect timing repeats)",
         )
     elif method == "vem":
         lines.append(
-            "VEM: deterministic given inputs; seeds only affect timing repeats",
+            f"VEM: estimate_betas={vem_estimate_betas}; deterministic given "
+            f"inputs; seeds only affect timing repeats",
         )
     lines.extend(
         [
@@ -702,6 +725,8 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit(f"Need M >= P; got M={cfg.M}, P={cfg.P}.")
     elif args.M is not None or args.P is not None:
         log.warning("--M/--P only apply to --method ipmcmc; ignoring")
+    if args.estimate_betas and args.method != "vem":
+        log.warning("--estimate-betas only applies to --method vem; ignoring")
     base_seed = args.seed if args.seed is not None else cfg.seed
     seeds = (
         args.seeds
@@ -741,6 +766,7 @@ def main(argv: list[str] | None = None) -> int:
         n_wallets=inputs.wallet_index.n_wallets,
         vem_iters=args.vem_iters,
         vem_tol=args.vem_tol,
+        vem_estimate_betas=args.estimate_betas,
     )
 
     profile_buckets: dict[str, float] | None = None
@@ -796,6 +822,7 @@ def main(argv: list[str] | None = None) -> int:
         gate=gate,
         vem_n_iter_run=vem_n_iter_run,
         vem_final_elbo=vem_final_elbo,
+        vem_estimate_betas=args.estimate_betas,
         kendall_tau_vs_baseline=kendall_tau_vs_baseline,
     )
     print(report)
@@ -839,6 +866,7 @@ def main(argv: list[str] | None = None) -> int:
                 "final_elbo": vem_final_elbo,
                 "vem_iters": args.vem_iters,
                 "vem_tol": args.vem_tol,
+                "estimate_betas": args.estimate_betas,
             }
         if kendall_tau_vs_baseline is not None:
             payload["kendall_tau_vs_baseline"] = kendall_tau_vs_baseline

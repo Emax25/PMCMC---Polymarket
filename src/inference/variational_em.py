@@ -11,8 +11,10 @@ E-step: single-mode ADF forward pass - 4 (V,Z) combos share one incoming
 
 M-step is an ECM sweep (Meng & Rubin 1993) of three ordered blocks; each
 block maximizes the expected complete-data log-posterior holding the other
-two fixed, so the (approximate) EM objective is monotone *blockwise* within
-an iteration even though the blocks are not updated jointly:
+two fixed, so — *provided the objective is the same one the E-step scored*
+(it is not; see the m_Z caveat below) — the (approximate) EM objective is
+monotone *blockwise* within an iteration even though the blocks are not
+updated jointly:
   (a) theta_w  - offset-adjusted per-wallet penalized Newton on
       logit(theta_w[w]), using the *previous* iteration's (beta_S, beta_Z)
       as a fixed per-trade offset. The Beta(a, b) prior is placed on
@@ -38,6 +40,24 @@ tau2_Z), so default-on beta estimation fits a spurious size-correlated beta_S
 (~-0.40) that drops gate AUC from ~0.89 to ~0.68. Beta estimation is enabled
 explicitly (Laplace layer, real-data runs, Z-identifiability work) until the
 E-step identifies Z.
+
+Caveat (blockwise monotonicity is conditional, and currently latent): the
+guarantee above holds only while the E-step and the M-step score the *same*
+objective, i.e. with the covariate standardization constants held fixed
+across the iteration. `m_Z` is not: it is refreshed from the fresh q(Z)
+*between* the E-step and the same iteration's M-step call, so `q_vz_list`
+was produced under the old `m_Z` while block (c) re-centers `x_Z~` under the
+new one — the objective is redefined mid-iteration and the log-marginal
+trace therefore carries no monotonicity guarantee. The effect is inert on
+every committed artifact because block (c) is opt-in and off by default
+(`estimate_betas=False` pins `beta_Z = 0`): measured induced level shift
+1.7e-5, with `m_Z` drifting 0.117 -> 0.055 over 15 iterations (largest
+per-iteration change 0.0124). At the oracle `beta_Z = 1.5` that same drift
+would move the logistic predictor by ~0.019 logit per iteration, absorbed by
+`theta_w` as a level; and with `estimate_betas=True` the log-marginal trace
+was measured non-monotone (-1065.6 -> -1082.1 -> -1126.3, then rising).
+Moving the refresh after the M-step is an open scope decision, not an
+oversight — nothing here reorders it.
 
 Predictor covariates are centered/standardized (Gelman et al. 2008) before
 entering the logistic Z predictor, with no free intercept — the theta_w
@@ -79,7 +99,6 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING
 
 import numpy as np
 from scipy.special import logsumexp
@@ -88,9 +107,6 @@ from config.default_params import InferenceConfig, ModelParams, PhiPrior
 from src.inference.kalman import _kalman_step_all_combos
 from src.inference.particle_gibbs import MarketData
 from src.utils.transforms import log1pexp, logit, sigmoid
-
-if TYPE_CHECKING:
-    pass
 
 # Below this pooled std of log_size_ratio, treat the size covariate as
 # degenerate (all trades effectively the same size) and skip the 0.5/s_S
@@ -455,6 +471,40 @@ def _update_theta_w(
     return theta_w_new, logit_mean, logit_var
 
 
+def _beta_grad_fisher(
+    X: np.ndarray,
+    offset: np.ndarray,
+    y: np.ndarray,
+    beta: np.ndarray,
+    cauchy_scale: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Penalized logistic score and Fisher information at `beta`.
+
+    The Gelman et al. (2008, §3) approximate-EM form: the Cauchy(0, scale)
+    prior contributes ``-c * beta`` to the score and ``diag(c)`` to the
+    information, with ``c = 2 / (scale**2 + beta**2)`` evaluated at the current
+    coefficient. Shared by the IRLS loop and the post-loop information report so
+    the two can never drift apart.
+
+    Args:
+        X: (n, 2) standardized design ``[x_S~, x_Z~]``.
+        offset: (n,) fixed per-trade offset ``logit(theta_w[wallet(t)])``.
+        y: (n,) fractional Bernoulli targets ``q(Z_t = 1)``.
+        beta: (2,) current internal-scale coefficients.
+        cauchy_scale: Scale of the Cauchy prior on each coefficient.
+
+    Returns:
+        `(grad, fisher)`: the (2,) penalized score and the (2, 2) augmented
+        Fisher information (data curvature + prior curvature).
+    """
+    mu = sigmoid(offset + X @ beta)
+    w = mu * (1.0 - mu)
+    c = 2.0 / (cauchy_scale**2 + beta**2)
+    grad = X.T @ (y - mu) - c * beta
+    fisher = (X * w[:, None]).T @ X + np.diag(c)
+    return grad, fisher
+
+
 def _update_beta_irls(
     markets: list[MarketData],
     q_vz_list: list[np.ndarray],
@@ -527,18 +577,9 @@ def _update_beta_irls(
         return log_lik + log_prior
 
     obj = _penalized_obj(beta)
-    fisher = np.diag(2.0 / (cauchy_scale**2 + beta**2))
     converged = False
     for _ in range(_IRLS_MAX_ITER):
-        eta = offset + X @ beta
-        mu = sigmoid(eta)
-        w = mu * (1.0 - mu)
-        grad_data = X.T @ (y - mu)
-        hess_data = (X * w[:, None]).T @ X
-
-        c = 2.0 / (cauchy_scale**2 + beta**2)
-        grad = grad_data - c * beta
-        fisher = hess_data + np.diag(c)
+        grad, fisher = _beta_grad_fisher(X, offset, y, beta, cauchy_scale)
 
         try:
             step = np.linalg.solve(fisher, grad)
@@ -576,15 +617,101 @@ def _update_beta_irls(
             stacklevel=2,
         )
 
-    # Fisher info at the final beta (data + prior curvature) for the caller.
-    eta = offset + X @ beta
-    mu = sigmoid(eta)
-    w = mu * (1.0 - mu)
-    hess_data = (X * w[:, None]).T @ X
-    c = 2.0 / (cauchy_scale**2 + beta**2)
-    fisher = hess_data + np.diag(c)
+    # Fisher info at the *final* beta (the loop's last evaluation predates the
+    # accepted step), data + prior curvature, for the caller's Laplace block.
+    _, fisher = _beta_grad_fisher(X, offset, y, beta, cauchy_scale)
 
     return float(beta[0]), float(beta[1]), fisher
+
+
+def _mstep_sufficient_stats(
+    markets: list[MarketData],
+    q_vz_list: list[np.ndarray],
+    mu_filt_list: list[np.ndarray],
+    sigma2_filt_list: list[np.ndarray],
+    gamma: float,
+) -> dict[str, float | list[float]]:
+    """Pool the E-step sufficient statistics the variance/transition blocks need.
+
+    One sweep over the markets accumulating the three statistic families the
+    M-step's closed-form blocks consume:
+
+      * ``SS_v``/``N_v`` — q(V)-weighted squared process increments per unit
+        time (trades j >= 1 with a positive gap), for the sigma2_v update;
+      * ``n_00``/``n_01``/``n_10``/``n_11`` — expected V-transition counts from
+        the product of consecutive V-marginals, for the q_01/q_10 update;
+      * ``SS_z``/``N_z`` — q(Z)-weighted size-scaled squared observation
+        residuals over all trades, for the tau2_z update.
+
+    Shared by ``_vem_m_step`` and ``src.inference.laplace``, whose curvature
+    blocks must be evaluated against the very statistics the M-step optimized —
+    a second copy of this algebra could silently drift from it.
+
+    Note: the increments use the *filtered* moments the ADF pass returns, and
+    the process statistic drops the lag-one cross-covariance a smoothed E-step
+    would supply. That is the estimator this M-step has always used; changing it
+    is an open scope decision, not something this helper alters.
+
+    Args:
+        markets: Input market data.
+        q_vz_list: Per-market soft (V, Z) assignments, each (T_k, 4).
+        mu_filt_list: Per-market mixed Kalman means, each (T_k,).
+        sigma2_filt_list: Per-market mixed Kalman variances, each (T_k,).
+        gamma: Size-informativeness scaling from the current parameters.
+
+    Returns:
+        Dict with ``SS_v``/``N_v`` and ``SS_z``/``N_z`` (length-2 lists indexed
+        by regime) and the four scalar transition counts ``n_ij``.
+    """
+    SS_v = [0.0, 0.0]
+    N_v = [0.0, 0.0]
+    n_00 = n_01 = n_10 = n_11 = 0.0
+    SS_z = [0.0, 0.0]
+    N_z = [0.0, 0.0]
+    for md, q_vz, mu_f, sigma2_f in zip(
+        markets, q_vz_list, mu_filt_list, sigma2_filt_list
+    ):
+        # Process-variance stats (trades j >= 1 with a positive time gap).
+        dt = md.delta[1:]
+        valid = dt > 0
+        if valid.any():
+            resid2 = (mu_f[1:] - mu_f[:-1]) ** 2
+            extra_var = sigma2_f[1:] + sigma2_f[:-1]
+            for v in (0, 1):
+                q_V_v = (q_vz[:, 2 * v] + q_vz[:, 2 * v + 1])[1:]
+                SS_v[v] += float(
+                    (
+                        q_V_v[valid] * (resid2[valid] + extra_var[valid]) / dt[valid]
+                    ).sum()
+                )
+                N_v[v] += float(q_V_v[valid].sum())
+
+        # Transition counts from the product of consecutive V-marginals.
+        q_V0 = q_vz[:, 0] + q_vz[:, 1]
+        q_V1 = q_vz[:, 2] + q_vz[:, 3]
+        n_00 += float((q_V0[:-1] * q_V0[1:]).sum())
+        n_01 += float((q_V0[:-1] * q_V1[1:]).sum())
+        n_10 += float((q_V1[:-1] * q_V0[1:]).sum())
+        n_11 += float((q_V1[:-1] * q_V1[1:]).sum())
+
+        # Observation-variance stats over all trades (size-scaled residuals).
+        denom_t = np.maximum(1.0 + md.log_size_ratio * gamma, 0.1)
+        resid2_obs = (md.Y - mu_f) ** 2
+        for z in (0, 1):
+            q_Z_z = q_vz[:, z] + q_vz[:, 2 + z]
+            SS_z[z] += float((q_Z_z * (resid2_obs + sigma2_f) * denom_t).sum())
+            N_z[z] += float(q_Z_z.sum())
+
+    return {
+        "SS_v": SS_v,
+        "N_v": N_v,
+        "n_00": n_00,
+        "n_01": n_01,
+        "n_10": n_10,
+        "n_11": n_11,
+        "SS_z": SS_z,
+        "N_z": N_z,
+    }
 
 
 def _vem_m_step(
@@ -600,7 +727,7 @@ def _vem_m_step(
     m_Z: float,
     *,
     prior: PhiPrior | None = None,
-    estimate_betas: bool = True,
+    estimate_betas: bool = False,
 ) -> tuple[ModelParams, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """ECM M-step: theta_w Newton, then moment-matched updates, then beta IRLS.
 
@@ -625,11 +752,12 @@ def _vem_m_step(
             `PhiPrior()` (the behaviour-preserving defaults). Supplies the
             sigma2/tau2 Inverse-Gamma, q Beta, and beta Cauchy hyperparameters
             — no prior constant is hardcoded in this body (plan R8/KTD3).
-        estimate_betas: If False, skip block (c) and hold beta_S/beta_Z fixed
-            at their `params` value for every iteration (regression-anchor /
-            debugging path — with the offset then uniformly 0 at the default
+        estimate_betas: If False (the default, matching `variational_em`'s
+            public default — see there for why beta estimation is opt-in), skip
+            block (c) and hold beta_S/beta_Z fixed at their `params` value for
+            every iteration. With the offset then uniformly 0 at the default
             beta_S = beta_Z = 0.0, block (a) reduces exactly to the original
-            Beta-count theta_w update).
+            Beta-count theta_w update.
 
     Returns:
         `(params, theta_w, theta_w_logit_mean, theta_w_logit_var, beta_fisher_info)`.
@@ -652,39 +780,20 @@ def _vem_m_step(
         logit(theta_w),
     )
 
+    stats = _mstep_sufficient_stats(
+        markets, q_vz_list, mu_filt_list, sigma2_filt_list, params.gamma
+    )
+    SS_v, N_v = stats["SS_v"], stats["N_v"]
+    SS_z, N_z = stats["SS_z"], stats["N_z"]
+
     # ---- q_01, q_10: product-of-marginals Beta update (prior.q_beta_a/b) ----
-    n_00 = n_01 = n_10 = n_11 = 0.0
-    for q_vz in q_vz_list:
-        q_V0 = q_vz[:, 0] + q_vz[:, 1]
-        q_V1 = q_vz[:, 2] + q_vz[:, 3]
-        n_00 += float((q_V0[:-1] * q_V0[1:]).sum())
-        n_01 += float((q_V0[:-1] * q_V1[1:]).sum())
-        n_10 += float((q_V1[:-1] * q_V0[1:]).sum())
-        n_11 += float((q_V1[:-1] * q_V1[1:]).sum())
-    q_01_new = prior.q_map(n_01, n_00)
-    q_10_new = prior.q_map(n_10, n_11)
+    q_01_new = prior.q_map(stats["n_01"], stats["n_00"])
+    q_10_new = prior.q_map(stats["n_10"], stats["n_11"])
     # Clamp to (0,1) open interval to avoid degenerate regimes
     q_01_new = float(np.clip(q_01_new, 1e-6, 1.0 - 1e-6))
     q_10_new = float(np.clip(q_10_new, 1e-6, 1.0 - 1e-6))
 
     # ---- sigma2_0, sigma2_1: IG MAP update (mode = beta/(alpha+1)) ----
-    SS_v = [0.0, 0.0]
-    N_v = [0.0, 0.0]
-    for md, q_vz, mu_f, sigma2_f in zip(
-        markets, q_vz_list, mu_filt_list, sigma2_filt_list
-    ):
-        dt = md.delta[1:]
-        valid = dt > 0
-        if not valid.any():
-            continue
-        resid2 = (mu_f[1:] - mu_f[:-1]) ** 2
-        extra_var = sigma2_f[1:] + sigma2_f[:-1]
-        for v in (0, 1):
-            q_V_v = (q_vz[:, 2 * v] + q_vz[:, 2 * v + 1])[1:]
-            SS_v[v] += float(
-                (q_V_v[valid] * (resid2[valid] + extra_var[valid]) / dt[valid]).sum()
-            )
-            N_v[v] += float(q_V_v[valid].sum())
     sigma2_0_new = max(prior.sigma2_map(SS_v[0], N_v[0]), 1e-6)
     sigma2_1_new = max(prior.sigma2_map(SS_v[1], N_v[1]), 1e-6)
     sigma2_1_new = max(sigma2_1_new, sigma2_0_new)
@@ -693,17 +802,6 @@ def _vem_m_step(
     # Reduces to the pre-refactor moment-match SS/N as the tau2 prior -> 0; the
     # weak default prior gives the Laplace tau2 block a defined curvature at the
     # cost of a numerically negligible estimate shift (plan R8).
-    SS_z = [0.0, 0.0]
-    N_z = [0.0, 0.0]
-    for md, q_vz, mu_f, sigma2_f in zip(
-        markets, q_vz_list, mu_filt_list, sigma2_filt_list
-    ):
-        denom_t = np.maximum(1.0 + md.log_size_ratio * params.gamma, 0.1)
-        resid2 = (md.Y - mu_f) ** 2
-        for z in (0, 1):
-            q_Z_z = q_vz[:, z] + q_vz[:, 2 + z]
-            SS_z[z] += float((q_Z_z * (resid2 + sigma2_f) * denom_t).sum())
-            N_z[z] += float(q_Z_z.sum())
     tau2_0_new = max(prior.tau2_map(SS_z[0], N_z[0]), 1e-6)
     tau2_1_new = max(prior.tau2_map(SS_z[1], N_z[1]), 1e-6)
     # Insiders have tighter obs variance (more price-informative trades)
@@ -737,7 +835,13 @@ def _vem_m_step(
         beta_S=beta_S_new,
         beta_Z=beta_Z_new,
     )
-    return new_params, theta_w_new, theta_w_logit_mean, theta_w_logit_var, beta_fisher_info
+    return (
+        new_params,
+        theta_w_new,
+        theta_w_logit_mean,
+        theta_w_logit_var,
+        beta_fisher_info,
+    )
 
 
 def variational_em(

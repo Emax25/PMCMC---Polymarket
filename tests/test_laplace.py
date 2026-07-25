@@ -10,7 +10,10 @@ from config.default_params import InferenceConfig, ModelParams, PhiPrior
 from src.data.synthetic import generate_market
 from src.inference.laplace import (
     PhiPosterior,
+    _MAX_SCALAR_SD_U,
+    _MAX_SCALAR_VAR_U,
     _block_cov_from_precision,
+    _scalar_block_variance,
     _to_constrained,
     _to_unconstrained,
     laplace_from_vem,
@@ -215,6 +218,102 @@ def test_singular_fisher_injected_gives_valid_distribution():
     draws = post.sample(np.random.default_rng(0), 100)
     assert np.all(np.isfinite(draws))
     assert np.isfinite(post.logpdf(_vem_point(out.params)))
+
+
+# ---------------- vanishing scalar curvature (R3, empty-regime path) ----------
+
+
+def test_scalar_block_healthy_curvature_is_exact_inverse():
+    """A well-conditioned scalar precision inverts exactly and is not flagged."""
+    for prec in (252.3, 3.29, 1.0 / _MAX_SCALAR_VAR_U + 1e-6):
+        var, used_fb = _scalar_block_variance(prec)
+        assert not used_fb
+        assert var == 1.0 / prec  # the cap must not perturb healthy blocks
+
+
+def test_scalar_block_vanishing_curvature_is_capped_and_flagged():
+    """The empty-regime tau2 remnant is capped instead of passing a sign test.
+
+    With ``SS_z = N_z = 0`` the tau2 curvature collapses to the prior remnant
+    ``tau2_ig_beta / tau2`` ~ 1e-9/tau2, which is positive — so a 1x1
+    positive-definiteness test accepts it — yet implies an absurd log-scale sd.
+    """
+    prior = PhiPrior()
+    prec = prior.tau2_ig_beta / 0.02  # SS_z = N_z = 0 at a plausible tau2
+    assert prec > 0.0  # a 1x1 PD test would wave this through unflagged
+    assert 1.0 / prec > 1e7  # ... at a log-scale sd of >3000
+    var, used_fb = _scalar_block_variance(prec)
+    assert used_fb
+    assert var == _MAX_SCALAR_VAR_U
+
+
+def test_scalar_block_nonpositive_curvature_is_finite_and_flagged():
+    """Zero/negative/non-finite scalar curvature still yields a finite variance."""
+    for prec in (0.0, -3.96, np.nan):
+        var, used_fb = _scalar_block_variance(prec)
+        assert used_fb
+        assert np.isfinite(var) and 0.0 < var <= _MAX_SCALAR_VAR_U
+
+
+def test_capped_scalar_block_gives_usable_distribution():
+    """A PhiPosterior carrying a capped scalar block still samples and scores.
+
+    Construction-level companion to the ``laplace_from_vem`` test below: an
+    uncapped 1e-9-precision block would put the log-scale sd near 3e4, so
+    ``exp`` overflows to 0/inf on back-transformation and both ``logpdf`` and
+    ``PhiPrior.log_prior`` go non-finite.
+    """
+    mean_u = _to_unconstrained(np.array([0.02, 0.05, 0.1, 0.1, 0.0, 0.0, 0.02, 0.02]))
+    cov_u = np.diag(np.full(8, 0.1))
+    cov_u[7, 7], used_fb = _scalar_block_variance(PhiPrior().tau2_ig_beta / 0.02)
+    post = PhiPosterior(
+        mean_u=mean_u,
+        cov_u=cov_u,
+        curvature_fallback=used_fb,
+        fallback_dims=("tau2_1",),
+    )
+    draws = post.sample(np.random.default_rng(0), 500)
+    assert np.all(np.isfinite(draws))
+    assert np.all(draws[:, [0, 1, 6, 7]] > 0.0)
+    assert np.all(np.isfinite(post.logpdf(draws)))
+    assert np.all(np.isfinite(PhiPrior().log_prior(draws)))
+
+
+def test_empty_z_regime_tau2_block_capped_and_usable():
+    """laplace_from_vem survives an empty Z regime: tau2_1 capped, flagged, usable.
+
+    Driving every wallet's propensity to ~0 makes ``q(Z = 1)`` underflow, so the
+    re-run E-step leaves ``SS_z[1] = N_z[1] = 0`` and the tau2_1 curvature is the
+    bare prior remnant. Regression guard for the whole degenerate path.
+    """
+    md, params = _make_synth(T=300)
+    out = _fit(md, params)
+    out_empty = replace(out, theta_w=np.full(15, 1e-12))
+    post = laplace_from_vem(out_empty, [md])
+
+    assert post.curvature_fallback
+    assert "tau2_1" in post.fallback_dims
+    np.testing.assert_allclose(np.sqrt(post.cov_u[7, 7]), _MAX_SCALAR_SD_U)
+
+    # Usable: finite on the constrained scale, and scorable by both densities.
+    draws = post.sample(np.random.default_rng(0), 500)
+    assert np.all(np.isfinite(draws))
+    assert np.all(draws[:, [0, 1, 6, 7]] > 0.0)
+    assert np.all((draws[:, [2, 3]] > 0.0) & (draws[:, [2, 3]] < 1.0))
+    assert np.all(np.isfinite(post.logpdf(draws)))
+    assert np.all(np.isfinite(PhiPrior().log_prior(draws)))
+
+
+def test_well_conditioned_scalar_blocks_not_flagged():
+    """On the standard fixture no scalar block is capped (only the beta block)."""
+    md, params = _make_synth(T=300)
+    out = _fit(md, params)
+    post = laplace_from_vem(out, [md])
+    # estimate_betas=False zeroes the beta Fisher, so those two dims always fall
+    # back; the six scalar blocks must not.
+    assert set(post.fallback_dims) == {"beta_S", "beta_Z"}
+    scalar_sd = np.sqrt(np.diag(post.cov_u)[[0, 1, 2, 3, 6, 7]])
+    assert np.all(scalar_sd < _MAX_SCALAR_SD_U)
 
 
 # ---------------- beta curvature scales with data (scenario 6) ----------------

@@ -1,11 +1,50 @@
-"""Laplace / curvature Gaussian over the unconstrained VEM parameter vector phi.
+"""Curvature Gaussian over the unconstrained VEM parameter vector phi.
 
 VEM's M-step is a *point* estimator, but the samplerless validation ladder
 (PSIS, SBC, coverage — plans 2 and 3) needs a *distribution* over parameters.
-This module supplies the cheapest defensible such object: a block-diagonal
-Gaussian on the unconstrained scale, centred at the VEM estimate, whose
-covariance is the inverse curvature of the M-step's own expected complete-data
-objective at that estimate (plan 2026-07-23-002 KTD1/R1/R2).
+This module supplies the cheapest such object: a block-diagonal Gaussian on the
+unconstrained scale, centred at the VEM/ECM fixed point, whose covariance is the
+inverse *expected complete-data* (ECM) curvature at that point
+(plan 2026-07-23-002 KTD1/R1/R2).
+
+What this object is NOT
+-----------------------
+Despite the module name, this is **not** a Laplace approximation to the
+posterior ``p(phi | Y)``. Two distinct gaps, both measured at dev scale:
+
+  1. *Wrong information matrix.* The blocks below are expected complete-data
+     information, not observed information. By the Louis (1982) missing-
+     information identity, observed = complete minus missing, so the complete-
+     data curvature systematically *over*-states precision. Measured on the
+     standard fixture: at ``log sigma2_0`` the observed information is 2.24
+     against this object's 252.3 — 113x over-precise.
+  2. *Wrong centre.* A VEM fixed point is stationary for the variational
+     objective, not for the target ``log p(Y|phi) + log p(phi)`` that PSIS and
+     SBC weight against. Run to convergence (1500 iterations, relative change
+     1.3e-8) the target's gradient at the centre is still ~10 Laplace sd along
+     ``log sigma2_0``, and the observed information at ``tau2_1`` is *negative*
+     (-3.96) — i.e. the centre is a local *minimum* along that axis, which no
+     Laplace approximation can be.
+
+Consequences: PSIS khat computed against this proposal diagnoses the *proposal*,
+not the model, and a poor khat is expected rather than evidence of model
+misfit; SBC coverage built on it inherits both the centre offset and the
+over-precision. Any such claim must be qualified accordingly. Fixing this needs
+either Louis-identity observed information or a direct optimum of the marginal
+target — neither is in the current layer.
+
+Known limitation: the order constraint binds
+--------------------------------------------
+The M-step enforces ``sigma2_1 = max(sigma2_1, sigma2_0)``. On the standard
+fixture that constraint is *active at every fitted point* — ``sigma2_0`` equals
+``sigma2_1`` to the last bit on 5/5 dev restarts, and still at convergence. The
+sigma2 blocks' curvature is therefore evaluated on a constraint boundary, where
+the unconstrained quadratic below is simply the wrong local model, and ~75% of
+draws from the resulting Gaussian violate the estimator's own order constraints.
+Relatedly the V regime is non-identified at that point: the ADF log-marginal
+moves less than 5e-13 over +-4 sd in both ``logit q_01`` and ``logit q_10``,
+while this object assigns those blocks precisions of ~106 and ~19. Both are
+known limitations of this layer, not of the fallback ladder.
 
 Parameter vector (canonical order, the constrained/natural scale):
 
@@ -17,9 +56,10 @@ the parameters' support):
     * transitions (q_*):             u = logit(phi),       phi = sigmoid(u)
     * standardized betas:            u = phi               (identity)
 
-Block curvature at the VEM optimum (all as *precisions*, i.e. negative Hessians
-of the M-step's expected complete-data log-posterior, delta-method-mapped to the
-unconstrained scale and evaluated at the returned estimate):
+Block curvature at the ECM fixed point (all as *precisions*, i.e. negative
+Hessians of the M-step's expected complete-data log-posterior — see the caveats
+above — delta-method-mapped to the unconstrained scale and evaluated at the
+returned estimate):
 
     * log(sigma2_v):  (SS_v/2 + prior.sigma2_ig_beta) / sigma2_v
                       (= alpha + N_v/2 + 1 at the interior Inverse-Gamma mode)
@@ -38,8 +78,10 @@ The variance/transition precisions depend only on the E-step sufficient
 statistics and the returned parameter values, so the builder re-runs one ADF
 E-step pass per market at the fitted (params, theta_w) to recover them — this is
 a cold analysis-side path, so correctness is preferred over reusing the M-step's
-internal buffers. The block algebra mirrors ``_vem_m_step`` exactly (see the
-per-block comments).
+internal buffers. The statistics themselves come from
+``variational_em._mstep_sufficient_stats``, the same helper the M-step calls, so
+the block algebra below is guaranteed to be curvature of the objective the
+estimator actually optimized.
 """
 
 from __future__ import annotations
@@ -52,7 +94,11 @@ from scipy.special import logit as _logit
 
 from config.default_params import PhiPrior
 from src.inference.particle_gibbs import MarketData
-from src.inference.variational_em import VEMOutput, _vem_e_step
+from src.inference.variational_em import (
+    VEMOutput,
+    _mstep_sufficient_stats,
+    _vem_e_step,
+)
 
 # Canonical constrained-parameter order and the per-dimension transform groups.
 _PHI_DIMS = (
@@ -74,6 +120,19 @@ _BETA_IDX = [4, 5]       # identity (already unconstrained, internal scale)
 # a degenerate block never crashes sampling/logpdf.
 _JITTER = 1e-10
 _MIN_PRECISION = 1e-8
+
+# Width cap for the *scalar* blocks (log-variances and logit-probabilities).
+# A 1x1 precision is positive-definite for any positive value, so the sign test
+# alone cannot catch a block whose data-driven curvature has vanished; the
+# variance itself has to be bounded. 4.0 on the log/logit scale is already an
+# extreme width: on log(sigma2)/log(tau2) a +-2 sd interval spans a factor of
+# exp(16) ~ 9e6 in the variance, and on logit(q) it puts over 99.9% of the mass
+# outside q in (3e-4, 1 - 3e-4). It is also ~7x the widest well-conditioned
+# scalar sd observed on the dev fixture (~0.55 for logit q_10 at T=300), so
+# well-identified blocks never touch it. Anything wider carries no information
+# and only risks exp() overflow when draws are back-transformed.
+_MAX_SCALAR_SD_U = 4.0
+_MAX_SCALAR_VAR_U = _MAX_SCALAR_SD_U**2
 
 
 def _to_unconstrained(phi: np.ndarray) -> np.ndarray:
@@ -146,18 +205,21 @@ def _is_pd(mat: np.ndarray) -> bool:
 def _block_cov_from_precision(
     prec: np.ndarray, fallback_prec_diag: float
 ) -> tuple[np.ndarray, bool]:
-    """Invert a precision block to a covariance, with the R3 fallback ladder.
+    """Invert a multivariate precision block to a covariance (R3 fallback ladder).
 
     Ladder: (1) invert directly if positive-definite; (2) else add scale-relative
     jitter to the diagonal and invert; (3) else replace with a per-dimension
     diagonal precision floored at ``fallback_prec_diag`` (a wide-but-finite,
     prior-informed curvature) and invert. Steps 2-3 flag the block.
 
+    Used for the 2x2 beta block only. Scalar blocks go through
+    ``_scalar_block_variance`` instead, because positive-definiteness of a 1x1
+    precision is a vacuous test (see that function's docstring).
+
     Args:
         prec: Symmetric precision (negative-Hessian) block, shape ``(d, d)``.
         fallback_prec_diag: Per-dimension precision floor for the last resort —
-            for the beta block this is the Cauchy prior curvature ``2/scale**2``;
-            for scalar blocks the generic ``_MIN_PRECISION``.
+            for the beta block this is the Cauchy prior curvature ``2/scale**2``.
 
     Returns:
         ``(cov, used_fallback)``: the covariance block and whether a fallback ran.
@@ -175,6 +237,42 @@ def _block_cov_from_precision(
     # (3) per-dimension curvature floor.
     prec_diag = np.maximum(np.abs(np.diag(prec)), fallback_prec_diag)
     return np.diag(1.0 / prec_diag), True
+
+
+def _scalar_block_variance(prec: float) -> tuple[float, bool]:
+    """Convert a scalar curvature to a sane unconstrained-scale variance (R3).
+
+    Scalar blocks need a stronger guard than the positive-definiteness test used
+    for the 2x2 beta block: a 1x1 precision is "PD" for *any* positive value,
+    including the purely prior-driven remnant left when a regime is empty. With
+    ``SS_z = N_z = 0`` the tau2 curvature collapses to ``tau2_ig_beta / tau2``
+    ~ 1e-9, which passes a sign test unflagged but implies a log-scale sd of
+    ~3e4; back-transforming such draws overflows ``exp`` to 0/inf and sends both
+    ``PhiPosterior.logpdf`` and ``PhiPrior.log_prior`` non-finite. So the
+    *returned variance* is capped at ``_MAX_SCALAR_VAR_U`` (see that constant
+    for the width justification), not merely checked for sign, and any block
+    that hits the cap is reported through ``fallback_dims``.
+
+    Args:
+        prec: Scalar unconstrained-scale precision (negative Hessian) for one
+            of the log-variance or logit-transition blocks.
+
+    Returns:
+        ``(var, used_fallback)``: the unconstrained-scale variance and whether
+        the sign floor or the width cap had to intervene.
+    """
+    prec = float(prec)
+    if not np.isfinite(prec) or prec <= 0.0:
+        # Non-PD (or undefined) curvature: keep its magnitude as an abs-Hessian
+        # proxy, floored so the inverse stays finite. Mirrors step (3) of
+        # `_block_cov_from_precision` for the 1x1 case.
+        magnitude = abs(prec) if np.isfinite(prec) else 0.0
+        var = 1.0 / max(magnitude, _MIN_PRECISION)
+        return min(var, _MAX_SCALAR_VAR_U), True
+    var = 1.0 / prec
+    if var > _MAX_SCALAR_VAR_U:
+        return _MAX_SCALAR_VAR_U, True
+    return var, False
 
 
 @dataclass
@@ -254,82 +352,6 @@ class PhiPosterior:
         return gauss + _log_abs_du_dphi(phi)
 
 
-def _recompute_mstep_stats(
-    markets: list[MarketData],
-    q_vz_list: list[np.ndarray],
-    mu_filt_list: list[np.ndarray],
-    sigma2_filt_list: list[np.ndarray],
-    gamma: float,
-) -> dict[str, float | list[float]]:
-    """Recompute the M-step sufficient statistics from an ADF E-step pass.
-
-    Mirrors the three stat sweeps in ``_vem_m_step`` exactly (process-variance
-    ``SS_v/N_v``, transition counts ``n_ij``, observation-variance ``SS_z/N_z``)
-    so the Laplace curvature is evaluated against the very objective the M-step
-    optimized. Recomputed here rather than reused to keep ``_vem_m_step`` free of
-    Laplace-specific bookkeeping.
-
-    Args:
-        markets: Input market data.
-        q_vz_list: Per-market soft (V, Z) assignments from the re-run E-step.
-        mu_filt_list: Per-market mixed Kalman means from the re-run E-step.
-        sigma2_filt_list: Per-market mixed Kalman variances from the re-run E-step.
-        gamma: Size-informativeness scaling (from the fitted params).
-
-    Returns:
-        Dict with ``SS_v``/``N_v`` (length-2 lists over regimes), the four
-        transition counts ``n_00/n_01/n_10/n_11``, and ``SS_z``/``N_z``.
-    """
-    SS_v = [0.0, 0.0]
-    N_v = [0.0, 0.0]
-    n_00 = n_01 = n_10 = n_11 = 0.0
-    SS_z = [0.0, 0.0]
-    N_z = [0.0, 0.0]
-    for md, q_vz, mu_f, sigma2_f in zip(
-        markets, q_vz_list, mu_filt_list, sigma2_filt_list
-    ):
-        # Process-variance stats (trades j >= 1 with a positive time gap).
-        dt = md.delta[1:]
-        valid = dt > 0
-        if valid.any():
-            resid2 = (mu_f[1:] - mu_f[:-1]) ** 2
-            extra_var = sigma2_f[1:] + sigma2_f[:-1]
-            for v in (0, 1):
-                q_V_v = (q_vz[:, 2 * v] + q_vz[:, 2 * v + 1])[1:]
-                contrib = (
-                    q_V_v[valid] * (resid2[valid] + extra_var[valid]) / dt[valid]
-                )
-                SS_v[v] += float(contrib.sum())
-                N_v[v] += float(q_V_v[valid].sum())
-
-        # Transition counts from the product of consecutive V-marginals.
-        q_V0 = q_vz[:, 0] + q_vz[:, 1]
-        q_V1 = q_vz[:, 2] + q_vz[:, 3]
-        n_00 += float((q_V0[:-1] * q_V0[1:]).sum())
-        n_01 += float((q_V0[:-1] * q_V1[1:]).sum())
-        n_10 += float((q_V1[:-1] * q_V0[1:]).sum())
-        n_11 += float((q_V1[:-1] * q_V1[1:]).sum())
-
-        # Observation-variance stats over all trades (size-scaled residuals).
-        denom_t = np.maximum(1.0 + md.log_size_ratio * gamma, 0.1)
-        resid2_obs = (md.Y - mu_f) ** 2
-        for z in (0, 1):
-            q_Z_z = q_vz[:, z] + q_vz[:, 2 + z]
-            SS_z[z] += float((q_Z_z * (resid2_obs + sigma2_f) * denom_t).sum())
-            N_z[z] += float(q_Z_z.sum())
-
-    return {
-        "SS_v": SS_v,
-        "N_v": N_v,
-        "n_00": n_00,
-        "n_01": n_01,
-        "n_10": n_10,
-        "n_11": n_11,
-        "SS_z": SS_z,
-        "N_z": N_z,
-    }
-
-
 def laplace_from_vem(
     vem_output: VEMOutput,
     markets: list[MarketData],
@@ -381,7 +403,10 @@ def laplace_from_vem(
         mu_filt_list.append(mu_f)
         sigma2_filt_list.append(sigma2_f)
 
-    stats = _recompute_mstep_stats(
+    # Same helper the M-step itself calls, so the curvature is evaluated against
+    # the very statistics the estimator optimized rather than a second copy of
+    # the algebra that could drift from it.
+    stats = _mstep_sufficient_stats(
         markets, q_vz_list, mu_filt_list, sigma2_filt_list, params.gamma
     )
     SS_v, N_v = stats["SS_v"], stats["N_v"]
@@ -414,10 +439,7 @@ def laplace_from_vem(
         7: prec_tau2_1,
     }
     for idx, prec in scalar_blocks.items():
-        block_cov, used_fb = _block_cov_from_precision(
-            np.array([[prec]]), _MIN_PRECISION
-        )
-        cov[idx, idx] = block_cov[0, 0]
+        cov[idx, idx], used_fb = _scalar_block_variance(prec)
         if used_fb:
             fallback_dims.append(_PHI_DIMS[idx])
 
