@@ -1,12 +1,14 @@
 """Default model hyperparameters and inference configuration for PMCMC.
 
-Defines three dataclasses consumed throughout the codebase:
+Defines four dataclasses consumed throughout the codebase:
 
-  * ``ModelParams``     — statistical model parameters (regime variances,
-                          insider logistic coefficients, observation noise).
-  * ``PhiPrior``        — the single prior spec the VEM M-step optimizes
-                          against, shared with the Laplace layer and PSIS.
-  * ``InferenceConfig`` — particle filter / iPMCMC tuning knobs.
+  * ``ModelParams``        — statistical model parameters (regime variances,
+                             insider logistic coefficients, observation noise).
+  * ``PhiPrior``           — the single prior spec the VEM M-step optimizes
+                             against, shared with the Laplace layer and PSIS.
+  * ``OnlineScorerConfig`` — forgetting / learning-rate schedule for the
+                             streaming scorer (``src/inference/online_scorer.py``).
+  * ``InferenceConfig``    — particle filter / iPMCMC tuning knobs.
 
 The module-level ``PRODUCTION`` preset is the reference configuration for
 overnight runs; individual scripts may override specific fields via
@@ -221,6 +223,113 @@ class PhiPrior:
             + self._invgamma_logpdf(phi[..., 6], t_a, t_b)
             + self._invgamma_logpdf(phi[..., 7], t_a, t_b)
         )
+
+
+# Cap on OnlineScorerConfig.effective_window. Keeps `forgetting = 1.0` (the
+# frozen no-adaptation anchor) from producing an infinite seed weight; any value
+# far above a realistic market's trade count works, since at that setting the
+# seeded statistics are never consumed.
+_MAX_EFFECTIVE_WINDOW = 1e6
+
+
+@dataclass
+class OnlineScorerConfig:
+    """Forgetting / learning-rate schedule for `OnlineScorer` (§6, live scoring).
+
+    `src.inference.online_scorer.OnlineScorer` adapts the model parameters with
+    Cappé & Moulines (2009) online-EM sufficient-statistic recursions
+
+        S_t = (1 - rho_t) * S_{t-1} + s(trade_t)
+
+    driven by the learning rate ``rho_t`` this config defines. Two schedules:
+
+      * ``"fixed"``: ``rho_t = 1 - forgetting`` — an exponential forgetting
+        factor. The statistics summarize an effective window of
+        ``1 / (1 - forgetting)`` trades, so the estimator tracks a *drifting*
+        parameter forever rather than converging. This is the live-trading
+        setting.
+      * ``"robbins_monro"``: ``rho_t = (t + 1) ** -rho_alpha`` — a decreasing
+        rate satisfying the Robbins-Monro conditions (sum rho = inf,
+        sum rho^2 < inf) for ``rho_alpha`` in ``(0.5, 1]``, so the estimator
+        *converges* to the batch fixed point on a stationary stream. This is
+        the setting for offline replay/validation against batch VEM.
+
+    ``forgetting = 1.0`` (the "fixed" schedule with ``rho_t == 0``) is the
+    degenerate no-adaptation case and is load-bearing: combined with
+    ``n_refresh = None`` it makes `OnlineScorer` a bare, frozen-parameter
+    `ADFFilter`, which is the regression anchor the online path is tested
+    against.
+
+    Attributes:
+        forgetting: ``lambda`` in ``(0, 1]``. Also sets the pseudo-count weight
+            the initial parameters are seeded with (``1 / (1 - lambda)``
+            pseudo-trades, capped), so adaptation starts *at* the supplied
+            batch fit instead of at the prior.
+        n_refresh: Trades between decayed-IRLS refreshes of
+            ``beta_S``/``beta_Z``. ``None`` (default) or a non-positive value
+            never refreshes them — matching `variational_em`'s
+            ``estimate_betas=False`` default, and for the same reason (the ADF
+            E-step does not identify ``Z`` on the synthetic generator; see
+            ARCHITECTURE.md §6.2).
+        rho_schedule: ``"fixed"`` or ``"robbins_monro"``; see above.
+        rho_alpha: Exponent of the Robbins-Monro schedule; must lie in
+            ``(0.5, 1]``. Ignored by the ``"fixed"`` schedule.
+        beta_window: Number of most-recent trades the beta refresh refits on.
+            ``None`` uses `effective_window`, so the beta block forgets on the
+            same timescale as the variance/transition blocks.
+
+    Reference: Cappé, O. & Moulines, E. (2009) "On-line
+    expectation-maximization algorithm for latent data models", JRSS-B 71(3).
+    """
+
+    forgetting: float = 0.98
+    n_refresh: int | None = None
+    rho_schedule: str = "fixed"
+    rho_alpha: float = 0.6
+    beta_window: int | None = None
+
+    def __post_init__(self) -> None:
+        """Reject schedules that would silently produce a non-convergent rate."""
+        if not 0.0 < self.forgetting <= 1.0:
+            raise ValueError(f"forgetting must be in (0, 1]; got {self.forgetting}")
+        if self.rho_schedule not in ("fixed", "robbins_monro"):
+            raise ValueError(
+                "rho_schedule must be 'fixed' or 'robbins_monro'; got "
+                f"{self.rho_schedule!r}"
+            )
+        # Outside (0.5, 1] the Robbins-Monro conditions fail: alpha <= 0.5
+        # leaves sum rho_t^2 divergent (the estimate never settles), alpha > 1
+        # leaves sum rho_t finite (the estimate freezes short of the optimum).
+        if not 0.5 < self.rho_alpha <= 1.0:
+            raise ValueError(f"rho_alpha must be in (0.5, 1]; got {self.rho_alpha}")
+        if self.beta_window is not None and self.beta_window < 2:
+            raise ValueError(f"beta_window must be >= 2; got {self.beta_window}")
+
+    @property
+    def effective_window(self) -> float:
+        """Effective number of trades the decayed statistics summarize.
+
+        The exponential window ``1 / (1 - forgetting)``, capped at
+        `_MAX_EFFECTIVE_WINDOW` so ``forgetting = 1.0`` (no forgetting) stays
+        finite — it is used only as a seed weight there, since that setting
+        disables adaptation entirely.
+        """
+        return min(1.0 / (1.0 - self.forgetting + 1e-12), _MAX_EFFECTIVE_WINDOW)
+
+    def rho(self, t: int) -> float:
+        """Learning rate for the trade at 0-based stream position ``t``.
+
+        Args:
+            t: Number of trades already consumed, i.e. the incoming trade's
+                0-based index in the stream.
+
+        Returns:
+            ``rho_t`` in ``[0, 1]``; exactly ``0.0`` only in the frozen
+            ``forgetting = 1.0`` / ``"fixed"`` case.
+        """
+        if self.rho_schedule == "fixed":
+            return 1.0 - self.forgetting
+        return float((t + 1) ** -self.rho_alpha)
 
 
 @dataclass
