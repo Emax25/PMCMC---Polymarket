@@ -9,6 +9,7 @@ pyarrow>=15.0          # Parquet I/O
 # API clients
 requests>=2.31
 gql[requests]>=3.4     # GraphQL for Goldsky subgraph
+websocket-client>=1.8  # live RTDS trade feed (src/data/rtds.py); optional at import
 
 # Inference diagnostics
 arviz>=0.18            # R-hat, ESS (decision #13)

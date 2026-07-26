@@ -26,9 +26,11 @@ from scripts import (
     pull_data,
     run_ipmcmc,
     run_pg,
+    stream_trades,
     validate_vem,
 )
 from src.analysis.validation import PSIS_KHAT_KEY
+from tests.test_rtds import LIVE_CONDITION_ID, FakeSocket, make_frame
 from src.data.polymarket_api import MarketMeta, RawTrade
 from src.inference.ipmcmc import iPMCMCOutput
 from src.inference.particle_gibbs import PGOutput
@@ -982,3 +984,113 @@ def test_pareto_from_fake_benchmark_json(tmp_path):
     vem_row = table.loc[table["method"] == "vem"].iloc[0]
     assert vem_row["kendall_tau_vs_baseline"] == pytest.approx(0.72)
     assert vem_row["label"] == "vem N=50 it=200"
+
+
+# ---------------- stream_trades.py ----------------
+
+_OTHER_COND_ID = "0xccc000000000000000000000000000000000000000000000000000000000cc01"
+
+
+def _read_jsonl(path: Path) -> list[dict]:
+    """Parse a JSONL capture, asserting every line is a complete JSON object."""
+    records = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        assert line.endswith("}"), f"truncated record: {line!r}"
+        records.append(json.loads(line))
+    return records
+
+
+def _socket_factory(frames: list):
+    """One-shot factory handing `stream_trades.main` a scripted fake socket."""
+    return lambda: FakeSocket(list(frames))
+
+
+def test_stream_trades_records_normalized_jsonl(tmp_path):
+    """Live frames land as one JSON object per line with RawTrade fields."""
+    out = tmp_path / "live" / "trades.jsonl"
+    frames = [make_frame(price=0.11, size=5), make_frame(price=0.22, size=7)]
+
+    rc = stream_trades.main(
+        ["--output", str(out), "--max-trades", "2", "--log-level", "WARNING"],
+        socket_factory=_socket_factory(frames),
+    )
+
+    assert rc == 0
+    records = _read_jsonl(out)
+    assert [r["price"] for r in records] == pytest.approx([0.11, 0.22])
+    assert [r["size"] for r in records] == pytest.approx([5.0, 7.0])
+    assert all(r["wallet"].startswith("0x") for r in records)
+    assert all(r["timestamp"] == 1785027308 for r in records)
+
+
+def test_stream_trades_market_filter_keeps_only_requested_ids(tmp_path):
+    """--markets drops trades from every other condition id."""
+    out = tmp_path / "trades.jsonl"
+    frames = [
+        make_frame(conditionId=_OTHER_COND_ID, price=0.1),
+        make_frame(price=0.2),
+        make_frame(conditionId=_OTHER_COND_ID, price=0.3),
+        make_frame(price=0.4),
+    ]
+
+    rc = stream_trades.main(
+        [
+            "--output",
+            str(out),
+            "--markets",
+            LIVE_CONDITION_ID,
+            "--max-trades",
+            "2",
+            "--log-level",
+            "WARNING",
+        ],
+        socket_factory=_socket_factory(frames),
+    )
+
+    assert rc == 0
+    records = _read_jsonl(out)
+    assert [r["condition_id"] for r in records] == [LIVE_CONDITION_ID] * 2
+    assert [r["price"] for r in records] == pytest.approx([0.2, 0.4])
+
+
+def test_stream_trades_interrupt_leaves_whole_records(tmp_path):
+    """A Ctrl-C mid-stream exits 0 with every written line complete JSON."""
+    out = tmp_path / "trades.jsonl"
+    frames = [
+        make_frame(price=0.5),
+        make_frame(price=0.6),
+        KeyboardInterrupt("ctrl-c"),
+    ]
+
+    rc = stream_trades.main(
+        ["--output", str(out), "--log-level", "WARNING"],
+        socket_factory=_socket_factory(frames),
+    )
+
+    assert rc == 0
+    records = _read_jsonl(out)
+    assert [r["price"] for r in records] == pytest.approx([0.5, 0.6])
+
+
+def test_stream_trades_appends_across_runs_and_compacts_parquet(tmp_path):
+    """--parquet-every compacts the whole append-only capture, not just a slice."""
+    out = tmp_path / "trades.jsonl"
+    parquet = tmp_path / "trades.parquet"
+    common = ["--output", str(out), "--max-trades", "2", "--log-level", "WARNING"]
+
+    rc = stream_trades.main(
+        common, socket_factory=_socket_factory([make_frame(price=0.1)] * 2)
+    )
+    assert rc == 0
+
+    rc = stream_trades.main(
+        common + ["--parquet-every", "2", "--parquet-path", str(parquet)],
+        socket_factory=_socket_factory([make_frame(price=0.9)] * 2),
+    )
+    assert rc == 0
+
+    assert len(_read_jsonl(out)) == 4  # second run appended, did not clobber
+    frame = pd.read_parquet(parquet)
+    assert len(frame) == 4
+    assert set(frame.columns) >= {"timestamp", "price", "size", "wallet", "side"}
+    assert frame["price"].tolist() == pytest.approx([0.1, 0.1, 0.9, 0.9])
