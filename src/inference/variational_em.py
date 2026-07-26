@@ -101,19 +101,11 @@ import warnings
 from dataclasses import dataclass, replace
 
 import numpy as np
-from scipy.special import logsumexp
 
 from config.default_params import InferenceConfig, ModelParams, PhiPrior
-from src.inference.kalman import _kalman_step_all_combos
+from src.inference.adf_filter import S_STD_FLOOR, ADFFilter
 from src.inference.particle_gibbs import MarketData
 from src.utils.transforms import log1pexp, logit, sigmoid
-
-# Below this pooled std of log_size_ratio, treat the size covariate as
-# degenerate (all trades effectively the same size) and skip the 0.5/s_S
-# scale factor. A truly constant column has std ~1e-16 from floating-point
-# rounding, not exactly 0.0, so the guard uses a floor well above that noise
-# floor rather than an exact `s_S > 0` check.
-_S_STD_FLOOR = 1e-8
 
 # The Cauchy(0, scale) weakly-informative prior on each standardized beta
 # (Gelman et al. 2008) now lives in `config.default_params.PhiPrior`
@@ -150,7 +142,7 @@ class VEMOutput:
     n_iter_run: int              # actual EM iterations completed
     m_S: float                   # pooled mean of log_size_ratio (standardization)
     s_S: float                   # pooled std of log_size_ratio; ~0 if degenerate
-                                  # (constant size) -- see _S_STD_FLOOR
+                                  # (constant size) -- see S_STD_FLOOR
     m_Z: float                   # running pooled mean of E[Z_prev] (centering)
     theta_w_logit_mean: np.ndarray  # (n_wallets,) logit-normal posterior mean = Newton mode
     theta_w_logit_var: np.ndarray   # (n_wallets,) logit-normal posterior var = 1/curvature
@@ -173,6 +165,11 @@ def _vem_e_step(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
     """Single-mode ADF forward pass for one market.
 
+    A thin batch driver over `ADFFilter`: it owns the output arrays and the
+    log-marginal accumulator, while every per-trade recursion (priors, the
+    4-combo Kalman update, the assumed-density collapse) lives in
+    `ADFFilter.step`, so the batch and live paths can never diverge.
+
     Args:
         Y: (T,) logit-price observations.
         delta: (T,) inter-trade times; delta[0] = 0.
@@ -181,7 +178,7 @@ def _vem_e_step(
         theta_w: (n_wallets,) current per-wallet propensity estimates.
         params: Current model parameters.
         m_S: Pooled mean of log_size_ratio, for standardizing the size covariate.
-        s_S: Pooled std of log_size_ratio; below `_S_STD_FLOOR` (degenerate
+        s_S: Pooled std of log_size_ratio; at or below `S_STD_FLOOR` (degenerate
             constant-size market/dataset), the 0.5/s_S scale factor is
             skipped and only centering is applied, avoiding an unstable or
             divide-by-zero scale factor.
@@ -195,91 +192,19 @@ def _vem_e_step(
         log_marginal: scalar approximate log p(Y | params, theta_w).
     """
     T = len(Y)
-    logit_theta = logit(theta_w)
-    q_01 = params.q_01
-    q_10 = params.q_10
-
-    denom_q = q_01 + q_10
-    rho_V = q_01 / denom_q if denom_q > 0 else 0.5
-
-    mu = np.zeros(1)
-    sigma2 = np.array([params.s0_2])
+    adf = ADFFilter(params, theta_w, m_S, s_S, m_Z)
 
     q_vz = np.empty((T, 4))
     mu_filt = np.empty(T)
     sigma2_filt = np.empty(T)
     log_marginal = 0.0
 
-    prev_q_V = np.array([1.0 - rho_V, rho_V])
-    prev_E_Z = 0.0
-
     for t in range(T):
-        if t == 0:
-            log_p_V = np.array(
-                [
-                    np.log(max(1.0 - rho_V, 1e-300)),
-                    np.log(max(rho_V, 1e-300)),
-                ]
-            )
-            log_p_Z = np.array([0.0, -500.0])
-        else:
-            p_V0 = prev_q_V[0] * (1.0 - q_01) + prev_q_V[1] * q_10
-            p_V1 = prev_q_V[0] * q_01 + prev_q_V[1] * (1.0 - q_10)
-            log_p_V = np.array(
-                [np.log(max(p_V0, 1e-300)), np.log(max(p_V1, 1e-300))]
-            )
-            # Standardize/center covariates (Gelman et al. 2008) before the
-            # logistic predictor: no free intercept here, theta_w's Beta
-            # hierarchy carries the level. Guard s_S below a small floor
-            # (degenerate/near-constant-size data) rather than exactly 0:
-            # a constant column's std is only ~machine-epsilon due to
-            # floating-point rounding, not exactly zero, and dividing by
-            # that residual noise would amplify it into an arbitrary value.
-            x_S_centered = float(log_size_ratio[t]) - m_S
-            x_S_tilde = (
-                x_S_centered * 0.5 / s_S if s_S > _S_STD_FLOOR else x_S_centered
-            )
-            x_Z_tilde = prev_E_Z - m_Z
-            logit_pi = (
-                float(logit_theta[int(wallet_ids[t])])
-                + params.beta_S * x_S_tilde
-                + params.beta_Z * x_Z_tilde
-            )
-            lp = float(log1pexp(logit_pi))
-            log_p_Z = np.array([-lp, logit_pi - lp])
-
-        log_prior_joint = (log_p_V[:, None] + log_p_Z[None, :]).reshape(4)
-
-        mu_combos, sigma2_combos, log_lik = _kalman_step_all_combos(
-            mu,
-            sigma2,
-            float(Y[t]),
-            float(delta[t]),
-            float(log_size_ratio[t]),
-            params.sigma2_0,
-            params.sigma2_1,
-            params.tau2_0,
-            params.tau2_1,
-            params.gamma,
-        )
-
-        log_joint = log_prior_joint + log_lik[0]
-        log_Z_t = float(logsumexp(log_joint))
-        log_marginal += log_Z_t
-        q_t = np.exp(log_joint - log_Z_t)
-        q_vz[t] = q_t
-
-        mu_c = mu_combos[0]
-        sigma2_c = sigma2_combos[0]
-        mu_mixed = float(q_t @ mu_c)
-        sigma2_mixed = float(q_t @ (sigma2_c + (mu_c - mu_mixed) ** 2))
-        mu_filt[t] = mu_mixed
-        sigma2_filt[t] = sigma2_mixed
-
-        mu = np.array([mu_mixed])
-        sigma2 = np.array([sigma2_mixed])
-        prev_q_V = np.array([q_t[0] + q_t[1], q_t[2] + q_t[3]])
-        prev_E_Z = float(q_t[1] + q_t[3])
+        out = adf.step(Y[t], delta[t], log_size_ratio[t], wallet_ids[t])
+        q_vz[t] = out.q_vz
+        mu_filt[t] = out.X_mean
+        sigma2_filt[t] = out.X_var
+        log_marginal += out.log_evidence
 
     return q_vz, mu_filt, sigma2_filt, log_marginal
 
@@ -302,7 +227,7 @@ def _pooled_zj_covariates(
         markets: Input market data.
         q_vz_list: Per-market soft (V,Z) assignments, each (T_k, 4).
         m_S: Pooled mean of log_size_ratio, for standardizing the size covariate.
-        s_S: Pooled std of log_size_ratio; see `_S_STD_FLOOR` for the
+        s_S: Pooled std of log_size_ratio; see `S_STD_FLOOR` for the
             degenerate-scale fallback.
         m_Z: Pooled mean of E[Z_prev], for centering the persistence covariate.
 
@@ -319,7 +244,7 @@ def _pooled_zj_covariates(
         if len(md.Y) < 2:
             continue
         x_S_centered = md.log_size_ratio[1:].astype(float) - m_S
-        x_S = x_S_centered * 0.5 / s_S if s_S > _S_STD_FLOOR else x_S_centered
+        x_S = x_S_centered * 0.5 / s_S if s_S > S_STD_FLOOR else x_S_centered
         E_Z = q_vz[:, 1] + q_vz[:, 3]
         wallet_parts.append(md.wallet_ids[1:])
         x_S_parts.append(x_S)
@@ -389,7 +314,7 @@ def _update_theta_w(
         beta_Z: Previous iteration's internal-scale persistence coefficient
             (offset).
         m_S: Pooled mean of log_size_ratio (standardization).
-        s_S: Pooled std of log_size_ratio (standardization); see `_S_STD_FLOOR`.
+        s_S: Pooled std of log_size_ratio (standardization); see `S_STD_FLOOR`.
         m_Z: Pooled mean of E[Z_prev] (centering).
         a: Beta prior shape (successes pseudo-count).
         b: Beta prior shape (failures pseudo-count).
@@ -541,7 +466,7 @@ def _update_beta_irls(
             the fixed offset, per the ECM block order — these are the
             block-(a) values updated earlier in this same M-step).
         m_S: Pooled mean of log_size_ratio (standardization).
-        s_S: Pooled std of log_size_ratio (standardization); see `_S_STD_FLOOR`.
+        s_S: Pooled std of log_size_ratio (standardization); see `S_STD_FLOOR`.
         m_Z: Pooled mean of E[Z_prev] (centering).
         beta_S_init: Warm-start internal-scale beta_S (previous iteration).
         beta_Z_init: Warm-start internal-scale beta_Z (previous iteration).
@@ -746,7 +671,7 @@ def _vem_m_step(
         theta_w: Current per-wallet propensity estimates.
         n_wallets: Total wallet count.
         m_S: Pooled mean of log_size_ratio (standardization).
-        s_S: Pooled std of log_size_ratio (standardization); see `_S_STD_FLOOR`.
+        s_S: Pooled std of log_size_ratio (standardization); see `S_STD_FLOOR`.
         m_Z: Pooled mean of E[Z_prev] (centering).
         prior: The single M-step prior spec (`PhiPrior`); `None` resolves to
             `PhiPrior()` (the behaviour-preserving defaults). Supplies the
@@ -1003,7 +928,7 @@ def variational_em(
 
     # Back-transform beta_S to original log_size_ratio units (§ module
     # docstring); beta_Z is unaffected since x_Z~ is centering-only.
-    if s_S > _S_STD_FLOOR:
+    if s_S > S_STD_FLOOR:
         beta_S_orig = params.beta_S * 0.5 / s_S
     else:
         beta_S_orig = params.beta_S

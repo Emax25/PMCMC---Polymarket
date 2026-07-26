@@ -879,6 +879,25 @@ def test_mstep_prior_refactor_preserves_params():
         assert rel < 1e-6, f"{name} shift {rel:.2e} exceeds the negligible band"
 
 
+def test_e_step_delegates_to_adf_filter_with_no_duplicate_recursion():
+    """`_vem_e_step` is a thin driver over `ADFFilter`, not a second copy of it.
+
+    The U4 refactor moved the per-trade recursion into `src.inference.adf_filter`
+    so the batch and live-scoring paths share one implementation. A future edit
+    that re-inlines the loop body here would reintroduce exactly the drift the
+    extraction removed, and the identity fixture in tests/test_adf_filter.py
+    would keep passing while the two paths silently diverged — so the delegation
+    itself is asserted structurally.
+    """
+    src = inspect.getsource(_vem_e_step)
+    assert "ADFFilter(" in src, "_vem_e_step no longer drives ADFFilter"
+    for banned in ("_kalman_step_all_combos", "logsumexp", "log_p_Z", "prev_E_Z"):
+        assert banned not in src, (
+            f"'{banned}' is back in _vem_e_step — the per-trade recursion "
+            "belongs to ADFFilter.step"
+        )
+
+
 def test_mstep_body_has_no_hardcoded_prior_constants():
     """Prior-consistency audit: `_vem_m_step` sources all priors from PhiPrior.
 
