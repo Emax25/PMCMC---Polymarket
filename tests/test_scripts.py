@@ -17,6 +17,7 @@ import pytest
 
 matplotlib.use("Agg")
 
+from config.default_params import ModelParams, OnlineScorerConfig
 from scripts import (
     _runner,
     benchmark,
@@ -26,6 +27,7 @@ from scripts import (
     pull_data,
     run_ipmcmc,
     run_pg,
+    score_stream,
     stream_trades,
     validate_vem,
 )
@@ -33,7 +35,10 @@ from src.analysis.validation import PSIS_KHAT_KEY
 from tests.test_rtds import LIVE_CONDITION_ID, FakeSocket, make_frame
 from src.data.polymarket_api import MarketMeta, RawTrade
 from src.inference.ipmcmc import iPMCMCOutput
+from src.inference.online_scorer import OnlineScorer
 from src.inference.particle_gibbs import PGOutput
+from src.inference.variational_em import VEMOutput
+from src.utils.transforms import logit
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -1208,3 +1213,284 @@ def test_stream_trades_appends_across_runs_and_compacts_parquet(tmp_path):
     assert len(frame) == 4
     assert set(frame.columns) >= {"timestamp", "price", "size", "wallet", "side"}
     assert frame["price"].tolist() == pytest.approx([0.1, 0.1, 0.9, 0.9])
+
+
+# ---------------- score_stream.py ----------------
+
+# Wallet addresses of the streaming fixtures, in the order a fresh WalletIndex
+# would assign ids to them.
+_STREAM_WALLETS = ("0xw0", "0xw1", "0xw2")
+
+
+def _raw_trade(i: int, *, ts: float, price: float, size: float, wallet: str) -> dict:
+    """Build one `stream_trades.py`-shaped raw trade record."""
+    return {
+        "timestamp": ts,
+        "price": price,
+        "size": size,
+        "wallet": wallet,
+        "side": "BUY",
+        "transaction_hash": f"0x{i:06d}",
+        "condition_id": _COND_ID,
+        "asset_id": "1",
+    }
+
+
+def _write_trades(path: Path, records: list[dict]) -> Path:
+    """Write raw trade records as a JSONL capture, one object per line."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "".join(json.dumps(r) + "\n" for r in records), encoding="utf-8"
+    )
+    return path
+
+
+def _stream_fixture(n: int = 40, *, constant_size: bool = False) -> list[dict]:
+    """Deterministic pseudo-market: strictly ordered trades, mixed wallets."""
+    rng = np.random.default_rng(7)
+    prices = np.clip(0.4 + np.cumsum(rng.normal(0.0, 0.02, n)), 0.05, 0.95)
+    sizes = np.full(n, 12.0) if constant_size else 5.0 + 40.0 * rng.random(n)
+    return [
+        _raw_trade(
+            i,
+            ts=1_700_000_000 + 3 * i,
+            price=float(prices[i]),
+            size=float(sizes[i]),
+            wallet=_STREAM_WALLETS[i % len(_STREAM_WALLETS)],
+        )
+        for i in range(n)
+    ]
+
+
+def _fake_vem(theta_w: np.ndarray) -> VEMOutput:
+    """A minimal fitted VEMOutput carrying non-trivial centering constants."""
+    params = ModelParams(
+        sigma2_0=0.05,
+        sigma2_1=0.4,
+        tau2_0=0.3,
+        tau2_1=0.01,
+        beta_S=0.8,
+        beta_Z=0.5,
+    )
+    n = theta_w.size
+    return VEMOutput(
+        params=params,
+        theta_w=theta_w,
+        Z_prob=[],
+        V_prob=[],
+        X_mean=[],
+        elbo_trace=np.zeros(1),
+        n_iter_run=1,
+        # Deliberately away from (0, 1, 0): a scorer that dropped them would
+        # still run, and only these values make the check bite.
+        m_S=0.3,
+        s_S=1.7,
+        m_Z=0.2,
+        theta_w_logit_mean=logit(theta_w),
+        theta_w_logit_var=np.full(n, 0.1),
+        beta_S_orig=0.8,
+        beta_Z_orig=0.5,
+        beta_fisher_info=np.eye(2),
+    )
+
+
+def test_score_stream_replay_is_byte_identical_across_runs(tmp_path):
+    """Same capture + same warm start replays to the same bytes twice."""
+    capture = _write_trades(tmp_path / "trades.jsonl", _stream_fixture())
+    vem = _fake_vem(np.array([0.1, 0.05, 0.2]))
+    warm = tmp_path / "warm.json"
+    warm.write_text(
+        json.dumps(score_stream.warm_start_payload(vem)), encoding="utf-8"
+    )
+
+    outputs = []
+    for run in ("a", "b"):
+        out = tmp_path / f"scores_{run}.jsonl"
+        rc = score_stream.main(
+            [
+                "--replay", str(capture),
+                "--warm-start", str(warm),
+                "--output", str(out),
+                "--log-level", "WARNING",
+            ]
+        )
+        assert rc == 0
+        outputs.append(out.read_bytes())
+
+    assert outputs[0] == outputs[1]
+    assert len(_read_jsonl(tmp_path / "scores_a.jsonl")) == 40
+
+
+def test_score_stream_replay_has_no_lookahead(tmp_path):
+    """Deleting the tail of a capture leaves every surviving score unchanged."""
+    records = _stream_fixture(40)
+    full = _write_trades(tmp_path / "full.jsonl", records)
+    prefix = _write_trades(tmp_path / "prefix.jsonl", records[:25])
+
+    scores = []
+    for name, capture in (("full", full), ("prefix", prefix)):
+        out = tmp_path / f"{name}.scores.jsonl"
+        # Default forgetting (adaptation on) is the strong version of the
+        # invariant: the parameters themselves must depend only on the past.
+        assert score_stream.main(
+            ["--replay", str(capture), "--output", str(out), "--log-level", "WARNING"]
+        ) == 0
+        scores.append(out.read_text(encoding="utf-8").splitlines())
+
+    assert len(scores[0]) == 40 and len(scores[1]) == 25
+    assert scores[0][:25] == scores[1]
+
+
+def test_score_stream_warm_start_restores_centering_constants(tmp_path):
+    """A warm-started replay reproduces an in-process OnlineScorer exactly."""
+    # Constant sizes pin log(S / S_bar) == 0 for every trade, so the reference
+    # run needs no feature bookkeeping and the only thing (m_S, s_S) can do is
+    # shift the logistic predictor — which is precisely what is under test.
+    records = _stream_fixture(30, constant_size=True)
+    capture = _write_trades(tmp_path / "trades.jsonl", records)
+
+    theta_w = np.array([0.03, 0.11, 0.27])
+    vem = _fake_vem(theta_w)
+    warm = tmp_path / "warm.json"
+    warm.write_text(json.dumps(score_stream.warm_start_payload(vem)), encoding="utf-8")
+    index = tmp_path / "wallet_index.json"
+    index.write_text(
+        json.dumps({w: i for i, w in enumerate(_STREAM_WALLETS)}), encoding="utf-8"
+    )
+
+    out = tmp_path / "scores.jsonl"
+    assert score_stream.main(
+        [
+            "--replay", str(capture),
+            "--warm-start", str(warm),
+            "--wallet-index", str(index),
+            "--output", str(out),
+            "--log-level", "WARNING",
+        ]
+    ) == 0
+
+    reference = OnlineScorer(
+        vem.params,
+        vem.theta_w,
+        vem.m_S,
+        vem.s_S,
+        vem.m_Z,
+        config=OnlineScorerConfig(),
+    )
+    expected = []
+    prev_ts = None
+    for i, rec in enumerate(records):
+        delta = 0.0 if prev_ts is None else rec["timestamp"] - prev_ts
+        prev_ts = rec["timestamp"]
+        step = reference.step(
+            float(logit(rec["price"])), delta, 0.0, i % len(_STREAM_WALLETS)
+        )
+        expected.append(step.Z_prob)
+
+    # Exact, not approximate: JSON round-trips a float's repr losslessly, so
+    # any difference at all would mean the CLI took a different code path.
+    got = [r["p_z"] for r in _read_jsonl(out)]
+    assert got == expected
+
+    # And the constants are load-bearing: a cold start scores differently.
+    cold = tmp_path / "cold.jsonl"
+    assert score_stream.main(
+        ["--replay", str(capture), "--output", str(cold), "--log-level", "WARNING"]
+    ) == 0
+    assert [r["p_z"] for r in _read_jsonl(cold)] != pytest.approx(expected)
+
+
+def test_score_stream_replay_sorts_out_of_order_input(tmp_path):
+    """Replay imposes (timestamp, tx_hash) order regardless of file order."""
+    records = _stream_fixture(12)
+    # Same-second pair so the hash tie-break is exercised, then a shuffle.
+    records[5]["timestamp"] = records[4]["timestamp"]
+    shuffled = _write_trades(tmp_path / "shuffled.jsonl", list(reversed(records)))
+    ordered = _write_trades(
+        tmp_path / "ordered.jsonl",
+        sorted(records, key=lambda r: (r["timestamp"], r["transaction_hash"])),
+    )
+
+    outs = []
+    for name, capture in (("shuffled", shuffled), ("ordered", ordered)):
+        out = tmp_path / f"{name}.scores.jsonl"
+        assert score_stream.main(
+            ["--replay", str(capture), "--output", str(out), "--log-level", "WARNING"]
+        ) == 0
+        outs.append(out.read_bytes())
+
+    assert outs[0] == outs[1]
+    ts = [r["ts"] for r in _read_jsonl(tmp_path / "shuffled.scores.jsonl")]
+    assert ts == sorted(ts)
+
+
+def test_score_stream_live_rejects_out_of_order_input(tmp_path, caplog):
+    """Live mode refuses to reorder a backwards sink and says why."""
+    records = _stream_fixture(6)
+    records[3]["timestamp"] = records[0]["timestamp"] - 60
+    capture = _write_trades(tmp_path / "trades.jsonl", records)
+    out = tmp_path / "scores.jsonl"
+
+    with caplog.at_level("ERROR"):
+        rc = score_stream.main(
+            ["--live", str(capture), "--output", str(out), "--log-level", "ERROR"]
+        )
+
+    assert rc == 1
+    assert "went backwards" in caplog.text
+    # The three trades that arrived in order were still scored and flushed.
+    assert len(_read_jsonl(out)) == 3
+
+
+def test_score_stream_live_scores_arrival_order_and_appends(tmp_path):
+    """Live mode consumes an in-order sink and appends across restarts."""
+    records = _stream_fixture(8)
+    capture = _write_trades(tmp_path / "trades.jsonl", records)
+    out = tmp_path / "scores.jsonl"
+
+    for _ in range(2):
+        # --max-trades bounds the tail so the poll loop is never entered.
+        assert score_stream.main(
+            [
+                "--live", str(capture),
+                "--output", str(out),
+                "--max-trades", "8",
+                "--log-level", "WARNING",
+            ]
+        ) == 0
+
+    scored = _read_jsonl(out)
+    assert len(scored) == 16  # second run appended, did not clobber
+    assert [r["ts"] for r in scored[:8]] == [r["timestamp"] for r in records]
+
+
+def test_score_stream_replays_parquet_and_skips_dirty_rows(tmp_path):
+    """Parquet replay matches JSONL, and unusable rows are dropped not scored."""
+    records = _stream_fixture(10)
+    dirty = records + [
+        _raw_trade(900, ts=1_700_000_100, price=1.0, size=5.0, wallet="0xw0"),
+        _raw_trade(901, ts=1_700_000_101, price=0.5, size=0.0, wallet="0xw0"),
+        dict(records[0]),  # duplicate transaction_hash
+    ]
+    jsonl_out = tmp_path / "jsonl.scores.jsonl"
+    assert score_stream.main(
+        [
+            "--replay", str(_write_trades(tmp_path / "trades.jsonl", dirty)),
+            "--output", str(jsonl_out),
+            "--log-level", "WARNING",
+        ]
+    ) == 0
+
+    parquet = tmp_path / "trades.parquet"
+    pd.DataFrame(dirty).to_parquet(parquet, index=False)
+    parquet_out = tmp_path / "parquet.scores.jsonl"
+    assert score_stream.main(
+        [
+            "--replay", str(parquet),
+            "--output", str(parquet_out),
+            "--log-level", "WARNING",
+        ]
+    ) == 0
+
+    assert len(_read_jsonl(jsonl_out)) == 10
+    assert jsonl_out.read_bytes() == parquet_out.read_bytes()
