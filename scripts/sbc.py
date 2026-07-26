@@ -5,9 +5,7 @@ The command has two modes over one append-only JSONL store
 
   * **run** (default) — the replicate harness: draw ``phi`` from the prior,
     simulate a prior-predictive dataset, fit VEM + Laplace, and append one row
-    per replicate. Resumable via ``--resume``, parallel via ``--n-jobs``. *Not
-    yet implemented — its flags are declared here so the analysis mode and the
-    harness share one argument surface.*
+    per replicate. Resumable via ``--resume``, parallel via ``--n-jobs``.
   * **analyze** (``--analyze``) — read the store back and emit the calibration
     evidence: per-component rank-uniformity verdicts, the nominal-90% coverage
     table, failure accounting, a JSON summary, and the paper figures.
@@ -27,6 +25,9 @@ exists to detect. Read the ``FLAGGED`` block and the failure rate before
 quoting any single number.
 
 Examples:
+    # Run 200 replicates into the default store, 8 at a time, resuming a kill
+    python -m scripts.sbc --n-sims 200 --n-jobs 8 --resume
+
     # Analyse a completed run into figures + summary.json
     python -m scripts.sbc --analyze
 
@@ -40,6 +41,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+import time
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -48,9 +50,12 @@ from src.analysis.plots import figure_sbc_ranks, save_paper_figure, set_paper_st
 from src.analysis.sbc import (
     DEFAULT_ALPHA,
     RANK_INTERPRETATION_KEY,
+    ReplicateSize,
     SBCSummary,
     analyze,
+    default_sbc_prior,
     load_results,
+    run_sbc,
     write_summary,
 )
 
@@ -307,6 +312,49 @@ def _format_report(summary: SBCSummary) -> str:
 # ---------------- Entrypoint ----------------
 
 
+def _run_harness(args: argparse.Namespace) -> int:
+    """Run replicates into the JSONL store and report what this call produced.
+
+    Args:
+        args: Parsed namespace carrying the run-mode flags.
+
+    Returns:
+        Exit code 0.
+
+    Raises:
+        ValueError: If the prior cannot be sampled (P11); see
+            ``default_sbc_prior``.
+    """
+    size = ReplicateSize(K=args.sim_K, T=args.sim_T, n_wallets=args.sim_wallets)
+    seeds = [args.seed_base + i for i in range(args.n_sims)]
+    started = time.perf_counter()
+    rows = run_sbc(
+        seeds,
+        size=size,
+        prior=default_sbc_prior(),
+        L=args.posterior_draws,
+        out_path=args.out,
+        n_jobs=args.n_jobs,
+        resume=args.resume,
+    )
+    elapsed = time.perf_counter() - started
+    n_failed = sum(1 for row in rows if row["flags"]["failed"])
+    print(
+        "\n".join(
+            [
+                "=== SBC harness ===",
+                f"Replicates computed this run: {len(rows)} of {len(seeds)} "
+                f"requested ({n_failed} failed) in {elapsed:.1f}s",
+                f"Size: K={size.K} T={size.T} wallets={size.n_wallets}  "
+                f"L={args.posterior_draws}  n_jobs={args.n_jobs}",
+                f"Store: {args.out}",
+                f"Next: python -m scripts.sbc --analyze --in {args.out}",
+            ],
+        ),
+    )
+    return 0
+
+
 def _run_analysis(args: argparse.Namespace) -> int:
     """Analyse an existing results store into a report, figures, and summary JSON."""
     rows = load_results(args.in_path)
@@ -342,8 +390,7 @@ def main(argv: list[str] | None = None) -> int:
         Exit code 0 on success.
 
     Raises:
-        NotImplementedError: In run mode — the replicate harness lands in a
-            follow-up unit; its flags are declared so the surface is stable.
+        ValueError: In run mode, if the SBC prior cannot be sampled (P11).
     """
     args = _parse_args(argv)
     logging.basicConfig(
@@ -352,7 +399,7 @@ def main(argv: list[str] | None = None) -> int:
         datefmt="%H:%M:%S",
     )
     if not args.analyze:
-        raise NotImplementedError("harness lands in U2")
+        return _run_harness(args)
     return _run_analysis(args)
 
 

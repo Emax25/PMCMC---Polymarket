@@ -2,14 +2,13 @@
 
 This module hosts **both halves** of the SBC pipeline:
 
-  * *Replicate execution* — draw ``phi`` from the prior, simulate a
-    prior-predictive dataset, fit, and emit one result row. That half lands
-    with the harness unit; the row schema it must produce is pinned by
-    ``SBC_SCHEMA_VERSION`` and spelled out below so the two halves can be
-    built independently.
-  * *Analysis* (this file today) — read the accumulated JSONL back and turn it
-    into the calibration evidence: per-component rank uniformity, nominal-90%
-    interval coverage, failure accounting, and a JSON summary.
+  * *Replicate execution* (``run_replicate`` / ``run_sbc``) — draw ``phi`` from
+    the prior, simulate a prior-predictive dataset, fit VEM + Laplace, and emit
+    one result row per replicate into an append-only JSONL store. The row
+    schema is pinned by ``SBC_SCHEMA_VERSION`` and spelled out below.
+  * *Analysis* — read the accumulated JSONL back and turn it into the
+    calibration evidence: per-component rank uniformity, nominal-90% interval
+    coverage, failure accounting, and a JSON summary.
 
 The halves are decoupled through the on-disk JSONL store (plan
 ``2026-07-23-003`` KTD4): a killed run resumes, and re-analysing a finished run
@@ -60,12 +59,22 @@ from __future__ import annotations
 import json
 import logging
 import math
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Sequence
 
 import numpy as np
+from joblib import Parallel, delayed
 from scipy.stats import binom, chi2, norm
+
+from config.default_params import InferenceConfig, ModelParams, PhiPrior
+from src.data.synthetic import (
+    SyntheticMarket,
+    generate_prior_predictive_market,
+    params_from_prior,
+)
+from src.utils.transforms import logit
 
 log = logging.getLogger(__name__)
 
@@ -73,9 +82,11 @@ SBC_SCHEMA_VERSION = 1
 
 # Canonical phi order. Deliberately restated rather than imported from
 # `src.inference.diagnostics.PHI_PARAM_NAMES` or `src.inference.laplace`: both
-# pull the PG/iPMCMC inference stack in transitively, and the analysis path here
-# only ever reads JSON. `tests/test_sbc.py` asserts this tuple still equals
-# `PHI_PARAM_NAMES`, so the duplication cannot drift unnoticed.
+# pull the PG/iPMCMC inference stack in transitively, and the analysis half of
+# this module only ever reads JSON (the replicate half defers those imports into
+# `run_replicate` so `--analyze` never pays for them). `tests/test_sbc.py`
+# asserts this tuple still equals `PHI_PARAM_NAMES` and `PhiPosterior.dims`, so
+# the duplication cannot drift unnoticed.
 PHI_COMPONENTS = (
     "sigma2_0",
     "sigma2_1",
@@ -1081,3 +1092,456 @@ def write_summary(
         payload.update(extra)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return path
+
+
+# ---------------- Replicate execution ----------------
+
+# VEM fit budget per replicate. Convergence is *declared* by comparing
+# `n_iter_run` against this cap, so it has to be pinned here rather than left to
+# `variational_em`'s own default: a replicate that merely ran out of iterations
+# must be flagged degenerate (R5), not counted as a converged fit.
+#
+# 200, not the 50 used elsewhere in the repo: measured on prior-predictive data
+# at the default (K=3, T=400, 30 wallets) size, a replicate needs ~86 iterations
+# to meet `_VEM_TOL`, and stopping at 50 leaves the log-marginal ~800 nats short
+# of the optimum. Ranking the truth against the Laplace curvature at a
+# *non-optimal* point is not an approximation of the posterior at all, so the
+# cap must be loose enough that hitting it is the exception R5 treats it as.
+_VEM_MAX_ITER = 200
+_VEM_TOL = 1e-3
+
+# Wallets whose theta_w interval is scored, taken as the *first* indices of the
+# concatenated wallet axis (i.e. the first wallets of the first market — see
+# `run_replicate` for the per-market wallet offsetting). A fixed rule rather
+# than a random subsample: a seed-dependent selection would make the pooled
+# wallet coverage depend on the draw as well as on the fit.
+_THETA_SUBSAMPLE = 10
+
+
+@dataclass(frozen=True)
+class ReplicateSize:
+    """Simulation size for one SBC replicate.
+
+    Attributes:
+        K: Markets simulated per replicate.
+        T: Trades per simulated market.
+        n_wallets: Wallets *per market*. Wallet ids are offset per market when
+            the markets are pooled for the fit, so a replicate's fit carries
+            ``K * n_wallets`` distinct wallets (see ``run_replicate``).
+    """
+
+    K: int = 3
+    T: int = 400
+    n_wallets: int = 30
+
+    def to_dict(self) -> dict[str, int]:
+        """Row-schema view of the size, as written to the ``size`` field."""
+        return {"K": self.K, "T": self.T, "n_wallets": self.n_wallets}
+
+
+def default_sbc_prior() -> PhiPrior:
+    """Return the prior the SBC draws and the fits are both scored against.
+
+    SBC is only valid when the density the data is simulated from is exactly
+    the density inference assumes (plan ``2026-07-23-003`` R1/KTD5), so this
+    single seam supplies the prior to the generator, to the VEM M-step, and to
+    the Laplace curvature alike.
+
+    Note:
+        The shipped ``PhiPrior()`` defaults put IG(1e-9, 1e-9) on ``tau2`` — a
+        deliberately vanishing placeholder that regularizes the M-step without
+        perturbing it (STATUS.md P11). It cannot be *sampled*: draws span
+        hundreds of orders of magnitude and overflow. Until P11 replaces it with
+        a proper prior, ``run_sbc`` raises the ``params_from_prior`` ValueError
+        naming P11 rather than producing meaningless replicates.
+
+    Returns:
+        The ``PhiPrior`` every SBC replicate simulates from and fits against.
+    """
+    return PhiPrior()
+
+
+def _phi_true(params: ModelParams) -> dict[str, float]:
+    """Extract the eight sampled phi components from a prior draw, by name."""
+    return {name: float(getattr(params, name)) for name in PHI_COMPONENTS}
+
+
+def _to_market_data(market: SyntheticMarket, *, wallet_offset: int) -> Any:
+    """Convert one synthetic market to inference input, shifting its wallet ids.
+
+    Each ``generate_market`` call draws its *own* ``theta_w`` vector over ids
+    ``0 .. n_wallets - 1``, so pooling K markets under the raw ids would give one
+    wallet K contradictory truths and the pooled model would no longer be the
+    model the data came from — which invalidates SBC. Offsetting market ``k``'s
+    ids by ``k * n_wallets`` makes every wallet appear in exactly one market,
+    restoring the exact prior-predictive correspondence.
+
+    Args:
+        market: The simulated market.
+        wallet_offset: Added to every wallet id of this market.
+
+    Returns:
+        A ``MarketData`` (typed loosely to keep the inference import deferred).
+    """
+    # Deferred for the same reason as the fitting stack in `run_replicate`:
+    # `particle_gibbs` pulls the numba kernels the analysis path never needs.
+    from src.inference.particle_gibbs import MarketData
+
+    return MarketData(
+        Y=market.Y,
+        delta=market.delta,
+        log_size_ratio=np.log(market.S / market.S_bar),
+        wallet_ids=market.wallet_ids + wallet_offset,
+    )
+
+
+def _phi_ranks_and_hits(
+    draws: np.ndarray,
+    phi_true: dict[str, float],
+    dims: Sequence[str],
+) -> tuple[dict[str, int], dict[str, bool]]:
+    """Rank each true component among the posterior draws and test its interval.
+
+    The rank is ``#{l : phi_draw_l < phi_true}`` in ``{0, ..., L}`` (Talts et
+    al. 2018) and the interval is the central ``NOMINAL_COVERAGE`` empirical
+    quantile pair of the *same* draws, so a coverage miss and a rank extreme are
+    two readings of one posterior sample rather than two approximations of it.
+
+    Args:
+        draws: Constrained posterior draws, shape ``(L, 8)`` in ``dims`` order.
+        phi_true: The true value per component.
+        dims: Component order of ``draws``' columns.
+
+    Returns:
+        ``(ranks, hits90)``, both keyed by component name.
+    """
+    tail = (1.0 - NOMINAL_COVERAGE) / 2.0
+    index = {name: i for i, name in enumerate(dims)}
+    ranks: dict[str, int] = {}
+    hits: dict[str, bool] = {}
+    for name in PHI_COMPONENTS:
+        column = np.asarray(draws[:, index[name]], dtype=float)
+        truth = phi_true[name]
+        ranks[name] = int(np.count_nonzero(column < truth))
+        lo, hi = np.quantile(column, [tail, 1.0 - tail])
+        hits[name] = bool(lo <= truth <= hi)
+    return ranks, hits
+
+
+def _theta_interval_hits(
+    logit_mean: np.ndarray,
+    logit_var: np.ndarray,
+    theta_true: np.ndarray,
+) -> list[bool]:
+    """Test the logit-normal wallet intervals against the simulated truths.
+
+    The VEM M-step reports each wallet as a Gaussian on the logit scale (mode
+    and inverse curvature), so the central ``NOMINAL_COVERAGE`` interval is
+    ``mean +/- z * sd`` there and the truth is compared after the same
+    transform — equivalent to, and better conditioned than, back-transforming
+    the interval to the probability scale.
+
+    Args:
+        logit_mean: Per-wallet logit-scale posterior mode, shape ``(W,)``.
+        logit_var: Per-wallet logit-scale posterior variance, shape ``(W,)``.
+        theta_true: Simulated wallet propensities, shape ``(W,)``.
+
+    Returns:
+        Hit indicators for the first ``_THETA_SUBSAMPLE`` wallets.
+    """
+    n = min(_THETA_SUBSAMPLE, theta_true.size)
+    z = float(norm.isf((1.0 - NOMINAL_COVERAGE) / 2.0))
+    # A zero/negative variance means the wallet block never got a finite
+    # curvature; the interval then collapses to a point and honestly misses,
+    # which is what the coverage table should see rather than a NaN.
+    half = z * np.sqrt(np.maximum(np.asarray(logit_var, dtype=float)[:n], 0.0))
+    centre = np.asarray(logit_mean, dtype=float)[:n]
+    truth = np.asarray(logit(np.asarray(theta_true, dtype=float)[:n]), dtype=float)
+    return [bool(v) for v in np.abs(truth - centre) <= half]
+
+
+def _pooled_z_auc(z_true: np.ndarray, z_prob: np.ndarray) -> float | None:
+    """Pooled discrimination of q(Z) against the simulated insider indicators.
+
+    Args:
+        z_true: Concatenated true ``Z_t`` over all markets, shape ``(sum T_k,)``.
+        z_prob: Concatenated ``q(Z_t = 1)`` from the fit, same shape.
+
+    Returns:
+        The rank-sum AUC, or None when one class is absent — an undefined AUC
+        must not be pooled into the summary as the 0.5 sentinel.
+    """
+    from src.analysis.results import roc_auc
+
+    n_pos = int(np.count_nonzero(z_true))
+    if n_pos == 0 or n_pos == z_true.size:
+        return None
+    return float(roc_auc(z_true, z_prob))
+
+
+def _replicate_row(
+    *,
+    seed: int,
+    phi_true: dict[str, float],
+    L: int,
+    size: ReplicateSize,
+    elapsed_s: float,
+    ranks: dict[str, int] | None = None,
+    hits90: dict[str, bool] | None = None,
+    theta_hits90: list[bool] | None = None,
+    z_auc: float | None = None,
+    vem_converged: bool = False,
+    laplace_fallback: bool = False,
+    error: str | None = None,
+) -> dict[str, Any]:
+    """Assemble one schema-v1 result row.
+
+    Both flags are written explicitly on *every* row: ``row_degenerate`` reads a
+    missing ``vem_converged`` as True, so an omitted key would silently
+    understate the degeneracy rate the analysis exists to report.
+
+    Args:
+        seed: Replicate seed; the store's unique key.
+        phi_true: The prior draw, by component; empty if the draw itself failed.
+        L: Posterior draws ranked against the truth.
+        size: Simulation size of this replicate.
+        elapsed_s: Wall-clock seconds for the whole replicate.
+        ranks: Per-component ranks, or None for a failed replicate.
+        hits90: Per-component interval hits, or None for a failed replicate.
+        theta_hits90: Wallet interval hits, or None for a failed replicate.
+        z_auc: Pooled Z AUC, or None when undefined or failed.
+        vem_converged: Whether the EM stopped on its tolerance, not the cap.
+        laplace_fallback: Whether any Laplace block used the R3 fallback ladder.
+        error: ``repr`` of the exception when the replicate failed, else None.
+
+    Returns:
+        The JSON-serializable row.
+    """
+    return {
+        "schema_version": SBC_SCHEMA_VERSION,
+        "seed": int(seed),
+        "phi_true": phi_true,
+        "L": int(L),
+        "ranks": ranks,
+        "hits90": hits90,
+        "theta_hits90": theta_hits90,
+        "z_auc": z_auc,
+        "flags": {
+            "vem_converged": bool(vem_converged),
+            "laplace_fallback": bool(laplace_fallback),
+            "failed": error is not None,
+            "error": error,
+        },
+        "elapsed_s": float(elapsed_s),
+        "size": size.to_dict(),
+    }
+
+
+def run_replicate(
+    sim_seed: int,
+    size: ReplicateSize,
+    prior: PhiPrior,
+    L: int,
+) -> dict[str, Any]:
+    """Run one SBC replicate: prior draw, simulate, fit, and score.
+
+    The pipeline is ``phi ~ prior`` -> prior-predictive dataset -> VEM (fit
+    single-threaded; the parallelism is over replicates, never inside one) ->
+    Laplace posterior -> ``L`` i.i.d. draws -> ranks, 90% interval hits,
+    wallet-interval hits, and pooled Z AUC. ``prior`` is threaded into the
+    generator *and* the M-step *and* the curvature, which is the condition that
+    makes the rank statistic uniform under a correct posterior.
+
+    Everything is seeded off ``sim_seed`` alone through one generator, so a
+    replicate is reproducible and independent of how many workers ran it or in
+    what order — the property ``--resume`` and ``--n-jobs`` both rely on.
+
+    Any exception is captured into a failed row rather than propagated: one bad
+    draw (an extreme untruncated Cauchy ``beta``, a singular fit) must not kill
+    a 200-replicate run, and R5 requires the failure be counted, not dropped.
+
+    Args:
+        sim_seed: Seed for this replicate; also its key in the results store.
+        size: Simulation size (K markets, T trades, wallets per market).
+        prior: The prior to simulate from and to fit against.
+        L: Posterior draws to rank the truth against (i.i.d., no thinning).
+
+    Returns:
+        One schema-v1 row, always — including on failure.
+    """
+    # Deferred imports (CODE_QUALITY §4 rule 6): the fitting stack pulls the
+    # numba-backed PG kernels in transitively and costs seconds to import, while
+    # the analysis half of this module and `scripts/sbc.py --analyze` only ever
+    # read JSON. Keeping them function-local also lets tests monkeypatch the fit.
+    from src.inference.laplace import laplace_from_vem
+    from src.inference.variational_em import variational_em
+
+    started = time.perf_counter()
+    rng = np.random.default_rng(sim_seed)
+    phi_true: dict[str, float] = {}
+    try:
+        params = params_from_prior(prior, rng)
+        phi_true = _phi_true(params)
+        simulated = [
+            generate_prior_predictive_market(
+                params,
+                rng=rng,
+                n_trades=size.T,
+                n_wallets=size.n_wallets,
+            )
+            for _ in range(size.K)
+        ]
+        markets = [
+            _to_market_data(market, wallet_offset=k * size.n_wallets)
+            for k, market in enumerate(simulated)
+        ]
+        theta_true = np.concatenate([m.theta_w for m in simulated])
+
+        vem = variational_em(
+            markets,
+            InferenceConfig(),
+            n_wallets=size.K * size.n_wallets,
+            n_iter=_VEM_MAX_ITER,
+            tol=_VEM_TOL,
+            n_jobs=1,
+            prior=prior,
+            # SBC ranks beta_S and beta_Z, so they must actually be estimated:
+            # with the default `estimate_betas=False` the beta block carries no
+            # Fisher information, the Laplace layer substitutes the Cauchy prior
+            # curvature, and every replicate would report a fallback and rank
+            # the truth against the prior instead of the posterior.
+            estimate_betas=True,
+        )
+        posterior = laplace_from_vem(vem, markets, prior)
+        draws = posterior.sample(rng, L)
+        ranks, hits90 = _phi_ranks_and_hits(draws, phi_true, posterior.dims)
+        row = _replicate_row(
+            seed=sim_seed,
+            phi_true=phi_true,
+            L=L,
+            size=size,
+            elapsed_s=time.perf_counter() - started,
+            ranks=ranks,
+            hits90=hits90,
+            theta_hits90=_theta_interval_hits(
+                vem.theta_w_logit_mean,
+                vem.theta_w_logit_var,
+                theta_true,
+            ),
+            z_auc=_pooled_z_auc(
+                np.concatenate([m.Z for m in simulated]),
+                np.concatenate(vem.Z_prob),
+            ),
+            # The EM loop breaks out on its tolerance check, so a run that used
+            # the full budget never met it.
+            vem_converged=vem.n_iter_run < _VEM_MAX_ITER,
+            laplace_fallback=posterior.curvature_fallback,
+        )
+    except Exception as exc:  # noqa: BLE001 - a failed replicate is data, not a crash
+        log.warning("replicate seed=%d failed: %r", sim_seed, exc)
+        row = _replicate_row(
+            seed=sim_seed,
+            phi_true=phi_true,
+            L=L,
+            size=size,
+            elapsed_s=time.perf_counter() - started,
+            error=repr(exc),
+        )
+    return row
+
+
+def completed_seeds(path: str | Path) -> set[int]:
+    """Read back the seeds a results store already holds.
+
+    Args:
+        path: The append-only JSONL store; a missing file is not an error.
+
+    Returns:
+        The seeds present, empty when the file does not exist.
+
+    Raises:
+        ValueError: If the store is malformed (see ``load_results``) — resuming
+            onto a file this module cannot read would double-count replicates.
+    """
+    path = Path(path)
+    if not path.exists():
+        return set()
+    return {int(row["seed"]) for row in load_results(path)}
+
+
+def run_sbc(
+    seeds: Sequence[int],
+    *,
+    size: ReplicateSize,
+    prior: PhiPrior,
+    L: int,
+    out_path: str | Path,
+    n_jobs: int = 1,
+    resume: bool = False,
+) -> list[dict[str, Any]]:
+    """Run replicates over ``seeds``, appending one row each to a JSONL store.
+
+    Rows are written by *this* process as workers return them, never by the
+    workers themselves — concurrent appends to one file interleave partial
+    lines — and flushed per row, so a killed run loses at most the in-flight
+    replicates and ``resume`` picks up the rest.
+
+    Args:
+        seeds: Replicate seeds; each is an independent, reproducible stream.
+        size: Simulation size passed to every replicate.
+        prior: Prior to simulate from and fit against (one object, R1/KTD5).
+        L: Posterior draws per replicate; must match any rows already in the
+            store, since the analysis bins ranks at a single L.
+        out_path: JSONL store to append to; parent directories are created.
+        n_jobs: joblib workers over replicates. Each replicate fits
+            single-threaded, so this is the only level of parallelism.
+        resume: Skip seeds already present in ``out_path``.
+
+    Returns:
+        The rows computed by *this* call, in seed order; already-present seeds
+        are not re-read.
+
+    Raises:
+        ValueError: If ``prior`` cannot be sampled (the P11 improper-tau2
+            default), raised before any replicate runs.
+    """
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Fail fast on an unsamplable prior: `run_replicate` would otherwise capture
+    # the same error once per seed and burn the whole run writing failed rows.
+    params_from_prior(prior, np.random.default_rng(0))
+
+    pending = list(seeds)
+    if resume:
+        done = completed_seeds(out_path)
+        pending = [s for s in pending if s not in done]
+        log.info(
+            "resume: %d seed(s) already in %s, %d to run",
+            len(done),
+            out_path,
+            len(pending),
+        )
+    if not pending:
+        log.info("nothing to run")
+        return []
+
+    tasks = (delayed(run_replicate)(seed, size, prior, L) for seed in pending)
+    rows: list[dict[str, Any]] = []
+    # `return_as="generator"` streams results back in submission order as they
+    # complete, which is what lets the store grow incrementally instead of only
+    # at the end of the run.
+    with out_path.open("a", encoding="utf-8") as handle:
+        for row in Parallel(n_jobs=n_jobs, return_as="generator")(tasks):
+            handle.write(json.dumps(row) + "\n")
+            handle.flush()
+            rows.append(row)
+            log.info(
+                "seed=%d %s in %.1fs (%d/%d)",
+                row["seed"],
+                "FAILED" if row["flags"]["failed"] else "ok",
+                row["elapsed_s"],
+                len(rows),
+                len(pending),
+            )
+    return rows

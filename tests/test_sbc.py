@@ -1,8 +1,14 @@
-"""Tests for src.analysis.sbc and the scripts/sbc.py --analyze path.
+"""Tests for src.analysis.sbc and both scripts/sbc.py modes.
 
-Everything here is built against synthetic JSONL fixtures written to tmp_path,
-so no inference runs: the analysis layer's contract is "given a results store,
-produce the right verdicts", and that is exactly what these exercise.
+The analysis tests are built against synthetic JSONL fixtures written to
+tmp_path, so no inference runs: the analysis layer's contract is "given a
+results store, produce the right verdicts", and that is exactly what these
+exercise.
+
+The harness tests *do* fit, but at a deliberately tiny size (one market, a few
+dozen trades) — they assert the bookkeeping contract (schema, resume, parallel
+equivalence, failure capture), never the calibration verdict, which needs the
+full-size run the plan defers.
 """
 
 from __future__ import annotations
@@ -17,6 +23,7 @@ import pytest
 
 matplotlib.use("Agg")
 
+from config.default_params import PhiPrior
 from scripts import sbc as sbc_cli
 from src.analysis.plots import figure_sbc_ranks, save_paper_figure
 from src.analysis.sbc import (
@@ -24,18 +31,23 @@ from src.analysis.sbc import (
     PHI_COMPONENTS,
     SBC_SCHEMA_VERSION,
     THETA_W_KEY,
+    ReplicateSize,
     analyze,
+    completed_seeds,
     coverage_table,
     default_n_bins,
     failure_accounting,
     load_results,
     rank_bin_edges,
     rank_uniformity,
+    run_replicate,
+    run_sbc,
     usable_rows,
     wilson_interval,
     write_summary,
 )
 from src.inference.diagnostics import PHI_PARAM_NAMES
+from src.inference.laplace import PhiPosterior
 
 L_DRAWS = 99  # small support keeps fixtures fast; rank in {0, ..., 99}
 
@@ -126,6 +138,9 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> Path:
 def test_phi_components_match_canonical_order():
     """The locally restated component tuple must not drift from the canonical one."""
     assert PHI_COMPONENTS == PHI_PARAM_NAMES
+    # The harness indexes posterior draw columns by this order, so a drift here
+    # would silently rank each component against another one's draws.
+    assert PhiPosterior.dims == PHI_COMPONENTS
 
 
 def test_rank_bin_edges_partition_the_support_exactly():
@@ -489,12 +504,6 @@ def test_cli_analyze_prints_flagged_block_for_a_bad_store(tmp_path, capsys):
     assert out.index("!!! FLAGGED !!!") < out.index("Rank uniformity")
 
 
-def test_cli_run_mode_is_not_implemented_yet():
-    """The run path declares its flags but defers to the harness unit."""
-    with pytest.raises(NotImplementedError, match="U2"):
-        sbc_cli.main(["--n-sims", "2"])
-
-
 def test_cli_declares_the_run_mode_flag_surface():
     """The harness flags exist now so the harness unit only fills in behaviour."""
     args = sbc_cli._parse_args([])
@@ -513,3 +522,243 @@ def test_cli_declares_the_run_mode_flag_surface():
     assert args.posterior_draws == 999
     assert args.resume is False
     assert args.analyze is False
+
+
+# ---------------- Replicate harness ----------------
+
+# Tiny by design: these tests assert bookkeeping, not calibration, and every
+# extra trade is paid once per replicate in CI.
+_TINY_SIZE = ReplicateSize(K=1, T=60, n_wallets=5)
+_TINY_L = 19
+
+
+def _proper_prior() -> PhiPrior:
+    """A samplable prior standing in for the P11-blocked shipped default.
+
+    The tau2 defaults (IG(1e-9, 1e-9)) cannot be drawn from at all, and the
+    beta Cauchy scale is narrowed from 2.5 to 0.5 so a heavy-tailed draw cannot
+    turn a bookkeeping test into a flaky one. The *same* object is threaded into
+    the generator and the fit, which is the property SBC actually depends on.
+    """
+    return PhiPrior(
+        sigma2_ig_alpha=3.0,
+        sigma2_ig_beta=0.05,
+        tau2_ig_alpha=3.0,
+        tau2_ig_beta=0.05,
+        beta_cauchy_scale=0.5,
+    )
+
+
+def _without_timing(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop the wall-clock field so rows compare across execution strategies."""
+    return [{k: v for k, v in row.items() if k != "elapsed_s"} for row in rows]
+
+
+def test_run_replicate_emits_a_complete_schema_row():
+    """One replicate returns every schema field, with ranks inside {0, ..., L}."""
+    row = run_replicate(11, _TINY_SIZE, _proper_prior(), _TINY_L)
+
+    assert row["schema_version"] == SBC_SCHEMA_VERSION
+    assert row["seed"] == 11
+    assert row["L"] == _TINY_L
+    assert row["size"] == {"K": 1, "T": 60, "n_wallets": 5}
+    assert set(row["phi_true"]) == set(PHI_COMPONENTS)
+    assert row["flags"]["failed"] is False
+    assert row["flags"]["error"] is None
+    # Both health flags must be present explicitly: the analysis reads a missing
+    # `vem_converged` as True and would understate the degeneracy rate.
+    assert isinstance(row["flags"]["vem_converged"], bool)
+    assert isinstance(row["flags"]["laplace_fallback"], bool)
+    assert row["elapsed_s"] > 0.0
+
+    assert set(row["ranks"]) == set(PHI_COMPONENTS)
+    assert all(0 <= r <= _TINY_L for r in row["ranks"].values())
+    assert set(row["hits90"]) == set(PHI_COMPONENTS)
+    assert all(isinstance(h, bool) for h in row["hits90"].values())
+    assert len(row["theta_hits90"]) == _TINY_SIZE.n_wallets  # < the 10 subsample
+    assert row["z_auc"] is None or 0.0 <= row["z_auc"] <= 1.0
+    # The row is the on-disk format, so it must survive a JSON round trip.
+    assert json.loads(json.dumps(row)) == row
+
+
+def test_run_replicate_is_reproducible_from_its_seed():
+    """The same seed reproduces the same replicate, whatever ran before it."""
+    first = run_replicate(3, _TINY_SIZE, _proper_prior(), _TINY_L)
+    run_replicate(4, _TINY_SIZE, _proper_prior(), _TINY_L)
+    again = run_replicate(3, _TINY_SIZE, _proper_prior(), _TINY_L)
+    assert _without_timing([first]) == _without_timing([again])
+
+
+def test_run_sbc_resume_computes_only_the_missing_seeds(tmp_path):
+    """--resume re-runs exactly the seeds a truncated store is missing."""
+    store = tmp_path / "sbc.jsonl"
+    seeds = [0, 1, 2, 3]
+    full = run_sbc(
+        seeds,
+        size=_TINY_SIZE,
+        prior=_proper_prior(),
+        L=_TINY_L,
+        out_path=store,
+    )
+    assert [row["seed"] for row in full] == seeds
+
+    # Simulate a kill after two replicates.
+    kept = store.read_text(encoding="utf-8").splitlines()[:2]
+    store.write_text("".join(line + "\n" for line in kept), encoding="utf-8")
+    assert completed_seeds(store) == {0, 1}
+
+    resumed = run_sbc(
+        seeds,
+        size=_TINY_SIZE,
+        prior=_proper_prior(),
+        L=_TINY_L,
+        out_path=store,
+        resume=True,
+    )
+    assert [row["seed"] for row in resumed] == [2, 3]
+    assert completed_seeds(store) == set(seeds)
+    # The resumed rows are identical to what the killed run had produced.
+    assert _without_timing(resumed) == _without_timing(full[2:])
+
+    # A fully populated store leaves nothing to do.
+    nothing_left = run_sbc(
+        seeds,
+        size=_TINY_SIZE,
+        prior=_proper_prior(),
+        L=_TINY_L,
+        out_path=store,
+        resume=True,
+    )
+    assert nothing_left == []
+
+
+def test_run_sbc_parallel_matches_sequential(tmp_path):
+    """n_jobs > 1 only changes who computes a replicate, not what it contains."""
+    seeds = [5, 6]
+    kwargs = {
+        "size": _TINY_SIZE,
+        "prior": _proper_prior(),
+        "L": _TINY_L,
+        "resume": False,
+    }
+    sequential = run_sbc(seeds, out_path=tmp_path / "seq.jsonl", n_jobs=1, **kwargs)
+    parallel = run_sbc(seeds, out_path=tmp_path / "par.jsonl", n_jobs=2, **kwargs)
+
+    by_seed = {row["seed"]: row for row in _without_timing(parallel)}
+    assert by_seed == {row["seed"]: row for row in _without_timing(sequential)}
+    # Both stores were written by the parent process, one line per replicate.
+    assert len(load_results(tmp_path / "par.jsonl")) == len(seeds)
+
+
+def test_run_sbc_records_a_failed_replicate_and_continues(tmp_path, monkeypatch):
+    """A fit that raises becomes a failed row; the remaining seeds still run."""
+    import src.inference.variational_em as vem_module
+
+    real_fit = vem_module.variational_em
+    calls = {"n": 0}
+
+    def flaky_fit(*args, **kwargs):
+        """Raise on the second replicate only (n_jobs=1 fixes the order)."""
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("synthetic fit explosion")
+        return real_fit(*args, **kwargs)
+
+    monkeypatch.setattr(vem_module, "variational_em", flaky_fit)
+
+    store = tmp_path / "sbc.jsonl"
+    rows = run_sbc(
+        [0, 1, 2],
+        size=_TINY_SIZE,
+        prior=_proper_prior(),
+        L=_TINY_L,
+        out_path=store,
+        n_jobs=1,
+    )
+    assert [row["seed"] for row in rows] == [0, 1, 2]
+
+    failed = rows[1]
+    assert failed["flags"]["failed"] is True
+    assert "synthetic fit explosion" in failed["flags"]["error"]
+    assert failed["ranks"] is None
+    assert failed["hits90"] is None
+    assert failed["theta_hits90"] is None
+    assert failed["z_auc"] is None
+    # The prior draw happened before the fit, so the row still records it.
+    assert set(failed["phi_true"]) == set(PHI_COMPONENTS)
+
+    assert [r["flags"]["failed"] for r in rows] == [False, True, False]
+    accounting = failure_accounting(load_results(store))
+    assert accounting.n_failed == 1
+    assert accounting.n_scored == 2
+
+
+def test_cli_run_then_analyze_round_trip(tmp_path, monkeypatch, capsys):
+    """Run mode writes a store the analyze mode reads end to end."""
+    monkeypatch.setattr(sbc_cli, "default_sbc_prior", _proper_prior)
+    store = tmp_path / "run.jsonl"
+
+    code = sbc_cli.main(
+        [
+            "--n-sims",
+            "3",
+            "--sim-K",
+            "1",
+            "--sim-T",
+            "60",
+            "--sim-wallets",
+            "5",
+            "--posterior-draws",
+            str(_TINY_L),
+            "--seed-base",
+            "100",
+            "--out",
+            str(store),
+        ],
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "SBC harness" in out
+    assert str(store) in out
+
+    rows = load_results(store)
+    assert [row["seed"] for row in rows] == [100, 101, 102]
+    assert {row["L"] for row in rows} == {_TINY_L}
+
+    # `--include-degenerate` keeps this smoke test about wiring: at 60 trades a
+    # replicate may legitimately hit a curvature fallback, and the analysis
+    # would then have nothing left to summarize.
+    summary_path = tmp_path / "summary.json"
+    code = sbc_cli.main(
+        [
+            "--analyze",
+            "--in",
+            str(store),
+            "--fig-dir",
+            str(tmp_path / "figs"),
+            "--summary",
+            str(summary_path),
+            "--include-degenerate",
+        ],
+    )
+    assert code == 0
+    payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert payload["n_replicates"] == 3
+    assert payload["sizes"] == [{"K": 1, "T": 60, "n_wallets": 5}]
+
+
+def test_cli_run_mode_rejects_the_improper_default_prior(tmp_path):
+    """The shipped prior cannot be sampled until P11 lands, and says so."""
+    with pytest.raises(ValueError, match="P11"):
+        sbc_cli.main(
+            [
+                "--n-sims",
+                "1",
+                "--sim-K",
+                "1",
+                "--sim-T",
+                "60",
+                "--out",
+                str(tmp_path / "never.jsonl"),
+            ],
+        )
