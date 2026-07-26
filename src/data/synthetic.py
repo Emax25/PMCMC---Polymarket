@@ -8,6 +8,17 @@ variance is scaled by trade size.
 ``SyntheticMarket`` (returned by ``generate_market``) mirrors the
 ``ProcessedMarket`` interface so that all downstream inference and plotting
 code works unchanged on both real and synthetic data.
+
+Two generation modes are supported:
+
+  * **planted-insider** (the default ``generate_market``): wallets
+    ``[0, n_insider_wallets)`` are forced to high propensity and trade more
+    often, which makes recovery experiments identifiable;
+  * **prior-predictive** (``generate_prior_predictive_market``): every wallet
+    draws θ_w from the Beta(a, b) prior and trades uniformly. Paired with
+    ``params_from_prior`` this yields exact draws from the joint
+    ``p(phi) p(latents, data | phi)``, the sampling scheme simulation-based
+    calibration requires.
 """
 
 from __future__ import annotations
@@ -16,8 +27,15 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from config.default_params import ModelParams
+from config.default_params import ModelParams, PhiPrior
 from src.utils.transforms import logit, sigmoid
+
+# Smallest Inverse-Gamma shape/scale ``params_from_prior`` will sample from. The
+# PhiPrior tau2 defaults are IG(1e-9, 1e-9) — a numerically improper prior kept
+# deliberately vanishing so it does not perturb the VEM M-step (STATUS.md P11).
+# Sampling it is meaningless: the draws span hundreds of orders of magnitude and
+# overflow to 0/inf, so simulation callers must supply proper hyperparameters.
+_MIN_IG_HYPERPARAM = 1e-3
 
 
 @dataclass
@@ -49,6 +67,91 @@ class SyntheticMarket:
     insider_wallet_ids: list[int]
 
 
+# ---------------- Prior draws ----------------
+
+
+def _check_proper_ig(block: str, alpha: float, beta: float) -> None:
+    """Reject Inverse-Gamma hyperparameters too small to sample meaningfully."""
+    if not (alpha >= _MIN_IG_HYPERPARAM and beta >= _MIN_IG_HYPERPARAM):
+        raise ValueError(
+            f"PhiPrior {block} Inverse-Gamma hyperparameters "
+            f"(alpha={alpha:g}, beta={beta:g}) fall below {_MIN_IG_HYPERPARAM:g}. "
+            "P11: improper prior — supply a proper PhiPrior for simulation."
+        )
+
+
+def _draw_inverse_gamma(alpha: float, beta: float, rng: np.random.Generator) -> float:
+    """Draw one Inverse-Gamma(alpha, beta) variate as ``1 / Gamma(alpha, 1/beta)``."""
+    return float(1.0 / rng.gamma(alpha, scale=1.0 / beta))
+
+
+def params_from_prior(prior: PhiPrior, rng: np.random.Generator) -> ModelParams:
+    """Draw one ModelParams from the ``PhiPrior`` spec.
+
+    Samples the eight free parameters from exactly the densities
+    ``PhiPrior.log_prior`` evaluates, so that ``(phi, data)`` pairs generated
+    with ``generate_prior_predictive_market`` are true joint draws — the
+    validity precondition for simulation-based calibration. The remaining
+    ModelParams fields (``a``, ``b``, ``gamma``, ``s0_2``) are fixed
+    hyperparameters, not inferred, and keep their dataclass defaults.
+
+    RNG calls are made in the canonical ``log_prior`` order —
+    ``sigma2_0, sigma2_1, q_01, q_10, beta_S, beta_Z, tau2_0, tau2_1`` — eight
+    draws per call. Reordering them changes the realization for a given seed,
+    matching the fixed-order convention ``generate_market`` documents.
+
+      * ``sigma2_v ~ InvGamma(sigma2_ig_alpha, sigma2_ig_beta)``
+      * ``q_0j ~ Beta(q_beta_a, q_beta_b)``
+      * ``beta_S, beta_Z ~ Cauchy(0, beta_cauchy_scale)``
+      * ``tau2_z ~ InvGamma(tau2_ig_alpha, tau2_ig_beta)``
+
+    The Cauchy draws are deliberately **untruncated**: clipping or rejecting
+    heavy tails would make the sampling density differ from the density the
+    posterior is scored against, which destroys SBC rank uniformity. Callers
+    must tolerate occasional very large |beta| values.
+
+    Args:
+        prior: Prior spec supplying every hyperparameter; both Inverse-Gamma
+            blocks must be proper (see Raises).
+        rng: Random generator; passed explicitly so callers control the seed.
+
+    Returns:
+        A ModelParams whose eight sampled fields are a single joint prior draw.
+
+    Raises:
+        ValueError: If either Inverse-Gamma block has a shape or scale below
+            ``_MIN_IG_HYPERPARAM``. The shipped ``PhiPrior()`` defaults are such
+            a case (``tau2`` is IG(1e-9, 1e-9), a placeholder that exists only to
+            regularize the M-step), so simulation callers must pass a PhiPrior
+            with proper variance hyperparameters rather than the default.
+    """
+    _check_proper_ig("sigma2", prior.sigma2_ig_alpha, prior.sigma2_ig_beta)
+    _check_proper_ig("tau2", prior.tau2_ig_alpha, prior.tau2_ig_beta)
+
+    sigma2_0 = _draw_inverse_gamma(prior.sigma2_ig_alpha, prior.sigma2_ig_beta, rng)
+    sigma2_1 = _draw_inverse_gamma(prior.sigma2_ig_alpha, prior.sigma2_ig_beta, rng)
+    q_01 = float(rng.beta(prior.q_beta_a, prior.q_beta_b))
+    q_10 = float(rng.beta(prior.q_beta_a, prior.q_beta_b))
+    beta_S = float(rng.standard_cauchy() * prior.beta_cauchy_scale)
+    beta_Z = float(rng.standard_cauchy() * prior.beta_cauchy_scale)
+    tau2_0 = _draw_inverse_gamma(prior.tau2_ig_alpha, prior.tau2_ig_beta, rng)
+    tau2_1 = _draw_inverse_gamma(prior.tau2_ig_alpha, prior.tau2_ig_beta, rng)
+
+    return ModelParams(
+        sigma2_0=sigma2_0,
+        sigma2_1=sigma2_1,
+        q_01=q_01,
+        q_10=q_10,
+        beta_S=beta_S,
+        beta_Z=beta_Z,
+        tau2_0=tau2_0,
+        tau2_1=tau2_1,
+    )
+
+
+# ---------------- Market simulation ----------------
+
+
 def generate_market(
     params: ModelParams,
     *,
@@ -72,7 +175,9 @@ def generate_market(
         n_trades: Number of trades T to simulate.
         n_wallets: Total number of wallets in the market.
         n_insider_wallets: Wallets [0, n_insider_wallets) are forced to high
-            propensity via Beta(9, 1) (mean 0.9).
+            propensity via Beta(9, 1) (mean 0.9) and are up-weighted 3x in the
+            wallet assignment. Pass 0 (or use
+            ``generate_prior_predictive_market``) for an unplanted market.
         mean_inter_trade_time: Mean of the Exponential inter-trade gap in
             seconds (delta[1:] ~ Exp(1/mean_inter_trade_time)).
         log_size_mean: Mean of the log-normal trade size distribution (log-USDC).
@@ -163,6 +268,46 @@ def generate_market(
         wallet_ids=wallet_ids,
         insider_wallet_ids=insider_wallet_ids,
     )
+
+
+def generate_prior_predictive_market(
+    params: ModelParams,
+    *,
+    rng: np.random.Generator,
+    **market_kwargs,
+) -> SyntheticMarket:
+    """Draw one market with no planted insiders — the SBC generation mode.
+
+    Thin named entry point onto ``generate_market`` with
+    ``n_insider_wallets=0``: *every* wallet's propensity comes from the model's
+    own Beta(``params.a``, ``params.b``) prior and wallets are assigned to
+    trades uniformly, with no 3x frequency up-weighting. That makes the market
+    an exact draw from ``p(latents, data | phi)``; the planted-insider default
+    is not, because forcing Beta(9, 1) propensities and skewing trade counts
+    tilts the generating density away from the one inference assumes.
+
+    Args:
+        params: Model hyperparameters, typically from ``params_from_prior``.
+        rng: Random generator; passed explicitly so callers control the seed.
+        **market_kwargs: Forwarded to ``generate_market`` (n_trades, n_wallets,
+            mean_inter_trade_time, ...). ``n_insider_wallets`` is fixed at 0 and
+            may not be overridden.
+
+    Returns:
+        A SyntheticMarket with ``insider_wallet_ids == []``.
+
+    Raises:
+        ValueError: If ``n_insider_wallets`` is passed — planting insiders would
+            silently break the prior-predictive property this entry point exists
+            to guarantee.
+    """
+    if "n_insider_wallets" in market_kwargs:
+        raise ValueError(
+            "generate_prior_predictive_market plants no insiders; "
+            "n_insider_wallets cannot be overridden. Call generate_market "
+            "directly for planted-insider markets."
+        )
+    return generate_market(params, n_insider_wallets=0, rng=rng, **market_kwargs)
 
 
 def generate_dataset(

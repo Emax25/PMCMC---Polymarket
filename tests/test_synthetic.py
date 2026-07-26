@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
-from config.default_params import ModelParams
-from src.data.synthetic import generate_dataset, generate_market
+from config.default_params import ModelParams, PhiPrior
+from src.data.synthetic import (
+    generate_dataset,
+    generate_market,
+    generate_prior_predictive_market,
+    params_from_prior,
+)
 
 
 @pytest.fixture
@@ -15,6 +22,16 @@ def params():
     rng = np.random.default_rng(0)
     Y_dummy = rng.standard_normal(200)
     return ModelParams.warm_start(Y_dummy)
+
+
+@pytest.fixture
+def proper_prior():
+    """PhiPrior with both variance blocks proper enough to sample from.
+
+    The shipped tau2 default IG(1e-9, 1e-9) is improper (STATUS.md P11); SBC
+    simulation must supply real hyperparameters, so tests do the same.
+    """
+    return PhiPrior(tau2_ig_alpha=2.0, tau2_ig_beta=1.0)
 
 
 @pytest.fixture
@@ -120,3 +137,123 @@ def test_reproducibility(params):
     mkt2 = generate_market(params, n_trades=100, rng=np.random.default_rng(7))
     np.testing.assert_array_equal(mkt1.Y, mkt2.Y)
     np.testing.assert_array_equal(mkt1.Z, mkt2.Z)
+
+
+# ---------------- params_from_prior ----------------
+
+
+def test_params_from_prior_in_domain(proper_prior):
+    """500 prior draws stay in the parameter domain with no NaN/inf."""
+    rng = np.random.default_rng(11)
+    draws = [params_from_prior(proper_prior, rng) for _ in range(500)]
+    variances = np.array([[d.sigma2_0, d.sigma2_1, d.tau2_0, d.tau2_1] for d in draws])
+    q = np.array([[d.q_01, d.q_10] for d in draws])
+    betas = np.array([[d.beta_S, d.beta_Z] for d in draws])
+    assert np.all(np.isfinite(variances)) and np.all(variances > 0.0)
+    assert np.all(np.isfinite(q)) and np.all((q > 0.0) & (q < 1.0))
+    assert np.all(np.isfinite(betas))
+
+
+def test_params_from_prior_betas_untruncated(proper_prior):
+    """Cauchy beta draws keep their heavy tails — no clipping or rejection.
+
+    P(|Cauchy(0, 2.5)| > 5) ~ 0.30, so over 1000 draws an all-|beta| <= 5 sample
+    would be conclusive evidence of truncation, which breaks SBC rank uniformity.
+    """
+    rng = np.random.default_rng(12)
+    draws = [params_from_prior(proper_prior, rng) for _ in range(500)]
+    betas = np.array([[d.beta_S, d.beta_Z] for d in draws])
+    assert np.max(np.abs(betas)) > 5.0
+
+
+def test_params_from_prior_fixed_hyperparameters(proper_prior):
+    """Non-inferred fields (a, b, gamma, s0_2) keep their ModelParams defaults."""
+    drawn = params_from_prior(proper_prior, np.random.default_rng(3))
+    defaults = ModelParams()
+    assert (drawn.a, drawn.b) == (defaults.a, defaults.b)
+    assert (drawn.gamma, drawn.s0_2) == (defaults.gamma, defaults.s0_2)
+
+
+def test_params_from_prior_deterministic(proper_prior):
+    """Same seed produces bit-exact identical prior draws."""
+    p1 = params_from_prior(proper_prior, np.random.default_rng(5))
+    p2 = params_from_prior(proper_prior, np.random.default_rng(5))
+    assert p1 == p2
+
+
+def test_params_from_prior_rejects_improper_default():
+    """The shipped PhiPrior tau2 block is improper and must be refused (P11)."""
+    with pytest.raises(ValueError, match="P11"):
+        params_from_prior(PhiPrior(), np.random.default_rng(0))
+
+
+def test_params_from_prior_rejects_improper_sigma2(proper_prior):
+    """The sigma2 block is guarded on the same footing as tau2."""
+    improper = replace(proper_prior, sigma2_ig_alpha=1e-9, sigma2_ig_beta=1e-9)
+    with pytest.raises(ValueError, match="P11"):
+        params_from_prior(improper, np.random.default_rng(0))
+
+
+# ---------------- prior-predictive generation ----------------
+
+
+def test_prior_predictive_plants_no_insiders(params, rng):
+    """No forced high-propensity cluster: theta_w is a plain Beta(a, b) sample."""
+    mkt = generate_prior_predictive_market(params, n_trades=200, n_wallets=50, rng=rng)
+    assert mkt.insider_wallet_ids == []
+    # Planted wallets would sit near Beta(9, 1)'s 0.9 mean; Beta(1, 19) draws
+    # exceeding 0.5 have probability ~2e-6 each.
+    assert np.max(mkt.theta_w[:5]) < 0.5
+
+
+def test_prior_predictive_theta_matches_beta_prior(params, rng):
+    """Empirical mean theta_w matches the Beta(a, b) prior mean a/(a+b)."""
+    n_wallets = 4000
+    mkt = generate_prior_predictive_market(
+        params, n_trades=50, n_wallets=n_wallets, rng=rng
+    )
+    expected = params.a / (params.a + params.b)
+    assert mkt.theta_w.mean() == pytest.approx(expected, abs=0.005)
+
+
+def test_prior_predictive_wallet_assignment_uniform(params, rng):
+    """Trade counts are uniform over wallets — no insider frequency upweighting."""
+    n_wallets, T = 10, 5000
+    mkt = generate_prior_predictive_market(
+        params, n_trades=T, n_wallets=n_wallets, rng=rng
+    )
+    counts = np.bincount(mkt.wallet_ids, minlength=n_wallets)
+    # Under uniform assignment each wallet's share is 1/10; the first five hold
+    # ~half the trades. Binomial sd of that share is ~0.007, so 0.05 is >> 5 sd.
+    assert counts[:5].sum() / T == pytest.approx(0.5, abs=0.05)
+
+
+def test_planted_mode_upweights_insider_trades(params, rng):
+    """Contrast: the planted mode does skew trade counts toward insiders."""
+    n_wallets, T = 10, 5000
+    mkt = generate_market(
+        params, n_trades=T, n_wallets=n_wallets, n_insider_wallets=5, rng=rng
+    )
+    counts = np.bincount(mkt.wallet_ids, minlength=n_wallets)
+    # Weights 3 vs 1 over 5 vs 5 wallets => insider share 15/20 = 0.75.
+    assert counts[:5].sum() / T > 0.6
+
+
+def test_prior_predictive_rejects_insider_override(params, rng):
+    """Planting insiders through the prior-predictive entry point is an error."""
+    with pytest.raises(ValueError, match="n_insider_wallets"):
+        generate_prior_predictive_market(
+            params, n_trades=50, n_insider_wallets=3, rng=rng
+        )
+
+
+def test_prior_predictive_matches_generate_market_zero_insiders(params):
+    """The entry point is a pure alias for n_insider_wallets=0 — same stream."""
+    mkt1 = generate_prior_predictive_market(
+        params, n_trades=100, rng=np.random.default_rng(9)
+    )
+    mkt2 = generate_market(
+        params, n_trades=100, n_insider_wallets=0, rng=np.random.default_rng(9)
+    )
+    np.testing.assert_array_equal(mkt1.Y, mkt2.Y)
+    np.testing.assert_array_equal(mkt1.theta_w, mkt2.theta_w)
