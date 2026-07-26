@@ -12,8 +12,10 @@ The two endpoints used:
   and resolution status per the §8.2 selection criteria.
 
 * Data API:   https://data-api.polymarket.com/trades
-  Returns trade history for one market keyed by `conditionId`. Paginated;
-  we walk forward until we get an empty page.
+  Returns trade history for one market keyed by `conditionId`, newest-first.
+  Paginated by `offset`, which the server caps (HTTP 400 past 10000), so the
+  full history is reached by walking inclusive `start`/`end` timestamp
+  windows instead — see `fetch_trades_windowed`.
 
 Per §7 of the README, no module-level random state. HTTP retries are bounded
 and use exponential backoff on 429/5xx; everything else surfaces as a
@@ -350,7 +352,26 @@ def fetch_market_by_slug(
 
 # ---------------- Data API: trades ----------------
 
-DATA_API_MAX_OFFSET = 3000  # Polymarket /trades cap on historical pagination
+# Empirically probed against data-api.polymarket.com/trades on 2026-07-25 with
+# the highest-volume resolved politics market
+# (0xdd22472e...110917, "will-donald-trump-win-the-2024-us-presidential-election"):
+#
+#   * `offset` <= 10000 is served; 10001 returns HTTP 400
+#     {"error":"max historical trades offset of 10000 exceeded"}. The cap is on
+#     `offset` alone, not offset+limit: offset=10000&limit=500 yields 500 rows.
+#   * `start` and `end` filter on trade timestamp in UNIX SECONDS and are both
+#     INCLUSIVE (start <= ts <= end). Value 0 is falsy server-side and disables
+#     the filter, so never send a zero bound.
+#   * Rows stay ordered by descending timestamp inside a filtered window, and
+#     windows partition exactly: [A, M] + [M+1, B] reproduces [A, B] row-for-row.
+#   * `transactionHash` was unique across 5000 consecutive rows, so it is a
+#     sound dedupe key for the default (taker-side) view of /trades.
+DATA_API_OFFSET_LIMIT = 10_000  # server-enforced hard cap on `offset`
+
+# Legacy tail budget: `fetch_trades` pulls at most this many of the newest
+# trades. It predates the 10000 cap above and is deliberately NOT raised —
+# every artifact and caller of `fetch_trades` was produced under it.
+DATA_API_MAX_OFFSET = 3000
 
 
 def fetch_trades(
@@ -362,23 +383,23 @@ def fetch_trades(
     sleep_between: float = 0.1,
     session: requests.Session | None = None,
 ) -> list[RawTrade]:
-    """Pull trades for one market via the paginated /trades endpoint.
+    """Pull the newest `max_offset` trades for one market via /trades.
 
-    Polymarket returns trades newest-first and rejects any offset that would
-    exceed `max_historical_activity_offset` (currently 3000) with HTTP 400.
-    Because of the newest-first ordering, the resulting window IS the last
-    ~3000 trades — i.e., the final price-action period leading into
-    resolution, which is exactly the §8.2 budget for the insider-detection
-    application. We stop paginating at `max_offset` to avoid the error
-    entirely.
+    Polymarket returns trades newest-first, so the resulting window IS the
+    last ~3000 trades — the final price-action period leading into
+    resolution, which is the §8.2 budget for the insider-detection
+    application. `max_offset` is a client-side row budget, not the server
+    limit: the server now accepts offsets up to `DATA_API_OFFSET_LIMIT`
+    (10000) and 400s beyond it. This default is pinned at 3000 for
+    artifact compatibility — use `fetch_trades_windowed` for full history.
 
     Args:
         condition_id: 0x-prefixed market condition id (from `MarketMeta`).
         page_size: trades per page; Polymarket caps at 500.
         max_pages: client-side safety cap on number of pages.
-        max_offset: maximum starting offset to request (default 3000,
-            Polymarket's documented limit). The function stops cleanly when
-            the next page would exceed this.
+        max_offset: total rows to pull (default 3000). The function stops
+            cleanly when the next page would exceed this, trimming the
+            final page so the budget is hit exactly.
         sleep_between: seconds between paged calls; cheap politeness.
         session: optional requests.Session.
 
@@ -414,3 +435,170 @@ def fetch_trades(
         if sleep_between > 0:
             time.sleep(sleep_between)
     return trades
+
+
+def _fetch_trade_window(
+    condition_id: str,
+    *,
+    start_ts: int | None,
+    end_ts: int | None,
+    page_size: int,
+    offset_limit: int,
+    sleep_between: float,
+    session: requests.Session | None,
+) -> tuple[list[RawTrade], bool, int]:
+    """Page one [start_ts, end_ts] window newest-first until it runs out.
+
+    Args:
+        condition_id: 0x-prefixed market condition id.
+        start_ts: inclusive lower timestamp bound; None or <= 0 omits it.
+        end_ts: inclusive upper timestamp bound; None or <= 0 omits it.
+        page_size: rows per call (Polymarket caps at 500).
+        offset_limit: highest `offset` the server accepts. Pages are never
+            trimmed against it because the cap applies to `offset` alone.
+        sleep_between: seconds slept after every call, including the last.
+        session: optional requests.Session.
+
+    Returns:
+        ``(rows, exhausted, calls)``. `exhausted` is True when the window ended
+        on a short or empty page — i.e. every trade inside it was retrieved —
+        and False when the offset cap cut it short and the caller must
+        re-anchor. `calls` is the number of HTTP GETs issued.
+
+    Raises:
+        PolymarketAPIError: If /trades returns a non-list payload.
+    """
+    rows: list[RawTrade] = []
+    calls = 0
+    offset = 0
+    # offset == offset_limit is still served (probed), hence <= not <.
+    while offset <= offset_limit:
+        params: dict[str, Any] = {
+            "market": condition_id,
+            "limit": int(page_size),
+            "offset": int(offset),
+        }
+        # A zero bound is falsy server-side and silently disables the filter,
+        # which would hand back the newest trades instead of the window.
+        if start_ts is not None and start_ts > 0:
+            params["start"] = int(start_ts)
+        if end_ts is not None and end_ts > 0:
+            params["end"] = int(end_ts)
+
+        payload = _get_json(f"{DATA_BASE}/trades", params=params, session=session)
+        calls += 1
+        if not isinstance(payload, list):
+            raise PolymarketAPIError(
+                f"Expected list from /trades, got {type(payload).__name__}"
+            )
+        rows.extend(RawTrade.from_dict(d) for d in payload)
+        if sleep_between > 0:
+            time.sleep(sleep_between)
+        if len(payload) < page_size:
+            return rows, True, calls
+        offset += page_size
+    return rows, False, calls
+
+
+def fetch_trades_windowed(
+    condition_id: str,
+    *,
+    start_ts: int | None = None,
+    end_ts: int | None = None,
+    page_size: int = 500,
+    offset_limit: int = DATA_API_OFFSET_LIMIT,
+    max_pages: int = 20_000,
+    sleep_between: float = 0.1,
+    session: requests.Session | None = None,
+) -> list[RawTrade]:
+    """Pull a market's full trade history by walking timestamp windows.
+
+    `fetch_trades` can only reach the newest ~10000 trades because /trades
+    rejects larger offsets. This walks backwards instead: each window is
+    requested with an inclusive `end` bound and its own `offset` counter, so
+    the cap is never a ceiling on total history — only on how much one window
+    may return before we re-anchor.
+
+    Re-anchoring sets ``end = min(timestamp)`` of the window just fetched.
+    Because `end` is inclusive, the next window re-requests that entire second,
+    which is what recovers trades the offset cap truncated mid-burst — trade
+    timestamps are only second-resolution and busy markets fire many trades per
+    second, so no ordering-based cursor is trustworthy. The one-second overlap
+    is deliberate and duplicates are removed by `transaction_hash`.
+
+    Rate discipline: one sleep of `sleep_between` after every call bounds the
+    request rate at ~1/`sleep_between` per second (10/s by default), far under
+    the 200-per-10s allowance.
+
+    Args:
+        condition_id: 0x-prefixed market condition id (from `MarketMeta`).
+        start_ts: inclusive lower bound on trade timestamp (unix seconds).
+            None fetches back to the market's first trade.
+        end_ts: inclusive upper bound (unix seconds). None starts at the
+            newest trade.
+        page_size: rows per call; Polymarket caps at 500.
+        offset_limit: highest `offset` the server accepts before HTTP 400.
+        max_pages: safety budget on total HTTP GETs. Checked between windows,
+            so the true ceiling overshoots by at most one window's pages.
+        sleep_between: seconds between calls.
+        session: optional requests.Session.
+
+    Returns:
+        list[RawTrade] ordered by descending timestamp, deduplicated on
+        `transaction_hash`.
+
+    Raises:
+        ValueError: If `condition_id` is empty or `page_size` is not positive.
+        PolymarketAPIError: If `max_pages` is exhausted, or if a single second
+            holds more trades than one window can return (which would leave the
+            walk unable to advance past it).
+    """
+    if not condition_id:
+        raise ValueError("condition_id must be non-empty")
+    if page_size <= 0:
+        raise ValueError("page_size must be positive")
+
+    seen: set[str] = set()
+    out: list[RawTrade] = []
+    cursor = end_ts
+    calls = 0
+
+    while True:
+        if calls >= max_pages:
+            raise PolymarketAPIError(
+                f"/trades: max_pages={max_pages} exhausted for {condition_id} "
+                f"at end={cursor}; history is incomplete"
+            )
+        window, exhausted, used = _fetch_trade_window(
+            condition_id,
+            start_ts=start_ts,
+            end_ts=cursor,
+            page_size=page_size,
+            offset_limit=offset_limit,
+            sleep_between=sleep_between,
+            session=session,
+        )
+        calls += used
+
+        n_new = 0
+        for t in window:
+            if t.transaction_hash in seen:
+                continue
+            seen.add(t.transaction_hash)
+            out.append(t)
+            n_new += 1
+
+        if exhausted:
+            break
+
+        # Truncated window: re-anchor on its oldest second (see docstring).
+        next_cursor = min(t.timestamp for t in window)
+        if next_cursor == cursor and n_new == 0:
+            raise PolymarketAPIError(
+                f"/trades: second ts={cursor} on {condition_id} holds more "
+                f"trades than one window of {offset_limit}+{page_size} rows "
+                "can return; cannot advance"
+            )
+        cursor = next_cursor
+
+    return out

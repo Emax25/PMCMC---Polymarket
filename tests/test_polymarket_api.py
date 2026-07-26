@@ -14,6 +14,7 @@ import pytest
 import requests
 
 from src.data.polymarket_api import (
+    DATA_API_MAX_OFFSET,
     GAMMA_BASE,
     POLITICS_KEYWORDS,
     MarketMeta,
@@ -23,6 +24,7 @@ from src.data.polymarket_api import (
     fetch_market_by_slug,
     fetch_markets,
     fetch_trades,
+    fetch_trades_windowed,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -389,6 +391,210 @@ def test_fetch_trades_respects_max_pages(monkeypatch):
     monkeypatch.setattr("src.data.polymarket_api.time.sleep", lambda _: None)
     trades = fetch_trades("0xabc", page_size=2, max_pages=3)
     assert len(trades) == 6
+
+
+# ---------------- fetch_trades_windowed ----------------
+
+
+class _FakeTradesAPI:
+    """In-memory /trades stand-in reproducing the probed server semantics.
+
+    Mirrors what the live Data API was measured to do (see the constants block
+    in polymarket_api.py): newest-first ordering, inclusive `start`/`end`
+    second-resolution filters, and HTTP 400 once `offset` passes the cap.
+    """
+
+    def __init__(
+        self,
+        timestamps: list[int],
+        *,
+        max_offset: int,
+        fail_calls: tuple[int, ...] = (),
+    ):
+        """Build a market whose i-th trade has ``timestamps[i]`` (descending).
+
+        Args:
+            timestamps: trade timestamps, newest first; ties are same-second
+                bursts and keep their listed order, as the real API does.
+            max_offset: highest `offset` served before HTTP 400.
+            fail_calls: 1-based call indices answered with HTTP 429 instead.
+        """
+        self.rows = [
+            {
+                "proxyWallet": f"0xW{i % 7}",
+                "side": "BUY" if i % 2 else "SELL",
+                "asset": "1",
+                "conditionId": "0xabc",
+                "size": "1",
+                "price": "0.5",
+                "timestamp": str(ts),
+                "transactionHash": f"0xT{i:05d}",
+            }
+            for i, ts in enumerate(timestamps)
+        ]
+        self.max_offset = max_offset
+        self.fail_calls = set(fail_calls)
+        self.calls: list[dict] = []
+
+    def get(self, url, params=None, timeout=None):
+        """Serve one paged, filtered /trades request."""
+        params = dict(params or {})
+        self.calls.append(params)
+        if len(self.calls) in self.fail_calls:
+            return _mock_response({"error": "rate limited"}, status_code=429)
+
+        offset = int(params["offset"])
+        if offset > self.max_offset:
+            return _mock_response(
+                {"error": f"max historical trades offset of {self.max_offset}"},
+                status_code=400,
+            )
+        start = params.get("start")
+        end = params.get("end")
+        rows = self.rows
+        if start is not None:
+            rows = [r for r in rows if int(r["timestamp"]) >= int(start)]
+        if end is not None:
+            rows = [r for r in rows if int(r["timestamp"]) <= int(end)]
+        return _mock_response(rows[offset : offset + int(params["limit"])])
+
+
+def _install(monkeypatch, api: _FakeTradesAPI) -> None:
+    """Route requests.get at the fake API and disable real sleeping."""
+    monkeypatch.setattr("src.data.polymarket_api.requests.get", api.get)
+    monkeypatch.setattr("src.data.polymarket_api.time.sleep", lambda _: None)
+
+
+def _assert_complete(trades: list[RawTrade], api: _FakeTradesAPI) -> None:
+    """Every trade returned exactly once, in descending timestamp order."""
+    got = [t.transaction_hash for t in trades]
+    assert len(got) == len(set(got)), "duplicate rows returned"
+    assert set(got) == {r["transactionHash"] for r in api.rows}
+    ts = [t.timestamp for t in trades]
+    assert all(a >= b for a, b in zip(ts, ts[1:])), "not newest-first"
+
+
+def test_windowed_walks_past_the_offset_cap(monkeypatch):
+    """7000 trades behind a 3000-offset cap all come back exactly once."""
+    api = _FakeTradesAPI([1_700_010_000 - i for i in range(7000)], max_offset=3000)
+    _install(monkeypatch, api)
+
+    trades = fetch_trades_windowed("0xabc", page_size=500, offset_limit=3000)
+
+    assert len(trades) == 7000
+    _assert_complete(trades, api)
+    # Every window restarts its own offset counter at 0 and re-anchors on `end`.
+    assert api.calls[0]["offset"] == 0 and "end" not in api.calls[0]
+    reanchors = [c for c in api.calls if c["offset"] == 0 and "end" in c]
+    assert len(reanchors) >= 2
+
+
+def test_windowed_same_second_burst_at_window_boundary(monkeypatch):
+    """A burst straddling the truncation point loses and duplicates nothing."""
+    # Window 1 = offsets 0..3000 of 500 rows each = rows 0..3499. Rows
+    # 3495..3509 share one second, so the cap slices that burst in half.
+    timestamps = []
+    for i in range(4000):
+        if 3495 <= i <= 3509:
+            timestamps.append(1_700_000_000 - 3495)
+        else:
+            timestamps.append(1_700_000_000 - i)
+    api = _FakeTradesAPI(timestamps, max_offset=3000)
+    _install(monkeypatch, api)
+
+    trades = fetch_trades_windowed("0xabc", page_size=500, offset_limit=3000)
+
+    assert len(trades) == 4000
+    _assert_complete(trades, api)
+    burst = [t for t in trades if t.timestamp == 1_700_000_000 - 3495]
+    assert len(burst) == 15  # the split second is whole again
+
+
+def test_windowed_raises_when_one_second_cannot_fit(monkeypatch):
+    """A second larger than a full window would stall the walk — surface it."""
+    api = _FakeTradesAPI([1_700_000_000] * 3000, max_offset=1000)
+    _install(monkeypatch, api)
+    with pytest.raises(PolymarketAPIError, match="cannot advance"):
+        fetch_trades_windowed("0xabc", page_size=500, offset_limit=1000)
+
+
+def test_windowed_resumes_after_429_without_duplicates(monkeypatch):
+    """A 429 mid-window is retried and the walk resumes cleanly."""
+    api = _FakeTradesAPI(
+        [1_700_010_000 - i for i in range(5000)],
+        max_offset=3000,
+        fail_calls=(3, 9),  # one inside window 1, one inside window 2
+    )
+    sleeps: list[float] = []
+    monkeypatch.setattr("src.data.polymarket_api.requests.get", api.get)
+    monkeypatch.setattr(
+        "src.data.polymarket_api.time.sleep", lambda s: sleeps.append(s)
+    )
+
+    trades = fetch_trades_windowed("0xabc", page_size=500, offset_limit=3000)
+
+    assert len(trades) == 5000
+    _assert_complete(trades, api)
+    assert any(s > 0 for s in sleeps)  # backoff actually slept
+
+
+def test_windowed_bounds_are_inclusive_and_zero_is_omitted(monkeypatch):
+    """start/end are forwarded as unix seconds; falsy bounds are never sent."""
+    api = _FakeTradesAPI([1_000 + i for i in range(20)][::-1], max_offset=3000)
+    _install(monkeypatch, api)
+
+    trades = fetch_trades_windowed(
+        "0xabc", start_ts=1_005, end_ts=1_010, page_size=500
+    )
+    assert [t.timestamp for t in trades] == list(range(1_010, 1_004, -1))
+    assert api.calls[0] == {
+        "market": "0xabc",
+        "limit": 500,
+        "offset": 0,
+        "start": 1_005,
+        "end": 1_010,
+    }
+
+    api.calls.clear()
+    fetch_trades_windowed("0xabc", start_ts=0, end_ts=0, page_size=500)
+    assert "start" not in api.calls[0] and "end" not in api.calls[0]
+
+
+def test_windowed_respects_max_pages(monkeypatch):
+    """The HTTP budget is enforced rather than silently truncating history."""
+    api = _FakeTradesAPI([1_700_000_000 - i for i in range(9000)], max_offset=1000)
+    _install(monkeypatch, api)
+    with pytest.raises(PolymarketAPIError, match="max_pages"):
+        fetch_trades_windowed(
+            "0xabc", page_size=500, offset_limit=1000, max_pages=6
+        )
+
+
+def test_windowed_rejects_bad_arguments():
+    """Guard rails on condition_id and page_size fire before any HTTP."""
+    with pytest.raises(ValueError):
+        fetch_trades_windowed("")
+    with pytest.raises(ValueError):
+        fetch_trades_windowed("0xabc", page_size=0)
+
+
+def test_fetch_trades_default_path_is_unchanged(monkeypatch):
+    """Pin the pre-change default: 6 plain pages, no start/end, 3000 rows."""
+    api = _FakeTradesAPI(
+        [1_700_010_000 - i for i in range(5000)], max_offset=DATA_API_MAX_OFFSET
+    )
+    _install(monkeypatch, api)
+
+    trades = fetch_trades("0xabc")
+
+    assert [dict(c) for c in api.calls] == [
+        {"market": "0xabc", "limit": 500, "offset": off}
+        for off in (0, 500, 1000, 1500, 2000, 2500)
+    ]
+    assert len(trades) == 3000
+    assert [t.transaction_hash for t in trades] == [
+        f"0xT{i:05d}" for i in range(3000)
+    ]
 
 
 # ---------------- HTTP error handling ----------------
