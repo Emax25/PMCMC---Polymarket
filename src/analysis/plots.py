@@ -15,8 +15,10 @@ keep their LaTeX-friendly defaults (vector PDF + serif font sizes).
 
 from __future__ import annotations
 
+import math
+import textwrap
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Mapping
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -31,6 +33,7 @@ from src.analysis.results import (
     roc_auc,
     roc_curve,
 )
+from src.analysis.sbc import RANK_INTERPRETATION_KEY, UniformityResult
 from src.data.preprocess import ProcessedMarket
 from src.data.synthetic import SyntheticMarket
 from src.inference.diagnostics import PHI_PARAM_NAMES
@@ -836,4 +839,207 @@ def pareto_plot(
     if title:
         ax.set_title(title)
     fig.tight_layout()
+    return fig
+
+
+# ---------------- SBC rank figures ----------------
+
+
+def _uniformity_panel_title(result: UniformityResult) -> str:
+    """Title carrying the numeric verdict so a panel is readable without the table."""
+    verdict = "FLAG" if result.flagged else "ok"
+    return f"{result.component}  (p={result.p_value:.3f}, {verdict})"
+
+
+def plot_rank_ecdf(
+    result: UniformityResult,
+    *,
+    ax: plt.Axes | None = None,
+) -> plt.Axes:
+    """Plot the rank-PIT ECDF *difference* with its simultaneous uniformity band.
+
+    Differencing against the uniform CDF is what makes the diagnostic legible:
+    the raw ECDF of a calibrated run is a diagonal on which no deviation is
+    visible, whereas ``ECDF(u) - u`` is flat at zero and the three failure modes
+    separate — a dip-then-rise for the U-shape (overconfident), a bulge for the
+    inverted-U (underconfident), and a one-sided excursion for a location bias.
+
+    The shaded band is the Dvoretzky-Kiefer-Wolfowitz band: distribution-free
+    and valid for the whole curve at once, and Bonferroni-widened across the
+    components plotted beside it, so ``1 - alpha`` is the level at which *no
+    panel* leaves its band under calibration — the claim a reader makes when
+    scanning the grid.
+
+    Args:
+        result: Per-component verdict from ``rank_uniformity``.
+        ax: Axes to draw on; a new single-panel figure is created if None.
+
+    Returns:
+        Axes containing the ECDF-difference curve and its band.
+    """
+    if ax is None:
+        _, ax = plt.subplots(figsize=(3.0, 2.4))
+    ordered = np.sort(result.pit)
+    steps = np.arange(1, ordered.size + 1, dtype=float) / ordered.size
+    # Anchor at (0, 0) and (1, 0): the ECDF difference is pinned to zero at both
+    # ends of the unit interval, and drawing it keeps the band visually closed.
+    x = np.concatenate(([0.0], ordered, [1.0]))
+    y = np.concatenate(([0.0], steps, [1.0])) - x
+
+    half = result.band_half_width
+    ax.axhspan(
+        -half,
+        half,
+        color="0.90",
+        zorder=0,
+        label=f"{1.0 - result.alpha:.0%} band (joint over panels)",
+    )
+    ax.axhline(0.0, color="0.5", lw=0.6)
+    ax.plot(x, y, color="C0", lw=1.0)
+    ax.set_xlim(0.0, 1.0)
+    if result.ks_stat <= half:
+        # Calibrated panels would otherwise autoscale to the curve and hide the
+        # band that makes them readable as "inside the band".
+        ax.set_ylim(-1.6 * half, 1.6 * half)
+    ax.set_xlabel("rank PIT $u$")
+    ax.set_ylabel(r"$\hat{F}(u) - u$")
+    ax.set_title(_uniformity_panel_title(result))
+    return ax
+
+
+def plot_rank_histogram(
+    result: UniformityResult,
+    *,
+    ax: plt.Axes | None = None,
+) -> plt.Axes:
+    """Plot the binned rank histogram against its expected count and binomial band.
+
+    Bins are drawn on the PIT scale (rank / (L + 1)) so panels for different
+    components are directly comparable. Bin widths can differ by one rank when
+    ``L + 1`` is not a multiple of the bin count, which is why the expected
+    count is drawn as a step rather than a single horizontal line.
+
+    Args:
+        result: Per-component verdict from ``rank_uniformity``.
+        ax: Axes to draw on; a new single-panel figure is created if None.
+
+    Returns:
+        Axes containing the histogram, expected step, and band.
+    """
+    if ax is None:
+        _, ax = plt.subplots(figsize=(3.0, 2.4))
+    edges = np.asarray(result.bin_edges, dtype=float) / float(result.L + 1)
+    widths = np.diff(edges)
+    centres = edges[:-1] + 0.5 * widths
+
+    # `fill_between`/`step` need one extra sample to close the final bin.
+    ax.fill_between(
+        edges,
+        np.append(result.band_lo, result.band_lo[-1]),
+        np.append(result.band_hi, result.band_hi[-1]),
+        step="post",
+        color="0.90",
+        zorder=0,
+        label=f"{1.0 - result.alpha:.0%} band (joint over panels)",
+    )
+    # The lower band edge is usually 0, so the fill alone covers the whole panel
+    # and reads as background; the explicit upper edge is what makes it a band.
+    ax.step(
+        edges,
+        np.append(result.band_hi, result.band_hi[-1]),
+        where="post",
+        color="0.55",
+        lw=0.7,
+        zorder=1,
+    )
+    ax.bar(centres, result.counts, width=widths * 0.9, color="C0", alpha=0.85, zorder=2)
+    ax.step(
+        edges,
+        np.append(result.expected, result.expected[-1]),
+        where="post",
+        color="C3",
+        lw=0.9,
+        ls="--",
+        zorder=3,
+        label="expected",
+    )
+    ax.set_xlim(0.0, 1.0)
+    ax.set_ylim(bottom=0.0)
+    ax.set_xlabel("rank PIT $u$")
+    ax.set_ylabel("replicates")
+    ax.set_title(_uniformity_panel_title(result))
+    return ax
+
+
+def figure_sbc_ranks(
+    results: Mapping[str, UniformityResult],
+    *,
+    kind: str = "ecdf",
+    ncols: int = 4,
+    figsize: tuple[float, float] | None = None,
+) -> plt.Figure:
+    """Produce the SBC rank figure — one panel per phi component.
+
+    A single legend and the interpretation key are attached at figure level so
+    the panel grid stays uncluttered and the figure is self-explanatory in the
+    paper without its caption.
+
+    Args:
+        results: Mapping from component name to ``UniformityResult``, as
+            returned by ``rank_uniformity``; panel order follows the mapping.
+        kind: ``"ecdf"`` for ECDF-difference panels, ``"hist"`` for binned
+            rank histograms.
+        ncols: Panels per row.
+        figsize: Figure dimensions in inches; defaults to a size derived from
+            the grid shape.
+
+    Returns:
+        Figure containing the panel grid.
+
+    Raises:
+        ValueError: If ``results`` is empty or ``kind`` is unrecognized.
+    """
+    if not results:
+        raise ValueError("results is empty; nothing to plot")
+    if kind not in ("ecdf", "hist"):
+        raise ValueError(f"kind must be 'ecdf' or 'hist'; got {kind!r}")
+
+    items = list(results.items())
+    ncols = max(1, min(ncols, len(items)))
+    nrows = math.ceil(len(items) / ncols)
+    if figsize is None:
+        figsize = (2.6 * ncols, 2.3 * nrows + 0.6)
+    fig, axes = plt.subplots(nrows, ncols, figsize=figsize, squeeze=False)
+    flat = axes.reshape(-1)
+
+    draw = plot_rank_ecdf if kind == "ecdf" else plot_rank_histogram
+    for ax, (_, result) in zip(flat, items):
+        draw(result, ax=ax)
+    for ax in flat[len(items) :]:
+        ax.set_visible(False)
+
+    handles, labels = flat[0].get_legend_handles_labels()
+    if handles:
+        fig.legend(handles, labels, loc="upper right", fontsize=7)
+    fig.suptitle(
+        f"SBC rank {'ECDF difference' if kind == 'ecdf' else 'histograms'} "
+        f"(n={items[0][1].n} replicates, L={items[0][1].L} draws)",
+        fontsize=10,
+    )
+    # Wrapped by hand rather than via `wrap=True`: matplotlib's wrapping is
+    # measured against the figure width at draw time and silently truncates in
+    # the tight-bbox PDF export this repo saves with. The reserved strip is then
+    # sized from the actual line count, so the key can never land on the bottom
+    # row's axis labels.
+    caption = textwrap.wrap(RANK_INTERPRETATION_KEY, width=max(60, 26 * ncols))
+    fig.text(
+        0.5,
+        0.012,
+        "\n".join(caption),
+        ha="center",
+        va="bottom",
+        fontsize=6.5,
+        color="0.3",
+    )
+    fig.tight_layout(rect=(0.0, 0.02 + 0.03 * len(caption), 1.0, 0.95))
     return fig
