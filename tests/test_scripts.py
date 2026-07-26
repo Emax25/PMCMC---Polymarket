@@ -188,6 +188,120 @@ def test_pull_data_tail_truncates(tmp_path, monkeypatch):
     assert mkt.delta[0] == 0.0
 
 
+def _mock_pull_data_api(monkeypatch, slug_meta_extra=None):
+    """Point pull_data at canned Gamma/Data responses; returns recorded calls.
+
+    The returned dict has a "trades" list (kwargs of every `fetch_trades` call)
+    and a "windowed" list (kwargs of every `fetch_trades_windowed` call).
+    """
+    page1 = json.loads((FIXTURES / "data_trades_page1.json").read_text())
+    gamma_market = {
+        "id": "1",
+        "conditionId": _COND_ID,
+        "slug": "x",
+        "question": "x",
+        "volume": 100_000,
+        "closed": True,
+        "endDate": "2024-11-05",
+        **(slug_meta_extra or {}),
+    }
+    calls: dict[str, list] = {"trades": [], "windowed": []}
+
+    def record(key):
+        def fake(condition_id, **kwargs):
+            calls[key].append({"condition_id": condition_id, **kwargs})
+            return [RawTrade.from_dict(d) for d in page1]
+
+        return fake
+
+    monkeypatch.setattr(
+        "scripts.pull_data.fetch_market_by_slug",
+        lambda s, **k: MarketMeta.from_dict({**gamma_market, "slug": s}),
+    )
+    monkeypatch.setattr("scripts.pull_data.fetch_trades", record("trades"))
+    monkeypatch.setattr("scripts.pull_data.fetch_trades_windowed", record("windowed"))
+    return calls
+
+
+def test_pull_data_without_full_history_keeps_tail_call_pattern(tmp_path, monkeypatch):
+    """Default (flag off) still hits fetch_trades with the unchanged kwargs."""
+    calls = _mock_pull_data_api(monkeypatch)
+
+    rc = pull_data.main(
+        [
+            "--output-dir",
+            str(tmp_path),
+            "--slugs",
+            "alpha",
+            "--log-level",
+            "WARNING",
+        ]
+    )
+    assert rc == 0
+    assert calls["windowed"] == []
+    assert calls["trades"] == [
+        {"condition_id": _COND_ID, "max_pages": 200, "sleep_between": 0.1}
+    ]
+
+
+def test_pull_data_full_history_uses_windowed_fetch_from_epoch_one(
+    tmp_path, monkeypatch
+):
+    """--full-history routes to the windowed fetcher with start_ts=1, not 0."""
+    calls = _mock_pull_data_api(monkeypatch)
+
+    rc = pull_data.main(
+        [
+            "--output-dir",
+            str(tmp_path),
+            "--slugs",
+            "alpha",
+            "--full-history",
+            "--log-level",
+            "WARNING",
+        ]
+    )
+    assert rc == 0
+    assert calls["trades"] == []
+    assert len(calls["windowed"]) == 1
+    assert calls["windowed"][0]["condition_id"] == _COND_ID
+    # 0 would be dropped server-side as falsy, so the bound must be epoch 1.
+    assert calls["windowed"][0]["start_ts"] == 1
+    assert calls["windowed"][0]["max_pages"] == 20_000
+
+
+def test_pull_data_full_history_applies_tail_after_retrieval(tmp_path, monkeypatch):
+    """--tail-trades still caps the kept trades when --full-history is on."""
+    calls = _mock_pull_data_api(monkeypatch)
+
+    rc = pull_data.main(
+        [
+            "--output-dir",
+            str(tmp_path),
+            "--slugs",
+            "alpha",
+            "--full-history",
+            "--tail-trades",
+            "3",
+            "--max-pages",
+            "7",
+            "--log-level",
+            "WARNING",
+        ]
+    )
+    assert rc == 0
+    # The cap is a post-retrieval slice: the fetch itself is still unbounded
+    # apart from the explicit --max-pages budget.
+    assert calls["windowed"][0]["max_pages"] == 7
+    assert "end_ts" not in calls["windowed"][0]
+
+    from src.data.preprocess import load_processed
+
+    mkt = load_processed(tmp_path / "alpha.parquet")
+    assert mkt.T == 3
+    assert mkt.delta[0] == 0.0
+
+
 # ---------------- run_pg.py / run_ipmcmc.py ----------------
 
 

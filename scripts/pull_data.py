@@ -2,7 +2,8 @@
 
 For each slug in `_shortlist.SLUGS`:
   1. Resolve slug → MarketMeta via Gamma API.
-  2. Paginate /trades for its conditionId.
+  2. Paginate /trades for its conditionId — the newest ~10000 trades by
+     default, or the entire history under `--full-history`.
   3. Clean + compute features (`build_processed_market`).
   4. Optionally tail to the last `--tail-trades` entries (§8.2 budget).
   5. Build one shared `WalletIndex` over the union of cleaned wallets.
@@ -14,6 +15,7 @@ Usage:
     python -m scripts.pull_data --output-dir data/processed
     python -m scripts.pull_data --tail-trades 2000   # cap per market
     python -m scripts.pull_data --max-pages 20       # cap per market
+    python -m scripts.pull_data --full-history       # deep backfill per market
 
 The script is idempotent over the output directory — re-running overwrites.
 """
@@ -31,6 +33,7 @@ from src.data.polymarket_api import (
     MarketMeta,
     fetch_market_by_slug,
     fetch_trades,
+    fetch_trades_windowed,
 )
 from src.data.preprocess import (
     ProcessedMarket,
@@ -41,6 +44,18 @@ from src.data.preprocess import (
 )
 
 log = logging.getLogger("pull_data")
+
+# Page budgets for the two retrieval paths. The tail path is offset-capped by the
+# API at ~10000 trades, so 200 pages is already unreachable slack; the windowed
+# path walks arbitrarily far back and raises when its budget runs out, so it gets
+# the wider default (matching `fetch_trades_windowed`'s own).
+_DEFAULT_MAX_PAGES = 200
+_FULL_HISTORY_MAX_PAGES = 20_000
+
+# Lower timestamp bound for --full-history. Deliberately 1, not 0: the Data API
+# treats a zero `start` as "no filter", so 0 cannot express an explicit bound.
+# No Polymarket trade predates epoch 1, so this loses nothing.
+_EPOCH_START_TS = 1
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -62,8 +77,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--max-pages",
         type=int,
-        default=200,
-        help="Polymarket /trades pagination cap per market (500 trades/page).",
+        default=None,
+        help="Polymarket /trades pagination cap per market (500 trades/page). "
+        f"Default: {_DEFAULT_MAX_PAGES}, or {_FULL_HISTORY_MAX_PAGES} under "
+        "--full-history.",
+    )
+    p.add_argument(
+        "--full-history",
+        action="store_true",
+        help="Walk timestamp windows to pull each market's entire trade history "
+        "instead of only the newest ~10000 trades. Slow; off by default.",
     )
     p.add_argument(
         "--sleep-between",
@@ -110,17 +133,34 @@ def _pull_trades(
     metas: list[MarketMeta],
     max_pages: int,
     sleep_between: float,
+    full_history: bool = False,
 ) -> list[tuple[str, list]]:
-    """Returns list of (slug, raw_trades) tuples in shortlist order."""
+    """Returns list of (slug, raw_trades) tuples in shortlist order.
+
+    Args:
+        metas: Resolved market metadata, in shortlist order.
+        max_pages: Pagination budget per market.
+        sleep_between: Seconds between paginated /trades calls.
+        full_history: Walk timestamp windows back to epoch instead of taking the
+            offset-capped tail of the newest trades.
+    """
     out: list[tuple[str, list]] = []
     for meta in metas:
         log.info("pulling /trades for %s …", meta.slug)
         t0 = time.monotonic()
-        trades = fetch_trades(
-            meta.condition_id,
-            max_pages=max_pages,
-            sleep_between=sleep_between,
-        )
+        if full_history:
+            trades = fetch_trades_windowed(
+                meta.condition_id,
+                start_ts=_EPOCH_START_TS,
+                max_pages=max_pages,
+                sleep_between=sleep_between,
+            )
+        else:
+            trades = fetch_trades(
+                meta.condition_id,
+                max_pages=max_pages,
+                sleep_between=sleep_between,
+            )
         log.info(
             "  -> %d raw trades in %.1fs",
             len(trades),
@@ -168,10 +208,14 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     metas = _resolve_metadata(args.slugs)
+    max_pages = args.max_pages
+    if max_pages is None:
+        max_pages = _FULL_HISTORY_MAX_PAGES if args.full_history else _DEFAULT_MAX_PAGES
     trades_by_market = _pull_trades(
         metas,
-        max_pages=args.max_pages,
+        max_pages=max_pages,
         sleep_between=args.sleep_between,
+        full_history=args.full_history,
     )
 
     resolution_ts_by_slug = {
@@ -207,7 +251,17 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     if args.tail_trades is not None:
-        markets = [_tail(m, args.tail_trades) for m in markets]
+        # The cap is applied *after* retrieval, so --full-history still walks the
+        # whole history and --tail-trades only decides how much of it is kept.
+        tailed = [_tail(m, args.tail_trades) for m in markets]
+        for retrieved, kept in zip(markets, tailed):
+            log.info(
+                "  %-40s retrieved %d cleaned trades -> kept %d",
+                retrieved.slug,
+                retrieved.T,
+                kept.T,
+            )
+        markets = tailed
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     for m in markets:
