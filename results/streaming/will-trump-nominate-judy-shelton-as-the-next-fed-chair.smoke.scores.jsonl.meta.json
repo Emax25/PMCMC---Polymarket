@@ -1,0 +1,9 @@
+{
+  "forgetting": 0.98,
+  "input": "results/streaming/will-trump-nominate-judy-shelton-as-the-next-fed-chair.trades.jsonl",
+  "mode": "replay",
+  "n_refresh": null,
+  "output": "results/streaming/will-trump-nominate-judy-shelton-as-the-next-fed-chair.smoke.scores.jsonl",
+  "wallet_index": null,
+  "warm_start": null
+}

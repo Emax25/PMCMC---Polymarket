@@ -37,12 +37,21 @@ band drawn on the figure). A signed pair of z-scores (``bias_z``,
 ``dispersion_z``) names *which* of the three shapes dominates.
 
 Both verdicts are corrected for testing all eight phi components at once (Holm
-for the p-values, Bonferroni for the bands), each at family-wise ``alpha``.
-They are not corrected *against each other*, so a perfectly calibrated run
-raises some flag with probability roughly ``2 * alpha`` — about one run in ten
-at the default 0.05. A lone flag on one component is weak evidence; the failure
+for the p-values, Bonferroni for the bands), each at family-wise ``alpha``, and
+the coverage table is Bonferroni-corrected across its own rows. The three
+families are *not* corrected against each other, so a perfectly calibrated run
+raises some flag with probability up to ``3 * alpha`` — roughly one run in
+seven at the default 0.05 (``ALPHA_FAMILY_NOTE``, surfaced in the summary JSON
+as ``alpha_note``). A lone flag on one component is weak evidence; the failure
 this analysis exists to catch shows up across components and as a coverage
 miss too.
+
+Coverage is judged on the *interval*, never on the point estimate: a row fails
+only when its Wilson CI excludes the nominal level, and passes-but-inconclusive
+when the CI overlaps the nominal level yet is wider than the R4 acceptance
+band. A point-estimate gate would mostly measure the replicate count — at
+n = 30 a perfectly calibrated 0.90 falls outside [0.85, 0.95] about a third of
+the time — so the summary reports conclusiveness alongside the verdict.
 
 Degenerate and failed replicates are never silently dropped (R5): failed rows
 carry no ranks and are excluded from every statistic but counted in the failure
@@ -143,6 +152,32 @@ _THETA_DEPENDENCE_NOTE = (
     "Wallet intervals are pooled across replicates; wallets within a replicate "
     "share one fit, so this binomial CI ignores that dependence and is "
     "anti-conservative. Read the width as a lower bound."
+)
+
+# Three separately corrected families of tests are reported side by side. Each
+# holds at family-wise `alpha` on its own; nothing corrects them against each
+# other, so the honest bound on a calibrated run raising *some* flag is their
+# union. Stated verbatim in the summary JSON so a reader quoting "one component
+# flagged" cannot mistake it for a 5% event.
+ALPHA_FAMILY_NOTE = (
+    "Three test families are reported, each controlled at family-wise alpha on "
+    "its own: (1) chi-square rank uniformity, Holm-adjusted across components; "
+    "(2) the DKW simultaneous ECDF band, Bonferroni-widened across components; "
+    "(3) interval coverage, Bonferroni-widened across the coverage table's "
+    "rows. They are not corrected against each other, so `flagged` unions them "
+    "and the overall false-alarm probability on a perfectly calibrated run is "
+    "bounded by 3 * alpha (about 14% at alpha = 0.05), not alpha. Read a single "
+    "flag accordingly; a real failure shows up in more than one family."
+)
+
+_COVERAGE_POWER_NOTE = (
+    "A coverage row passes when its Wilson CI overlaps the nominal level and "
+    "is conclusive when the CI also fits entirely inside the acceptance band, "
+    "i.e. n was large enough to rule out a coverage error big enough to "
+    "matter. At nominal 0.90, a [0.85, 0.95] band and the table-wide Bonferroni "
+    "correction that needs roughly 400 replicates; a passing row below that is "
+    "underpowered and means 'no evidence of miscalibration', not 'calibration "
+    "demonstrated'."
 )
 
 
@@ -336,6 +371,14 @@ class UniformityResult:
             shape ``(n,)``. Not serialized.
         ks_stat: Two-sided Kolmogorov-Smirnov distance of ``pit`` from U(0, 1).
         band_half_width: DKW simultaneous half-width at ``alpha``.
+        ks_floor: ``1 / (2 * (L + 1))`` — the KS distance a *perfectly*
+            calibrated discrete PIT cannot go below, because the continuity-
+            corrected ranks live on ``L + 1`` atoms while the band compares them
+            against the continuous U(0, 1) CDF. ``band_half_width`` shrinks like
+            ``1 / sqrt(n)`` but the floor does not, so a small ``L`` with a large
+            ``n`` produces band violations from discretization alone; when
+            ``band_half_width`` is not comfortably above ``ks_floor`` the band is
+            testing the grid, not the posterior.
         band_violation: ``ks_stat > band_half_width``.
         mean_pit: Sample mean of ``pit``; 0.5 under calibration.
         var_pit: Sample variance of ``pit``; 1/12 under calibration.
@@ -365,6 +408,7 @@ class UniformityResult:
     pit: np.ndarray
     ks_stat: float
     band_half_width: float
+    ks_floor: float
     band_violation: bool
     mean_pit: float
     var_pit: float
@@ -376,7 +420,17 @@ class UniformityResult:
 
     @property
     def flagged(self) -> bool:
-        """Whether either numeric verdict says the ranks are non-uniform."""
+        """Whether either numeric verdict says the ranks are non-uniform.
+
+        Note:
+            This is a *union* of two families that are each controlled at
+            ``alpha`` separately (Holm over the chi-square p-values, Bonferroni
+            over the DKW bands) and are not corrected against each other. The
+            union bound on flagging a perfectly calibrated component is
+            therefore ``2 * alpha``, and adding the coverage family takes the
+            whole-report bound to ``3 * alpha`` — see ``ALPHA_FAMILY_NOTE``,
+            which ships in the summary JSON as ``alpha_note``.
+        """
         return self.rejected or self.band_violation
 
     def to_dict(self) -> dict[str, Any]:
@@ -398,6 +452,7 @@ class UniformityResult:
             "rejected": self.rejected,
             "ks_stat": self.ks_stat,
             "band_half_width": self.band_half_width,
+            "ks_floor": self.ks_floor,
             "band_violation": self.band_violation,
             "mean_pit": self.mean_pit,
             "var_pit": self.var_pit,
@@ -436,6 +491,14 @@ def default_n_bins(n: int, L: int) -> int:
     expected per bin) while never exceeding ``MAX_RANK_BINS`` or the number of
     distinct ranks available.
 
+    The ``max(2, ...)`` floor deliberately *overrides* the expected-count
+    guidance rather than returning a single meaningless bin: a one-bin
+    chi-square has zero degrees of freedom and tests nothing. Below
+    ``2 * MIN_EXPECTED_PER_BIN`` replicates that floor is therefore reached by
+    violating the guidance, which is logged loudly — the chi-square p-value is
+    not trustworthy there and the run needs more replicates, not a different
+    bin count.
+
     Args:
         n: Replicate count contributing ranks.
         L: Posterior draws per replicate.
@@ -443,7 +506,19 @@ def default_n_bins(n: int, L: int) -> int:
     Returns:
         Bin count, at least 2.
     """
-    return max(2, min(MAX_RANK_BINS, n // MIN_EXPECTED_PER_BIN, L + 1))
+    n_bins = max(2, min(MAX_RANK_BINS, n // MIN_EXPECTED_PER_BIN, L + 1))
+    expected_per_bin = n / n_bins if n_bins else 0.0
+    if expected_per_bin < MIN_EXPECTED_PER_BIN:
+        log.warning(
+            "rank histogram has only %.1f expected counts per bin at n=%d over "
+            "%d bins (floor is %d): the chi-square approximation is unreliable "
+            "and its p_value should not be quoted as evidence",
+            expected_per_bin,
+            n,
+            n_bins,
+            MIN_EXPECTED_PER_BIN,
+        )
+    return n_bins
 
 
 def _shape_hint(bias_z: float, dispersion_z: float, threshold: float) -> str:
@@ -529,6 +604,14 @@ def _component_uniformity(
     # DKW: P(sup|F_n - F| > eps) <= 2 exp(-2 n eps^2), so this half-width is a
     # distribution-free band holding simultaneously over the whole curve.
     band_half_width = math.sqrt(math.log(2.0 / band_alpha) / (2.0 * n))
+    # Discretization floor: `pit` sits on the L+1 midpoints k/(L+1) + 1/(2(L+1))
+    # while the band compares it against the *continuous* U(0, 1) CDF, so even an
+    # exactly calibrated rank distribution leaves a KS distance of 1/(2(L+1))
+    # (half a grid step, at the atoms). The band half-width falls off as
+    # 1/sqrt(n) and this floor does not, so at small L with large n the band
+    # eventually flags the grid rather than the inference - `ks_floor` is
+    # reported so that regime is visible instead of read as miscalibration.
+    ks_floor = 1.0 / (2.0 * float(L + 1))
 
     mean_pit = float(np.mean(pit))
     var_pit = float(np.var(pit))
@@ -557,6 +640,7 @@ def _component_uniformity(
         pit=pit,
         ks_stat=ks_stat,
         band_half_width=band_half_width,
+        ks_floor=ks_floor,
         band_violation=ks_stat > band_half_width,
         mean_pit=mean_pit,
         var_pit=var_pit,
@@ -678,17 +762,40 @@ def wilson_interval(
 
 @dataclass(frozen=True)
 class CoverageRow:
-    """One line of the coverage table.
+    """One line of the coverage table, decided on the interval not the point.
+
+    The verdict reads the Wilson CI, never ``rate`` against ``band`` directly.
+    An empirical coverage rate is a binomial proportion, and at the replicate
+    counts SBC actually runs at it is far too noisy to compare with a +/- 0.05
+    window: at ``n = 30`` a *perfectly calibrated* 0.90 lands outside
+    [0.85, 0.95] about a third of the time, so a point-estimate gate mostly
+    measures ``n``. The two questions are therefore separated:
+
+      * ``in_range`` — the pass/fail decision. True when the CI *overlaps*
+        ``nominal``, i.e. the data are consistent with correct coverage. A row
+        fails only when the CI excludes ``nominal``, which is real evidence of
+        miscalibration rather than a small-sample artefact.
+      * ``conclusive`` — whether the CI also fits entirely inside ``band``, i.e.
+        whether ``n`` was large enough to *rule out* a coverage error big enough
+        to matter. ``in_range and not conclusive`` is the underpowered verdict:
+        no evidence against calibration, and not enough evidence for it either.
 
     Attributes:
         name: Component name, or ``theta_w`` for the pooled latent row.
-        n: Interval draws contributing (replicates, or wallet intervals).
+        n: Interval draws contributing (replicates, or wallet intervals). Kept
+            on the row because the verdict is only readable next to it.
         n_hits: How many contained the truth.
         rate: Empirical coverage ``n_hits / n``.
-        ci_lo: Wilson lower bound at the table's alpha.
-        ci_hi: Wilson upper bound.
+        ci_lo: Wilson lower bound at ``row_alpha``.
+        ci_hi: Wilson upper bound at ``row_alpha``.
         nominal: Nominal interval level the hits were computed at.
-        in_range: Whether ``rate`` lies inside the R4 acceptance band.
+        band: R4 acceptance window the CI is checked against for
+            conclusiveness.
+        row_alpha: Two-sided level this row's CI was built at — the table's
+            ``alpha`` Bonferroni-divided by the number of rows, so "no coverage
+            row failed" holds jointly over the table.
+        in_range: CI overlaps ``nominal``; the pass/fail decision.
+        conclusive: CI lies entirely inside ``band``; the power check.
         note: Caveat attached to this row, empty when there is none.
     """
 
@@ -699,8 +806,18 @@ class CoverageRow:
     ci_lo: float
     ci_hi: float
     nominal: float
+    band: tuple[float, float]
+    row_alpha: float
     in_range: bool
+    conclusive: bool
     note: str = ""
+
+    @property
+    def verdict(self) -> str:
+        """One-token reading of ``(in_range, conclusive)`` for report tables."""
+        if not self.in_range:
+            return "fail"
+        return "pass (conclusive)" if self.conclusive else "pass (underpowered)"
 
     def to_dict(self) -> dict[str, Any]:
         """JSON-serializable view of the row."""
@@ -712,7 +829,11 @@ class CoverageRow:
             "ci_lo": self.ci_lo,
             "ci_hi": self.ci_hi,
             "nominal": self.nominal,
+            "band": list(self.band),
+            "row_alpha": self.row_alpha,
             "in_range": self.in_range,
+            "conclusive": self.conclusive,
+            "verdict": self.verdict,
             "note": self.note,
         }
 
@@ -723,14 +844,18 @@ def _coverage_row(
     *,
     nominal: float,
     band: tuple[float, float],
-    alpha: float,
+    row_alpha: float,
     note: str = "",
 ) -> CoverageRow:
-    """Build one coverage row from a flat sequence of hit indicators."""
+    """Build one coverage row, deciding pass/fail and power from the Wilson CI."""
     n = len(hits)
     n_hits = int(sum(bool(h) for h in hits))
     rate = n_hits / n if n else 0.0
-    lo, hi = wilson_interval(n_hits, n, alpha=alpha)
+    lo, hi = wilson_interval(n_hits, n, alpha=row_alpha)
+    # An empty row carries no interval at all (`wilson_interval` returns the
+    # whole unit interval), so it can be neither a failure nor a pass anyone
+    # should read: report it as failing to keep it visible in `flagged`.
+    overlaps = bool(n) and lo <= nominal <= hi
     return CoverageRow(
         name=name,
         n=n,
@@ -739,7 +864,10 @@ def _coverage_row(
         ci_lo=lo,
         ci_hi=hi,
         nominal=nominal,
-        in_range=bool(n) and band[0] <= rate <= band[1],
+        band=band,
+        row_alpha=row_alpha,
+        in_range=overlaps,
+        conclusive=overlaps and band[0] <= lo and hi <= band[1],
         note=note,
     )
 
@@ -765,15 +893,21 @@ def coverage_table(
     """Build the nominal-interval coverage table over already-selected replicates.
 
     One row per phi component, plus a pooled ``theta_w`` row when any replicate
-    recorded wallet intervals. Rows outside ``band`` are flagged via
-    ``CoverageRow.in_range``; nothing is dropped.
+    recorded wallet intervals. Each row's verdict is read off its Wilson CI (see
+    ``CoverageRow``); nothing is dropped.
+
+    ``alpha`` is *family-wise across the table*: every row's CI is built at
+    ``alpha / n_rows``, matching how ``rank_uniformity`` treats its bands. Nine
+    independent 95% decisions would flag a perfectly calibrated pipeline about
+    37% of the time, which is precisely the n-blind false alarm this
+    interval-based gate exists to remove.
 
     Args:
         rows: Usable replicate rows, each carrying a full ``hits90`` mapping.
         components: Phi components to tabulate, in report order.
         nominal: Nominal interval level the harness recorded hits at.
-        band: Acceptance window for the empirical rate (R4).
-        alpha: Two-sided level for the Wilson CI.
+        band: Acceptance window used for the conclusiveness check (R4).
+        alpha: Family-wise two-sided level for the Wilson CIs.
 
     Returns:
         Coverage rows in ``components`` order, ``theta_w`` last when present.
@@ -781,6 +915,12 @@ def coverage_table(
     Raises:
         ValueError: If a row is missing a component's hit indicator.
     """
+    per_replicate = _theta_hits(rows)
+    # Bonferroni denominator has to be known before the first row is built, so
+    # the theta_w row's presence is settled up front rather than appended later.
+    n_rows = len(components) + (1 if per_replicate else 0)
+    row_alpha = alpha / n_rows if n_rows else alpha
+
     table: list[CoverageRow] = []
     for component in components:
         try:
@@ -793,11 +933,10 @@ def coverage_table(
                 hits,
                 nominal=nominal,
                 band=band,
-                alpha=alpha,
+                row_alpha=row_alpha,
             ),
         )
 
-    per_replicate = _theta_hits(rows)
     if per_replicate:
         pooled = [h for replicate in per_replicate for h in replicate]
         table.append(
@@ -806,7 +945,7 @@ def coverage_table(
                 pooled,
                 nominal=nominal,
                 band=band,
-                alpha=alpha,
+                row_alpha=row_alpha,
                 note=_THETA_DEPENDENCE_NOTE,
             ),
         )
@@ -934,10 +1073,12 @@ class SBCSummary:
             the ranks test the posterior against.
         alpha: Significance level threaded through every test and band.
         nominal: Nominal interval level.
-        band: R4 acceptance window for the empirical coverage.
+        band: R4 acceptance window used for the coverage conclusiveness check.
         include_degenerate: Whether degenerate rows entered the statistics.
         uniformity: Per-component rank verdicts.
         coverage: The coverage table, ``theta_w`` last when present.
+        coverage_power: Conclusive / underpowered accounting over ``coverage``;
+            a passing table at small ``n`` proves nothing on its own.
         failures: Failure and degeneracy accounting over all rows.
         z_auc: Pooled ``{"n", "mean", "sd"}`` for the latent-Z health metric.
         theta_w: Wallet-interval block, or None when none were recorded.
@@ -957,6 +1098,7 @@ class SBCSummary:
     include_degenerate: bool
     uniformity: dict[str, UniformityResult]
     coverage: list[CoverageRow]
+    coverage_power: dict[str, Any]
     failures: FailureAccounting
     z_auc: dict[str, Any]
     theta_w: dict[str, Any] | None
@@ -977,12 +1119,14 @@ class SBCSummary:
             "coverage_band": list(self.band),
             "include_degenerate": self.include_degenerate,
             "coverage": [row.to_dict() for row in self.coverage],
+            "coverage_power": self.coverage_power,
             "uniformity": {k: v.to_dict() for k, v in self.uniformity.items()},
             "theta_w": self.theta_w,
             "z_auc": self.z_auc,
             "failures": self.failures.to_dict(),
             "sensitivity": self.sensitivity,
             "flagged": list(self.flagged),
+            "alpha_note": ALPHA_FAMILY_NOTE,
             "interpretation_key": RANK_INTERPRETATION_KEY,
         }
 
@@ -1016,6 +1160,29 @@ def _z_auc_block(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _coverage_power(coverage: Sequence[CoverageRow]) -> dict[str, Any]:
+    """Report how much of the coverage table is conclusive rather than just passing.
+
+    Args:
+        coverage: The table as returned by ``coverage_table``.
+
+    Returns:
+        Counts per verdict, the names of the underpowered rows, the smallest
+        contributing ``n``, and ``_COVERAGE_POWER_NOTE``.
+    """
+    underpowered = [row.name for row in coverage if row.in_range and not row.conclusive]
+    return {
+        "n_rows": len(coverage),
+        "n_pass_conclusive": sum(1 for row in coverage if row.conclusive),
+        "n_pass_underpowered": len(underpowered),
+        "n_fail": sum(1 for row in coverage if not row.in_range),
+        "underpowered": underpowered,
+        "min_n": min((row.n for row in coverage), default=0),
+        "row_alpha": coverage[0].row_alpha if coverage else None,
+        "note": _COVERAGE_POWER_NOTE,
+    }
+
+
 def _collect_flags(
     uniformity: dict[str, UniformityResult],
     coverage: Sequence[CoverageRow],
@@ -1035,9 +1202,15 @@ def _collect_flags(
                 f"(D={result.ks_stat:.3f} > {result.band_half_width:.3f})",
             )
     for row in coverage:
+        # Only a CI that *excludes* the nominal level is evidence. Underpowered
+        # rows (CI overlaps nominal but is wider than the band) are reported in
+        # the summary's `coverage_power` block instead of as failures, so a
+        # short run reads as "not yet conclusive" rather than "miscalibrated".
         if not row.in_range:
             flags.append(
-                f"{row.name}: coverage {row.rate:.3f} outside the acceptance band",
+                f"{row.name}: coverage {row.rate:.3f} (n={row.n}), "
+                f"CI [{row.ci_lo:.3f}, {row.ci_hi:.3f}] excludes the nominal "
+                f"{row.nominal:.2f}",
             )
     if failures.failure_rate > FAILURE_RATE_FLAG:
         flags.append(
@@ -1066,7 +1239,8 @@ def analyze(
         n_bins: Chi-square bin count; ``None`` picks ``default_n_bins``.
         alpha: Significance level for tests, bands, and CIs.
         nominal: Nominal interval level the harness recorded hits at.
-        band: R4 acceptance window for empirical coverage.
+        band: R4 acceptance window; a coverage row is *conclusive* when its CI
+            fits inside it (the pass/fail decision is CI-vs-``nominal``).
         include_degenerate: Fold non-converged / fallback replicates into the
             headline statistics instead of only the sensitivity block.
 
@@ -1138,6 +1312,7 @@ def analyze(
         include_degenerate=include_degenerate,
         uniformity=uniformity,
         coverage=coverage,
+        coverage_power=_coverage_power(coverage),
         failures=failures,
         z_auc=_z_auc_block(selected),
         theta_w=_theta_block(selected),

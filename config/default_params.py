@@ -278,17 +278,25 @@ class OnlineScorerConfig:
         beta_window: Number of most-recent trades the beta refresh refits on.
             ``None`` uses `effective_window`, so the beta block forgets on the
             same timescale as the variance/transition blocks.
-        rho_t0: Offset in the Robbins-Monro rate, i.e. the number of
-            pseudo-trades the schedule treats the incoming statistics as
-            already carrying. Must exceed 1: at ``rho_t0 = 1`` the first trade's
-            rate is exactly ``1.0``, whose decay factor ``1 - rho_0 = 0`` erases
-            the seeded statistics `OnlineScorer` starts from — the scorer would
-            jump to the prior on trade 1 instead of starting at the fit it was
-            handed. Deliberately a constant rather than `effective_window`,
-            which degenerates to the `_MAX_EFFECTIVE_WINDOW` seed-weight cap at
-            ``forgetting = 1.0`` and would freeze adaptation for a million
-            trades; the default matches the seed weight at the default
-            ``forgetting = 0.98``. Ignored by the ``"fixed"`` schedule.
+        rho_t0: Offset in the Robbins-Monro rate ``(t + rho_t0) ** -rho_alpha``.
+            *Not* a pseudo-trade count: under the decayed-*sum* recursion the
+            rate alone fixes the quasi-stationary accumulated mass at roughly
+            ``(t + rho_t0) ** rho_alpha``, so the default (50, ``rho_alpha =
+            0.6``) starts the schedule as if about 10.5 trades of mass were in
+            hand at ``t = 0``, not 50. What ``rho_t0`` actually buys is a gentle
+            *first* decay: it caps ``rho_0`` at ``rho_t0 ** -rho_alpha < 1`` so
+            trade 0 keeps most of the statistics `OnlineScorer` was seeded with
+            (measured: a 50-pseudo-trade seed decays to ~42 by ``t = 500`` at
+            the defaults, rather than being erased on trade 1). Must be at least
+            2 — at ``rho_t0 = 1`` the rate is exactly ``1.0`` and the decay
+            factor ``1 - rho_0`` is ``0``, and just above 1 it is small enough
+            (``~6e-5`` at ``rho_t0 = 1.0001``) that the seed is wiped in all but
+            name, so the scorer would jump to the prior instead of starting at
+            the fit it was handed. Deliberately a constant rather than
+            `effective_window`, which degenerates to the
+            `_MAX_EFFECTIVE_WINDOW` seed-weight cap at ``forgetting = 1.0`` and
+            would freeze adaptation for a million trades. Ignored by the
+            ``"fixed"`` schedule.
 
     Reference: Cappé, O. & Moulines, E. (2009) "On-line
     expectation-maximization algorithm for latent data models", JRSS-B 71(3).
@@ -316,9 +324,12 @@ class OnlineScorerConfig:
         if not 0.5 < self.rho_alpha <= 1.0:
             raise ValueError(f"rho_alpha must be in (0.5, 1]; got {self.rho_alpha}")
         # rho_t0 <= 1 makes rho_0 >= 1, i.e. a first-trade decay factor of zero
-        # (or negative): the seeded statistics would be discarded unread.
-        if self.rho_t0 <= 1.0:
-            raise ValueError(f"rho_t0 must be > 1; got {self.rho_t0}")
+        # (or negative): the seeded statistics would be discarded unread. The
+        # bound is 2 rather than a bare "> 1" because the interval just above 1
+        # is no better in practice - at rho_t0 = 1.0001 the surviving fraction
+        # 1 - rho_0 is ~6e-5, which erases the seed as surely as zero does.
+        if self.rho_t0 < 2.0:
+            raise ValueError(f"rho_t0 must be >= 2; got {self.rho_t0}")
         if self.beta_window is not None and self.beta_window < 2:
             raise ValueError(f"beta_window must be >= 2; got {self.beta_window}")
 

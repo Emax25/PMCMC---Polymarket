@@ -392,6 +392,10 @@ def test_all_zero_delta_stream_stays_finite():
         {"rho_alpha": 1.5},
         {"rho_t0": 1.0},
         {"rho_t0": 0.5},
+        # Just above 1 is rejected too: the surviving seed fraction 1 - rho_0 is
+        # ~6e-5 there, which erases the seeded statistics as surely as 0 does.
+        {"rho_t0": 1.0001},
+        {"rho_t0": 1.9},
         {"beta_window": 1},
     ],
 )

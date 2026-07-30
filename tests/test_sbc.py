@@ -14,6 +14,7 @@ full-size run the plan defers.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,7 @@ from scripts import sbc as sbc_cli
 from src.analysis.plots import figure_sbc_ranks, save_paper_figure
 from src.analysis.sbc import (
     COVERAGE_BAND,
+    NOMINAL_COVERAGE,
     PHI_COMPONENTS,
     SBC_SCHEMA_VERSION,
     THETA_W_KEY,
@@ -188,6 +190,23 @@ def test_default_n_bins_respects_expected_count_floor():
     assert default_n_bins(3, 99) == 2  # floor of 2 bins even for tiny n
 
 
+def test_default_n_bins_warns_when_the_expected_count_floor_is_unreachable(caplog):
+    """Below 2*MIN_EXPECTED_PER_BIN replicates the 2-bin floor wins, loudly.
+
+    The chi-square approximation is not usable there, so the clamp must not be
+    silent: a tiny store would otherwise emit a p_value that looks like every
+    other p_value in the summary.
+    """
+    with caplog.at_level(logging.WARNING, logger="src.analysis.sbc"):
+        assert default_n_bins(6, 99) == 2
+    assert any("expected counts per bin" in r.getMessage() for r in caplog.records)
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="src.analysis.sbc"):
+        assert default_n_bins(40, 99) == 8
+    assert not caplog.records
+
+
 def test_wilson_interval_brackets_the_point_estimate():
     """Wilson bounds bracket the rate and stay inside [0, 1] at the extremes."""
     lo, hi = wilson_interval(90, 100)
@@ -217,9 +236,21 @@ def test_calibrated_fixture_passes_uniformity_and_coverage():
         assert result.counts.sum() == 400
 
     for row in summary.coverage:
+        # The verdict is the interval, not the point: a row passes because its
+        # Wilson CI covers the nominal level.
+        assert row.ci_lo <= NOMINAL_COVERAGE <= row.ci_hi, f"{row.name} n={row.n}"
         assert row.in_range, f"{row.name} rate={row.rate}"
         assert COVERAGE_BAND[0] <= row.rate <= COVERAGE_BAND[1]
         assert row.ci_lo <= row.rate <= row.ci_hi
+        assert row.verdict.startswith("pass")
+
+    # The pooled wallet row carries 2000 intervals, which is comfortably enough
+    # for its CI to fit inside the acceptance band — i.e. a *conclusive* pass,
+    # the thing 400 replicates of a single phi component cannot deliver.
+    assert summary.coverage[-1].conclusive
+    assert summary.coverage_power["n_fail"] == 0
+    assert summary.coverage_power["n_pass_conclusive"] >= 1
+    assert summary.coverage_power["min_n"] == 400
 
     assert summary.flagged == []
     assert summary.failures.failure_rate == 0.0
@@ -255,6 +286,80 @@ def test_calibrated_fixture_reports_theta_and_z_blocks():
     assert summary.theta_w["between_replicate_sd"] > 0.0
 
 
+# ---------------- Coverage power ----------------
+
+
+def _small_n_rows(n_hits: int, n: int = 30, seed: int = 4242) -> list[dict[str, Any]]:
+    """``n`` rows with uniform ranks and exactly ``n_hits`` interval hits each."""
+    rng = np.random.default_rng(seed)
+    return [
+        _row(
+            i,
+            ranks={c: int(rng.integers(0, L_DRAWS + 1)) for c in PHI_COMPONENTS},
+            hits={c: i < n_hits for c in PHI_COMPONENTS},
+        )
+        for i in range(n)
+    ]
+
+
+def test_small_n_coverage_passes_but_is_reported_as_underpowered():
+    """At n=30 an off-band rate is not evidence: pass, flagged as inconclusive.
+
+    25/30 = 0.833 lies outside the [0.85, 0.95] acceptance band, so the old
+    point-estimate gate called it a coverage failure — yet the Wilson CI runs
+    from roughly 0.59 to 0.95, which a perfectly calibrated 0.90 produces
+    routinely. The row therefore must pass and be counted as underpowered, and
+    nothing may reach `flagged` on that basis.
+    """
+    summary = analyze(_small_n_rows(25))
+
+    for row in summary.coverage:
+        assert row.n == 30
+        assert row.rate < COVERAGE_BAND[0]  # would have failed the old gate
+        assert row.in_range
+        assert not row.conclusive
+        assert row.verdict == "pass (underpowered)"
+        assert row.ci_lo <= NOMINAL_COVERAGE <= row.ci_hi
+
+    power = summary.coverage_power
+    assert power["n_fail"] == 0
+    assert power["n_pass_conclusive"] == 0
+    assert power["n_pass_underpowered"] == len(PHI_COMPONENTS)
+    assert set(power["underpowered"]) == set(PHI_COMPONENTS)
+    assert power["min_n"] == 30
+    assert not [text for text in summary.flagged if "coverage" in text]
+
+
+def test_small_n_coverage_still_fails_when_the_ci_clears_the_nominal_level():
+    """Underpowered is not a free pass: 6/30 excludes 0.90 even at n=30."""
+    summary = analyze(_small_n_rows(6))
+
+    for row in summary.coverage:
+        assert not row.in_range
+        assert row.ci_hi < NOMINAL_COVERAGE
+    assert summary.coverage_power["n_fail"] == len(PHI_COMPONENTS)
+    assert any("excludes the nominal" in text for text in summary.flagged)
+
+
+def test_coverage_ci_level_is_bonferroni_corrected_across_the_table():
+    """The table is one family: each row's CI is widened by the row count."""
+    rows = _calibrated_rows(n=100)
+    table = coverage_table(rows)
+    # 8 phi rows + the pooled theta_w row.
+    assert len(table) == len(PHI_COMPONENTS) + 1
+    for row in table:
+        assert row.row_alpha == pytest.approx(0.05 / len(table))
+
+    # Without the theta_w rows the denominator drops to the phi count alone.
+    for row in rows:
+        row["theta_hits90"] = None
+    narrow = coverage_table(rows)
+    assert len(narrow) == len(PHI_COMPONENTS)
+    assert narrow[0].row_alpha == pytest.approx(0.05 / len(PHI_COMPONENTS))
+    # A wider correction can only widen the interval it produces.
+    assert table[0].ci_hi - table[0].ci_lo >= narrow[0].ci_hi - narrow[0].ci_lo
+
+
 # ---------------- Miscalibrated fixture ----------------
 
 
@@ -271,9 +376,17 @@ def test_miscalibrated_fixture_is_rejected_and_flagged():
     for row in summary.coverage:
         assert not row.in_range
         assert row.rate < COVERAGE_BAND[0]
+        # A failure means the whole CI sits below the nominal level, so no
+        # amount of small-sample noise explains it away.
+        assert row.ci_hi < NOMINAL_COVERAGE
+        assert row.verdict == "fail"
+
+    assert summary.coverage_power["n_fail"] == len(summary.coverage)
+    assert summary.coverage_power["n_pass_underpowered"] == 0
 
     assert len(summary.flagged) >= len(PHI_COMPONENTS)
     assert any("overconfident" in text for text in summary.flagged)
+    assert any("excludes the nominal" in text for text in summary.flagged)
 
 
 def test_rank_uniformity_rejects_a_location_bias():
@@ -482,6 +595,23 @@ def test_write_summary_is_json_serializable(tmp_path):
     assert payload["uniformity"]["beta_S"]["counts"]
     assert "pit" not in payload["uniformity"]["beta_S"]
     assert payload["coverage"][0]["name"] == PHI_COMPONENTS[0]
+    # The coverage verdict is unreadable without n, the CI level it was decided
+    # at, and whether the CI was narrow enough to conclude anything.
+    coverage_row = payload["coverage"][0]
+    assert coverage_row["n"] == 50
+    assert coverage_row["row_alpha"] < 0.05
+    assert coverage_row["verdict"].startswith("pass")
+    assert set(coverage_row) >= {"in_range", "conclusive", "band"}
+    assert payload["coverage_power"]["n_rows"] == len(payload["coverage"])
+    assert "underpowered" in payload["coverage_power"]["note"]
+    # The union bound across the three test families travels with the summary,
+    # so nobody reads a lone flag as a 5% event.
+    assert "3 * alpha" in payload["alpha_note"]
+    # DKW discretization floor, so a band violation driven by the rank grid at
+    # small L is visible instead of read as miscalibration.
+    assert payload["uniformity"]["beta_S"]["ks_floor"] == pytest.approx(
+        1.0 / (2.0 * (L_DRAWS + 1)),
+    )
     assert payload["prior"] == prior_fingerprint(_proper_prior())
     assert "overconfident" in payload["interpretation_key"]
     # The P8 caveat travels with the key so no reader takes a U-shape at face

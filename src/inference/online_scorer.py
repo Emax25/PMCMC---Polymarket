@@ -49,6 +49,20 @@ Design notes, in the order they bite:
     special case, not one. Each wallet's counts decay on *its own* trade clock,
     which keeps the update O(1) per trade instead of O(n_wallets).
 
+  * **Idle regimes are prior-dominated, not fitted.** The variance and
+    transition statistics are split by the *soft* q(V) mass a trade carries, so
+    on a stream that never leaves one volatility regime the other regime's
+    block accumulates only the leak (measured: ~1.8 of 50 pseudo-trades over
+    500 trades at `forgetting = 0.98`). Its seeded mass still decays on
+    schedule, so its MAP drifts from the seed toward the Inverse-Gamma prior
+    mode — and once the two cross, the `sigma2_1 >= sigma2_0` order clamp moves
+    it again on top of that (measured: a seeded `sigma2_1 = 0.5` settling at
+    0.265 over 500 trades without a single high-variance trade). This is the
+    correct Cappé-Moulines answer — an unvisited regime has no data to be fitted
+    to — but it is a reporting hazard: `OnlineScorer.params` for a regime the
+    stream never occupied is seed/prior arithmetic and must not be quoted as a
+    data-driven estimate, nor its movement read as evidence of adaptation.
+
   * **`delta = 0` exclusion.** Same-second trades are dropped from the process-
     variance statistic, mirroring the batch fix (ARCHITECTURE.md §6.1); the
     `1/delta` in `SS_v` would otherwise be a division by zero and poison every
