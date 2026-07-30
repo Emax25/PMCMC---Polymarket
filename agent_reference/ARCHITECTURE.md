@@ -64,7 +64,7 @@
 1. **Refine the research paper** — `Monte_Carlo_Simulation/writeup.tex`
 2. **Refine the codebase** — fix approximations, improve data quality
 3. **Optimize speed** — **highest immediate priority** (see [STATUS.md](STATUS.md))
-4. **Future: trading algorithm** — real-time insider scoring on live Polymarket trades
+4. **Trading algorithm** — real-time insider scoring on live Polymarket trades (streaming path shipped 2026-07-28; see §17)
 
 **Workflow:** All execution goes through **`scripts/`** CLIs (`pull_data`, `run_pg`, `run_ipmcmc`, `make_figures`). This is the only supported entrypoint.
 
@@ -84,7 +84,7 @@ Summary (fixed order unless user directs otherwise):
 | P3 | `theta_w` fix + `β_S` investigation |
 | P4 | Paper figures |
 | P5 | γ / s₀² sensitivity script |
-| P6 | Trading infrastructure |
+| P6 | Trading infrastructure (streaming path shipped — §17; tracked as STATUS P14) |
 | P8–P13 | Post-VEM-validation open items (Laplace/PSIS foundation, `SS_v` smoothed moments, `sigma2` order clamp, `tau2` prior, artifact re-runs, `slow` marker) — see [STATUS.md](STATUS.md) |
 
 **Default refinement run (VEM, canonical since 2026-07-23):**
@@ -129,7 +129,8 @@ Model is a **baseline spec** (§5), not immutable — changes OK if synthetic te
 flowchart TB
     subgraph ingest [Data Ingestion]
         G[Gamma API]
-        D[Data API — sole trade source]
+        D[Data API — historical trades]
+        RT[RTDS wss — live trades §9]
     end
 
     subgraph prep [Preprocessing]
@@ -229,6 +230,9 @@ Via `src/analysis/results.py` and `plots.py`.
 | `variational_em.py` | Variational EM (C1) — **canonical engine** | ADF E-step + moment-matched **+ IRLS-Cauchy logistic M-step** (Gelman et al. 2008); `beta_S`/`beta_Z` estimated **when opted in** (`estimate_betas=False` default); `theta_w` offset-adjusted (logit-normal); 50 EM iterations default; gate: AUC 0.885, 68.8 s mean (single-initialization, deterministic warm start, at the iteration cap) |
 | `laplace.py` | Curvature Gaussian over unconstrained `phi` | `PhiPosterior`, `laplace_from_vem`; block-diagonal. **Foundation unsound** — ECM curvature, not observed information; see §14 / STATUS P8 |
 | `parameter_updates.py` | Gibbs/MH | `theta_w` = per-wallet RWMH on logit scale (full logistic Z model; correct for β≠0) |
+| `adf_filter.py` | Stepwise ADF filter | Extracted from the VEM E-step, **output-identical** (exact-equality fixture); `step` / `set_params` / `set_theta_logits`; bit-exact `_logsumexp4` hot path (§13) |
+| `online_scorer.py` | Online EM (Cappé–Moulines) | Per-trade $P(Z_i=1\mid\mathcal{D}_{\leq i})$ over `ADFFilter`; decayed **sums**, `rho` schedules `fixed`/`robbins_monro` with `rho_t0`; consumes public `variational_em.update_beta_irls` |
+| `stream_scoring.py` | Streaming-scorer library | `StreamScorer`, `WarmStart` artifact, `warm_start_payload`; backs `scripts/score_stream.py` (§17) |
 | `diagnostics.py` | R-hat, ESS | arviz |
 
 **PG iteration (historical):** CSMC → sample path → FFBS → `gibbs_sweep` (per market, params pooled).
@@ -245,6 +249,10 @@ These only surfaced on live Polymarket data (synthetic data does not trigger the
 |-------|----------|-----|
 | Extreme price jumps (e.g. 0.001→0.999) make Gaussian `log_lik` → `-inf` → NaN weights | `kalman.py` | Cap `log_lik` at `_LOG_LIK_FLOOR = -500` |
 | Same-second trades have `delta=0`; dividing by zero in σ² Gibbs update → NaN params | `parameter_updates.py` | Drop `delta=0` steps from σ² sufficient statistics |
+
+**Cross-cutting invariant (promoted 2026-07-28):** the `delta=0` variance exclusion is not
+local to `parameter_updates.py` — every consumer of σ² sufficient statistics must honor it,
+including `adf_filter.py` and `online_scorer.py` on the streaming path.
 
 Regression tests: `test_parameter_updates.py` (delta-zero case); SMC/CSMC suites cover Kalman floor.
 
@@ -288,12 +296,16 @@ ranking, `theta_w` Spearman). Run before/after hot-path changes. NB: cProfile
 ```
 config/default_params.py      # presets + PhiPrior (single authoritative prior spec)
 src/utils/transforms.py
-src/data/polymarket_api.py    # Gamma + Data API only
+src/data/polymarket_api.py    # Gamma + Data API (historical); + fetch_trades_windowed
+src/data/rtds.py              # RTDS websocket live trade adapter
+src/data/trade_stream.py      # trade-stream ordering / corruption policy
 src/data/preprocess.py
-src/data/synthetic.py
+src/data/synthetic.py         # + params_from_prior / prior-predictive generator mode
 src/inference/{kalman,smc,csmc,particle_gibbs,ipmcmc,variational_em,laplace,parameter_updates,diagnostics}.py
-src/analysis/{prefilter,results,plots,validation}.py
+src/inference/{adf_filter,online_scorer,stream_scoring}.py
+src/analysis/{prefilter,results,plots,validation,sbc}.py
 scripts/{_shortlist,_runner,pull_data,run_pg,run_ipmcmc,benchmark,validate_vem,pareto,eval_c4,make_figures}.py
+scripts/{stream_trades,score_stream,sbc}.py
 tests/
 Monte_Carlo_Simulation/       # LaTeX paper
 agent_reference/              # ARCHITECTURE.md + STATUS.md + CODE_QUALITY.md
@@ -317,6 +329,13 @@ class MarketData:
 - `PhiPrior` — `config/default_params.py`; the one prior spec consumed by the VEM M-step, `laplace.py` and PSIS
 - `PhiPosterior`, `laplace_from_vem()` — `src/inference/laplace.py`; block-diagonal curvature Gaussian over unconstrained `phi`
 - `src/analysis/validation.py` — samplerless validation layer: `jittered_init`, `top_k_wallets`, `pooled_synthetic_auc`, `restart_record`, `spread`, `mean_pairwise_jaccard`, `stability_block`, `elbo_convergence`, `convergence_block`, `phi_centring_gradient`, plus held-out predictive LL and PSIS-k̂. **Import these from here, never from `scripts/`** (they were moved out of the CLI on 2026-07-25 for plan 3's benefit)
+- `ADFFilter` — `src/inference/adf_filter.py`; stepwise ADF filter **extracted from the VEM E-step and output-identical to it** (exact-equality fixture pins this). Interface: `step()`, `set_params()`, `set_theta_logits()`. Hot path: `_logsumexp4` (see §13)
+- `OnlineScorer` — `src/inference/online_scorer.py`; Cappé–Moulines online EM wrapper over `ADFFilter`. Carries decayed **sums, not averages** (the batch MAP maps consume sum-scale sufficient statistics — the module docstring is authoritative); `rho` schedules `fixed` and `robbins_monro` with `rho_t0` (default 50, ≥ 2, because `rho(0)=1` annihilated the seed). Consumes the now-public `variational_em.update_beta_irls`
+- `src/inference/stream_scoring.py` — streaming-scorer library: `StreamScorer`, the `WarmStart` artifact format, `warm_start_payload()`. **Import from here, never from `scripts/`** (same contract as `validation.py`)
+- `src/data/rtds.py` — RTDS websocket live adapter (§9)
+- `src/data/trade_stream.py` — ordering/corruption policy for trade streams: `iter_jsonl`, `read_replay`, `tail_live`, `OutOfOrderTradeError`
+- `src/analysis/sbc.py` — SBC replicate harness + rank-uniformity/coverage analysis; JSONL store, **schema v2 with an `(L, size, prior)` regime guard** (cross-regime stores are refused, not merged)
+- `variational_em.update_beta_irls` — **PUBLIC** (cross-module contract with `online_scorer`); do not re-privatize
 
 ---
 
@@ -325,7 +344,12 @@ class MarketData:
 | API | Role |
 |-----|------|
 | Gamma | Metadata, slug → conditionId |
-| Data | **Sole trade source** |
+| Data | **Sole HISTORICAL / backfill trade source** (`data-api.polymarket.com/trades`) |
+| RTDS | **Live counterpart** — `wss://ws-live-data.polymarket.com`, `activity/trades` topic, no auth; `src/data/rtds.py`. First-party Polymarket feed, so resolved decision #9 (Data API only, no Goldsky/CLOB) is unchanged in spirit |
+
+**Backfill:** `fetch_trades_windowed` walks timestamp windows to get full history past the
+server offset ceiling — dedupe on `transaction_hash`, offset reset per window. Exposed as
+`pull_data --full-history` (§10).
 
 **Cleaning:** drop invalid → dedupe `transaction_hash` → sort `(timestamp, hash)` → features → wallet IDs.
 
@@ -342,9 +366,22 @@ feature computation; resolution time comes from Gamma `endDate` threaded through
 | `order=volume` ignored | Use `order=volumeNum&ascending=false` |
 | `volume_num_min=X` | Works server-side; pass when `min_volume > 0` |
 | `/markets?slug=X` returns `[]` | Fast path: `/events?slug=X`; fallback: paginated `/markets` scan |
-| Trade `offset` capped at 3000 (HTTP 400 beyond) | Trades are newest-first — cap yields final ~3000 trades; use `--tail-trades 2000` |
+| Two distinct offset limits | `DATA_API_MAX_OFFSET` (3000) is the deliberate **client-side tail budget** (trades are newest-first — yields the final ~3000 trades; pair with `--tail-trades 2000`). `DATA_API_OFFSET_LIMIT` (10000) is the **server ceiling**, reached only by `fetch_trades_windowed` |
 
-Per-market $T \leq 3000$. See also §6.1 for inference-side fixes on real data.
+Per-market $T \leq 3000$ on the default tail path. See also §6.1 for inference-side fixes on real data.
+
+**Probe findings (2026-07-25, empirical against `data-api.polymarket.com/trades`):**
+
+- Max usable `offset` = 10000; `offset=10001` → HTTP 400. The cap applies to `offset` **alone**, so `offset=10000&limit=500` returns 500 rows.
+- Timestamp params are `start` / `end`, in **UNIX SECONDS**, and both bounds are **INCLUSIVE**. 26 other candidate names (`from`, `after`, `startTs`, …) are silently ignored; millisecond values behave as no filter at all.
+- `start=0` / `end=0` are **falsy server-side** and are never sent — an epoch-start window uses `ts=1`.
+- `transactionHash` is unique across taker-side rows, which is what makes it a valid dedupe key; `takerOnly=false` would break that uniqueness.
+- Live cross-check: a windowed pull is **set-identical** to an unfiltered pull, 0 duplicates.
+
+**RTDS message schema — VERIFIED live 2026-07-25:** field names match the REST payload
+(`proxyWallet`, `conditionId`, `transactionHash`, `price`, `size`, `side`); trade `timestamp`
+is in **seconds** while the envelope `ts` is in **milliseconds**; empty text frames are
+keepalives, not malformed messages.
 
 ### 9.5 Real-data analysis notes
 
@@ -367,6 +404,10 @@ python -m scripts.run_ipmcmc --config prod \
 python -m scripts.run_pg --synthetic --config dev              # validation
 python -m scripts.pareto.py --output results/figures/pareto.png
 python -m scripts.make_figures --chain results/chains/*.pkl
+python -m scripts.stream_trades --markets <cond_id>          # live RTDS capture → JSONL/Parquet
+python -m scripts.score_stream --replay trades.jsonl \
+  --warm-start results/warm_start.json --output scores.jsonl # per-trade P(Z|D<=i)
+python -m scripts.sbc --n-sims 200 --n-jobs 8                 # SBC replicates (blocked — P8/P11)
 python -m pytest tests/ -q
 ```
 
@@ -383,6 +424,10 @@ python -m pytest tests/ -q
 - `validate_vem.py --config {dev|half-prod|...}` — samplerless validation ladder (§12): ELBO traces, jittered-restart stability, held-out one-step predictive LL, PSIS-k̂ + `phi_centring_gradient`; writes `results/validation/*.json` with a `convergence_status` block.
 - `pareto.py` — AUC-vs-wall-clock Pareto figure from bench JSONs; output to PNG + CSV.
 - `eval_c4.py` — C4 full-scale eval (K=10, T=2000) [deferred].
+- `pull_data --full-history` — windowed backfill from the epoch via `fetch_trades_windowed` instead of the newest-first tail. Per-market failure isolation: one market failing does not abort the pull, and the run summary is marked **INCOMPLETE**. `--tail-trades` is applied *post-retrieval*.
+- `stream_trades.py` — live RTDS capture. `--markets` (condition IDs), `--parquet-every N` (rolling Parquet flush), `--max-trades N`, `--stale-after S` (reconnect on a silent socket); clean SIGINT shutdown that flushes before exit.
+- `score_stream.py` — streaming insider scorer over `StreamScorer`. `--replay FILE` / `--live` (mutually exclusive), `--warm-start` (batch VEM artifact), `--forgetting` (`rho` decay), `--n-refresh` (M-step refresh cadence). Writes a scores JSONL plus a **deterministic `<output>.meta.json` sidecar**; in live mode it pre-seeds the dedupe set from an existing output so a restart skips already-scored trades.
+- `sbc.py` — SBC replicate harness. `--n-sims`, `--n-jobs` (joblib), `--resume` (append to the JSONL store), `--analyze` (rank-uniformity + coverage tables and figures). **Refuses cross-regime stores** (schema-v2 `(L, size, prior)` guard). The coverage table prints Wilson-CI verdicts including `pass (underpowered)`. Currently non-executable end to end: `default_sbc_prior()` fails fast on the improper `tau2` prior (STATUS P8/P11).
 
 ---
 
@@ -421,10 +466,17 @@ Correct **iff** synthetic injection passes:
 | Restart stability | Is the answer an artifact of the initialization? | Jittered restarts (init jitter log-sd 0.1) → pooled-AUC `spread` + top-K `mean_pairwise_jaccard`. **Distinct from data-seed sensitivity** — report both, never conflate |
 | Held-out one-step predictive LL | Does the fit predict unseen trades? | Per-trade held-out LL |
 | PSIS-k̂ + `phi_centring_gradient` | Is the Laplace proposal adequate for the target? | k̂, plus the target gradient at the centre in Laplace-sd units. **Stop condition: k̂ > 0.7 escalates to the user** — it has fired (k̂ = 5.82 dev / 24.0 gate) |
+| SBC ranks + `theta_w` coverage | Is the whole posterior calibrated? | Rank uniformity + interval coverage per parameter row; harness `src/analysis/sbc.py` / `scripts/sbc.py`. Acceptance semantics below |
 
 The PSIS target is **conditional on `theta_w_hat`** (held fixed across draws) — it is not a marginal over parameters.
 
-SBC (Talts et al. 2018) and `theta_w` coverage are deferred to plan 3, which is **blocked** on the Laplace-foundation rebuild (STATUS P8).
+**SBC / coverage acceptance semantics** (Talts et al. 2018; harness landed 2026-07-28):
+
+- The **R4 gate is an interval-overlap gate, not a point-estimate gate**: the Wilson CI for a row's empirical coverage — **Bonferroni-corrected across the table** — must overlap the nominal 0.90. `[0.85, 0.95]` is the *conclusiveness* band, i.e. how tight the CI must be to say anything, not a pass threshold on the estimate.
+- Power: roughly **~400 replicates** are needed before the `phi` rows can be conclusive.
+- The **uniformity flag fires on Holm-corrected chi-square OR a DKW band violation** — a deliberate 2-family union bound; together with coverage the overall error rate is $\leq 3\alpha$.
+- `ks_floor = 1/(2(L+1))` — the rank-discretization floor, reported per row so a "violation" at the floor is recognizable as discretization, not miscalibration.
+- **Evidence runs are deferred** (STATUS P8/P11): `default_sbc_prior()` refuses to draw from the improper `tau2` IG(1e-9, 1e-9), so the 200-replicate run and the production-size confirmation run are open. The harness is landed and fails fast rather than producing a meaningless store.
 
 ---
 
@@ -439,6 +491,7 @@ SBC (Talts et al. 2018) and `theta_w` coverage are deferred to plan 3, which is 
 |------|--------|
 | RNG | `default_rng(seed)`; pass `rng` explicitly |
 | Weights | Log-space + `logsumexp` |
+| Hot-path LSE | `adf_filter._logsumexp4` replaces `scipy.special.logsumexp` on the per-trade path and is **pinned bit-exact to scipy's algorithm** (570k-vector fuzz, 0 mismatches; an identity fixture enforces it). scipy is no longer imported on that path (~5.6× on `ADFFilter.step`, ~4.8× on the batch E-step). Do not "simplify" it |
 | Vectorization | Particle dim = NumPy, not Python loops |
 | Logic location | `src/` only (`scripts/` is a thin CLI layer) |
 | Persistence | Pickle chains; Parquet data |
@@ -464,8 +517,11 @@ SBC (Talts et al. 2018) and `theta_w` coverage are deferred to plan 3, which is 
 | Restart (initialization) instability | P8/P9 | **Open finding** — pooled AUC across jittered restarts spans 0.376–0.915 (dev), 0.388–0.877 (gate); gate top-K Jaccard 0.171. Deterministic warm start is stable across *data* seeds (0.885/0.899/0.893/0.915). Headline AUC 0.885 = single-initialization, deterministic-warm-start, at-the-cap |
 | Committed validation artifacts pre-convergence | P12 | `results/validation/{dev.json,gate/gate.json}` hit the 50-iteration cap (rel. ELBO change 5.35e-4 / 1.31e-3 vs tol 1e-4). Best-restart selection not meaningful there (terminal-ELBO spread < one iteration's gain) |
 | `sigma2` order clamp / `SS_v` moments / `m_Z` ordering | P9/P10 | open — see §6.2 |
-| `PhiPrior` `tau2` = IG(1e-9, 1e-9) ≈ improper Jeffreys | P11 | open — blocks SBC prior draws |
-| `slow` pytest marker unregistered | P13 | open — no pytest config file in repo |
+| `PhiPrior` `tau2` = IG(1e-9, 1e-9) ≈ improper Jeffreys | P11 | open — blocks SBC prior draws; `default_sbc_prior()` fails fast rather than sample |
+| `slow` pytest marker unregistered | P13 | DONE — `pytest.ini` registers `slow` (2026-07-28) |
+| Online scorer + streaming ingestion | P14 | DONE — `adf_filter.py` / `online_scorer.py` / `stream_scoring.py`, RTDS + replay (§17) |
+| SBC / coverage harness | P15 | DONE (code) — **evidence runs open**, blocked on P8/P11; acceptance semantics in §12.1 |
+| Unvisited `V` regime online | P14 caveat | Open limitation — if a regime is never visited in the stream, its `sigma2` stays prior/seed-dominated; it is not a data-driven fit and must not be read as one |
 
 ---
 
@@ -481,10 +537,16 @@ SBC (Talts et al. 2018) and `theta_w` coverage are deferred to plan 3, which is 
 | `test_ipmcmc.py` | Swap, degeneracy |
 | `test_synthetic.py` | Generator |
 | `test_preprocess.py` | Cleaning, Parquet |
-| `test_polymarket_api.py` | API client |
+| `test_polymarket_api.py` | API client + `fetch_trades_windowed` |
 | `test_results.py` | Summaries, ROC |
 | `test_plots.py` | Figures |
-| `test_scripts.py` | CLI smoke tests |
+| `test_scripts.py` | CLI smoke tests (incl. `stream_trades`, `score_stream`, `sbc`) |
+| `test_adf_filter.py` | Stepwise ADF filter; exact-equality vs the VEM E-step; `_logsumexp4` identity |
+| `test_online_scorer.py` | Cappé–Moulines online EM, `rho` schedules, sum-scale statistics |
+| `test_rtds.py` | RTDS websocket adapter, keepalives, reconnect |
+| `test_sbc.py` | SBC harness, JSONL resume, regime guard, rank/coverage analysis |
+
+`pytest.ini` registers the `slow` marker (2026-07-28).
 
 ---
 
@@ -506,18 +568,25 @@ SBC (Talts et al. 2018) and `theta_w` coverage are deferred to plan 3, which is 
 
 ---
 
-## 17. Future: Trading Algorithm (P6)
+## 17. Trading Algorithm (P6 / STATUS P14) — shipped 2026-07-28
 
-**Input:** Live trades (Data API / future WebSocket).
+**Input:** Live trades via RTDS websocket (`src/data/rtds.py`) or a recorded JSONL replay
+(`src/data/trade_stream.py`).
 
-**Output:** $P(Z_i=1 \mid \mathcal{D}_{\leq i})$ per trade.
+**Output:** $P(Z_i=1 \mid \mathcal{D}_{\leq i})$ per trade — one score per trade, emitted as it arrives.
 
 ```
-Live trades → preprocess features → filter-only CSMC or warm-started MCMC
-           → P(Z=1) + θ_w lookup → signal layer (user-defined)
+RTDS live / JSONL replay → trade_stream ordering policy → StreamScorer
+    → OnlineScorer (Cappé–Moulines online EM) over ADFFilter
+    → P(Z=1) + θ_w lookup → signal layer (user-defined)
 ```
 
-**Refactor now:** kernels callable without MCMC wrapper; numba; open markets only; online wallet index.
+Shipped shape:
+
+- `scripts/stream_trades.py` captures; `scripts/score_stream.py` scores (`--replay` / `--live`, §10).
+- Warm start from a batch VEM fit (`stream_scoring.warm_start_payload`); a wallet with no history cold-starts at the **Beta(a, b) prior mean**.
+- **Replay mode is plan 5's no-lookahead evaluation substrate.** Scores use a *causal expanding* $\bar S$, so replay scores **deliberately differ** from batch filtered marginals — this is not a regression.
+- **CAVEAT:** if a `V` regime is never visited in the stream, its `sigma2` remains prior/seed-dominated rather than a data-driven fit (§14).
 
 ---
 
