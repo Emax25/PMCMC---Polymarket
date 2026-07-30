@@ -2,8 +2,8 @@
 
 For each slug in `_shortlist.SLUGS`:
   1. Resolve slug → MarketMeta via Gamma API.
-  2. Paginate /trades for its conditionId — the newest ~10000 trades by
-     default, or the entire history under `--full-history`.
+  2. Paginate /trades for its conditionId — the newest `DATA_API_MAX_OFFSET`
+     trades by default, or the entire history under `--full-history`.
   3. Clean + compute features (`build_processed_market`).
   4. Optionally tail to the last `--tail-trades` entries (§8.2 budget).
   5. Build one shared `WalletIndex` over the union of cleaned wallets.
@@ -30,7 +30,9 @@ from pathlib import Path
 
 from scripts._shortlist import SLUGS
 from src.data.polymarket_api import (
+    DATA_API_MAX_OFFSET,
     MarketMeta,
+    PolymarketAPIError,
     fetch_market_by_slug,
     fetch_trades,
     fetch_trades_windowed,
@@ -45,10 +47,12 @@ from src.data.preprocess import (
 
 log = logging.getLogger("pull_data")
 
-# Page budgets for the two retrieval paths. The tail path is offset-capped by the
-# API at ~10000 trades, so 200 pages is already unreachable slack; the windowed
-# path walks arbitrarily far back and raises when its budget runs out, so it gets
-# the wider default (matching `fetch_trades_windowed`'s own).
+# Page budgets for the two retrieval paths. The tail path stops at
+# `fetch_trades`' client-side row budget (`DATA_API_MAX_OFFSET` = 3000, well
+# inside the server's `DATA_API_OFFSET_LIMIT` ceiling), so at 500 trades/page
+# 200 pages is already unreachable slack; the windowed path walks arbitrarily
+# far back and raises when its budget runs out, so it gets the wider default
+# (matching `fetch_trades_windowed`'s own).
 _DEFAULT_MAX_PAGES = 200
 _FULL_HISTORY_MAX_PAGES = 20_000
 
@@ -86,7 +90,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--full-history",
         action="store_true",
         help="Walk timestamp windows to pull each market's entire trade history "
-        "instead of only the newest ~10000 trades. Slow; off by default.",
+        f"instead of only the newest {DATA_API_MAX_OFFSET} trades "
+        "(DATA_API_MAX_OFFSET). Slow; off by default.",
     )
     p.add_argument(
         "--sleep-between",
@@ -134,8 +139,15 @@ def _pull_trades(
     max_pages: int,
     sleep_between: float,
     full_history: bool = False,
-) -> list[tuple[str, list]]:
-    """Returns list of (slug, raw_trades) tuples in shortlist order.
+) -> tuple[list[tuple[str, list]], list[str]]:
+    """Fetch each market's trades, skipping the ones whose fetch fails.
+
+    A single API failure must not discard the markets already pulled: a
+    `--full-history` backfill costs hours per market, and a partial dataset that
+    *names its gaps* is worth far more than an exception that throws the whole
+    pull away. Each failure is logged as it happens; the failed slugs are
+    returned so `main` can close with a summary the reader cannot miss, rather
+    than a partial pull that looks complete.
 
     Args:
         metas: Resolved market metadata, in shortlist order.
@@ -143,31 +155,47 @@ def _pull_trades(
         sleep_between: Seconds between paginated /trades calls.
         full_history: Walk timestamp windows back to epoch instead of taking the
             offset-capped tail of the newest trades.
+
+    Returns:
+        ``(pulled, failed_slugs)`` — ``pulled`` is the ``(slug, raw_trades)``
+        pairs that succeeded, in shortlist order; ``failed_slugs`` names the
+        markets missing from it.
     """
     out: list[tuple[str, list]] = []
+    failed: list[str] = []
     for meta in metas:
         log.info("pulling /trades for %s …", meta.slug)
         t0 = time.monotonic()
-        if full_history:
-            trades = fetch_trades_windowed(
-                meta.condition_id,
-                start_ts=_EPOCH_START_TS,
-                max_pages=max_pages,
-                sleep_between=sleep_between,
+        try:
+            if full_history:
+                trades = fetch_trades_windowed(
+                    meta.condition_id,
+                    start_ts=_EPOCH_START_TS,
+                    max_pages=max_pages,
+                    sleep_between=sleep_between,
+                )
+            else:
+                trades = fetch_trades(
+                    meta.condition_id,
+                    max_pages=max_pages,
+                    sleep_between=sleep_between,
+                )
+        except PolymarketAPIError as err:
+            log.error(
+                "  -> FAILED %s after %.1fs: %s",
+                meta.slug,
+                time.monotonic() - t0,
+                err,
             )
-        else:
-            trades = fetch_trades(
-                meta.condition_id,
-                max_pages=max_pages,
-                sleep_between=sleep_between,
-            )
+            failed.append(meta.slug)
+            continue
         log.info(
             "  -> %d raw trades in %.1fs",
             len(trades),
             time.monotonic() - t0,
         )
         out.append((meta.slug, trades))
-    return out
+    return out, failed
 
 
 def _tail(market: ProcessedMarket, n: int) -> ProcessedMarket:
@@ -198,7 +226,9 @@ def main(argv: list[str] | None = None) -> int:
         argv: Argument list passed to argparse; defaults to ``sys.argv[1:]``.
 
     Returns:
-        Exit code (0 on success).
+        Exit code: 0 when at least one market was saved — a pull that lost some
+        markets to API failures still writes the rest and logs an ``INCOMPLETE``
+        line naming them — and 1 when every market failed.
     """
     args = _parse_args(argv)
     logging.basicConfig(
@@ -211,12 +241,18 @@ def main(argv: list[str] | None = None) -> int:
     max_pages = args.max_pages
     if max_pages is None:
         max_pages = _FULL_HISTORY_MAX_PAGES if args.full_history else _DEFAULT_MAX_PAGES
-    trades_by_market = _pull_trades(
+    trades_by_market, failed_slugs = _pull_trades(
         metas,
         max_pages=max_pages,
         sleep_between=args.sleep_between,
         full_history=args.full_history,
     )
+    if not trades_by_market:
+        log.error(
+            "every market failed to pull (%s) — nothing to clean or save",
+            ", ".join(failed_slugs),
+        )
+        return 1
 
     resolution_ts_by_slug = {
         meta.slug: _resolution_ts_from_end_date(meta.end_date) for meta in metas
@@ -274,7 +310,18 @@ def main(argv: list[str] | None = None) -> int:
         wallet_index.n_wallets,
     )
 
-    log.info("done.")
+    if failed_slugs:
+        # Repeated at the end because the per-market error scrolled past long
+        # ago on a multi-hour backfill, and this is the line a reader uses to
+        # decide whether the directory is a complete dataset.
+        log.error(
+            "done — INCOMPLETE: %d of %d market(s) failed and were not saved: %s",
+            len(failed_slugs),
+            len(metas),
+            ", ".join(failed_slugs),
+        )
+    else:
+        log.info("done.")
     return 0
 
 

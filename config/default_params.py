@@ -248,11 +248,12 @@ class OnlineScorerConfig:
         ``1 / (1 - forgetting)`` trades, so the estimator tracks a *drifting*
         parameter forever rather than converging. This is the live-trading
         setting.
-      * ``"robbins_monro"``: ``rho_t = (t + 1) ** -rho_alpha`` — a decreasing
-        rate satisfying the Robbins-Monro conditions (sum rho = inf,
-        sum rho^2 < inf) for ``rho_alpha`` in ``(0.5, 1]``, so the estimator
-        *converges* to the batch fixed point on a stationary stream. This is
-        the setting for offline replay/validation against batch VEM.
+      * ``"robbins_monro"``: ``rho_t = (t + rho_t0) ** -rho_alpha`` — a
+        decreasing rate satisfying the Robbins-Monro conditions (sum rho = inf,
+        sum rho^2 < inf) for ``rho_alpha`` in ``(0.5, 1]`` and any finite
+        ``rho_t0``, so the estimator *converges* to the batch fixed point on a
+        stationary stream. This is the setting for offline replay/validation
+        against batch VEM.
 
     ``forgetting = 1.0`` (the "fixed" schedule with ``rho_t == 0``) is the
     degenerate no-adaptation case and is load-bearing: combined with
@@ -277,6 +278,17 @@ class OnlineScorerConfig:
         beta_window: Number of most-recent trades the beta refresh refits on.
             ``None`` uses `effective_window`, so the beta block forgets on the
             same timescale as the variance/transition blocks.
+        rho_t0: Offset in the Robbins-Monro rate, i.e. the number of
+            pseudo-trades the schedule treats the incoming statistics as
+            already carrying. Must exceed 1: at ``rho_t0 = 1`` the first trade's
+            rate is exactly ``1.0``, whose decay factor ``1 - rho_0 = 0`` erases
+            the seeded statistics `OnlineScorer` starts from — the scorer would
+            jump to the prior on trade 1 instead of starting at the fit it was
+            handed. Deliberately a constant rather than `effective_window`,
+            which degenerates to the `_MAX_EFFECTIVE_WINDOW` seed-weight cap at
+            ``forgetting = 1.0`` and would freeze adaptation for a million
+            trades; the default matches the seed weight at the default
+            ``forgetting = 0.98``. Ignored by the ``"fixed"`` schedule.
 
     Reference: Cappé, O. & Moulines, E. (2009) "On-line
     expectation-maximization algorithm for latent data models", JRSS-B 71(3).
@@ -287,6 +299,7 @@ class OnlineScorerConfig:
     rho_schedule: str = "fixed"
     rho_alpha: float = 0.6
     beta_window: int | None = None
+    rho_t0: float = 50.0
 
     def __post_init__(self) -> None:
         """Reject schedules that would silently produce a non-convergent rate."""
@@ -302,6 +315,10 @@ class OnlineScorerConfig:
         # leaves sum rho_t finite (the estimate freezes short of the optimum).
         if not 0.5 < self.rho_alpha <= 1.0:
             raise ValueError(f"rho_alpha must be in (0.5, 1]; got {self.rho_alpha}")
+        # rho_t0 <= 1 makes rho_0 >= 1, i.e. a first-trade decay factor of zero
+        # (or negative): the seeded statistics would be discarded unread.
+        if self.rho_t0 <= 1.0:
+            raise ValueError(f"rho_t0 must be > 1; got {self.rho_t0}")
         if self.beta_window is not None and self.beta_window < 2:
             raise ValueError(f"beta_window must be >= 2; got {self.beta_window}")
 
@@ -324,12 +341,13 @@ class OnlineScorerConfig:
                 0-based index in the stream.
 
         Returns:
-            ``rho_t`` in ``[0, 1]``; exactly ``0.0`` only in the frozen
-            ``forgetting = 1.0`` / ``"fixed"`` case.
+            ``rho_t`` in ``[0, 1)``; exactly ``0.0`` only in the frozen
+            ``forgetting = 1.0`` / ``"fixed"`` case. Never exactly ``1.0``,
+            which would wipe the accumulated statistics (see `rho_t0`).
         """
         if self.rho_schedule == "fixed":
             return 1.0 - self.forgetting
-        return float((t + 1) ** -self.rho_alpha)
+        return float((t + self.rho_t0) ** -self.rho_alpha)
 
 
 @dataclass

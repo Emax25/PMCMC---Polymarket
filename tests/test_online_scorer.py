@@ -17,7 +17,7 @@ import pytest
 
 from config.default_params import ModelParams, OnlineScorerConfig
 from src.inference.adf_filter import ADFFilter
-from src.inference.online_scorer import OnlineScorer
+from src.inference.online_scorer import _MAX_BETA_WINDOW, OnlineScorer
 
 # Centering/standardization constants. The scorer holds these fixed for a
 # stream's lifetime, so the tests pass plain, already-representative values
@@ -275,8 +275,15 @@ def test_beta_refresh_is_smooth_and_bounded_under_separation():
     assert np.abs(np.diff(beta[-4:], axis=0)).max() < 1.0
 
 
-def test_no_beta_refresh_leaves_the_coefficients_untouched():
-    """`n_refresh = None` holds beta_S/beta_Z fixed, matching estimate_betas=False."""
+@pytest.mark.parametrize("n_refresh", [None, 0, -1])
+def test_no_beta_refresh_leaves_the_coefficients_untouched(n_refresh):
+    """Every documented never-refresh spelling holds beta_S/beta_Z fixed.
+
+    `None` and any non-positive count all mean "never", matching
+    `variational_em`'s ``estimate_betas=False``; 0 and -1 additionally have to
+    not reach the ``self._t % n_refresh`` schedule check, which would be a
+    ZeroDivisionError and a refresh on every trade respectively.
+    """
     params = _params(beta_S=0.7, beta_Z=1.3)
     scorer = OnlineScorer(
         params,
@@ -284,11 +291,36 @@ def test_no_beta_refresh_leaves_the_coefficients_untouched():
         M_S,
         S_S,
         M_Z,
-        config=OnlineScorerConfig(forgetting=0.95, n_refresh=None),
+        config=OnlineScorerConfig(forgetting=0.95, n_refresh=n_refresh),
     )
     _run(scorer, _stream(300, n_wallets=4, seed=5))
     assert scorer.params.beta_S == params.beta_S
     assert scorer.params.beta_Z == params.beta_Z
+
+
+def test_beta_window_is_capped_when_it_follows_the_effective_window():
+    """`forgetting = 1.0` must not size the refresh buffer at the 1e6 seed cap.
+
+    `effective_window` doubles as the seed weight and is capped at 1e6 there, so
+    a `beta_window = None` refresh config at ``forgetting = 1.0`` would allocate
+    a million-slot deque for a window no one asked for. Non-degenerate settings
+    are far below the cap and must be untouched by it.
+    """
+
+    def _maxlen(**cfg) -> int:
+        scorer = OnlineScorer(
+            _params(),
+            np.full(2, 0.05),
+            M_S,
+            S_S,
+            M_Z,
+            config=OnlineScorerConfig(n_refresh=10, **cfg),
+        )
+        return scorer._buffer.maxlen
+
+    assert _maxlen(forgetting=1.0) == _MAX_BETA_WINDOW + 1
+    assert _maxlen(forgetting=0.98) == 51
+    assert _maxlen(forgetting=0.999) == 1001
 
 
 # ---------------- delta == 0 ----------------
@@ -358,6 +390,8 @@ def test_all_zero_delta_stream_stays_finite():
         {"rho_schedule": "adam"},
         {"rho_alpha": 0.5},
         {"rho_alpha": 1.5},
+        {"rho_t0": 1.0},
+        {"rho_t0": 0.5},
         {"beta_window": 1},
     ],
 )
@@ -373,9 +407,48 @@ def test_robbins_monro_rate_decays_and_fixed_rate_does_not():
     rm = OnlineScorerConfig(rho_schedule="robbins_monro", rho_alpha=0.6)
     assert fixed.rho(0) == pytest.approx(0.02)
     assert fixed.rho(10_000) == pytest.approx(0.02)
-    assert rm.rho(0) == pytest.approx(1.0)
+    assert rm.rho(0) == pytest.approx(50.0**-0.6)
     assert rm.rho(10_000) < rm.rho(10)
     assert OnlineScorerConfig(forgetting=1.0).rho(5) == 0.0
+    # rho_0 < 1 is the load-bearing part: a rate of exactly 1 gives a decay
+    # factor of 0, which would discard the seeded statistics unread.
+    assert rm.rho(0) < 1.0
+
+
+def test_robbins_monro_first_trade_keeps_the_seeded_params():
+    """The Robbins-Monro rate must not erase the seed on trade 0.
+
+    With ``rho_0 = 1`` the recursion's decay factor ``1 - rho_0`` is exactly 0,
+    so the very first trade throws away the statistics seeded from the incoming
+    fit and the parameters jump to the prior — ``q_01`` to the Beta(1, 1) mean
+    0.5 whatever it was fitted at. The `rho_t0` offset is what keeps trade 1
+    starting *at* the handed-over fit; only the long-run limit was pinned
+    before, which this failure mode slips straight through.
+
+    Variances are chosen above the Inverse-Gamma prior's implied floor so the
+    seed inversion is exact rather than clamped (see `_seed_stats`), making the
+    comparison a tight one.
+    """
+    # q_01 / q_10 well away from the Beta(1, 1) prior mean 0.5, which is where
+    # a wiped transition statistic lands.
+    seeded = _params(
+        sigma2_0=0.1, sigma2_1=0.2, tau2_0=0.02, tau2_1=0.002, q_01=0.05, q_10=0.1
+    )
+    scorer = OnlineScorer(
+        seeded,
+        np.full(4, 0.05),
+        M_S,
+        S_S,
+        M_Z,
+        config=OnlineScorerConfig(rho_schedule="robbins_monro", rho_alpha=0.6),
+    )
+    scorer.step(0.1, 0.0, 0.2, 1)
+
+    fitted = scorer.params
+    for name in ("sigma2_0", "sigma2_1", "tau2_0", "tau2_1", "q_01", "q_10"):
+        assert getattr(fitted, name) == pytest.approx(
+            getattr(seeded, name), rel=0.15
+        ), f"{name} moved off the seed on the first trade"
 
 
 def test_robbins_monro_converges_toward_the_batch_variance():
@@ -391,6 +464,14 @@ def test_robbins_monro_converges_toward_the_batch_variance():
         config=OnlineScorerConfig(rho_schedule="robbins_monro", rho_alpha=0.6),
     )
     _run(scorer, stream)
+
+    # A single-variance stream identifies only the regime the fitted V chain
+    # actually occupies: the other accumulates almost no q(V) mass, so its
+    # variance keeps whatever the seed said. Read the occupied regime off the
+    # fitted transition probabilities rather than assuming which one it is.
+    fitted = scorer.params
+    rho_V = fitted.q_01 / (fitted.q_01 + fitted.q_10)
+    occupied = fitted.sigma2_1 if rho_V > 0.5 else fitted.sigma2_0
     # Filtered (not smoothed) increments bias sigma2 low, so this is a
     # containment band, not a point estimate check.
-    assert 0.2 * sigma2_true < scorer.params.sigma2_1 < 3.0 * sigma2_true
+    assert 0.2 * sigma2_true < occupied < 3.0 * sigma2_true

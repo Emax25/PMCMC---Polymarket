@@ -14,6 +14,7 @@ full-size run the plan defers.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,7 @@ from src.analysis.sbc import (
     default_n_bins,
     failure_accounting,
     load_results,
+    prior_fingerprint,
     rank_bin_edges,
     rank_uniformity,
     run_replicate,
@@ -55,6 +57,29 @@ L_DRAWS = 99  # small support keeps fixtures fast; rank in {0, ..., 99}
 # ---------------- Fixture builders ----------------
 
 
+def _proper_prior() -> PhiPrior:
+    """A samplable prior standing in for the P11-blocked shipped default.
+
+    The tau2 defaults (IG(1e-9, 1e-9)) cannot be drawn from at all, and the
+    beta Cauchy scale is narrowed from 2.5 to 0.5 so a heavy-tailed draw cannot
+    turn a bookkeeping test into a flaky one. The *same* object is threaded into
+    the generator and the fit, which is the property SBC actually depends on.
+    """
+    return PhiPrior(
+        sigma2_ig_alpha=3.0,
+        sigma2_ig_beta=0.05,
+        tau2_ig_alpha=3.0,
+        tau2_ig_beta=0.05,
+        beta_cauchy_scale=0.5,
+    )
+
+
+# Fixture rows are stamped with the same prior the harness tests fit under, so a
+# hand-written store and a store the harness produced belong to one regime and
+# the resume checks can be exercised against either.
+_FIXTURE_SIZE = ReplicateSize(K=3, T=400, n_wallets=30)
+
+
 def _row(
     seed: int,
     *,
@@ -67,8 +92,9 @@ def _row(
     failed: bool = False,
     error: str | None = None,
     L: int = L_DRAWS,
+    prior: PhiPrior | None = None,
 ) -> dict[str, Any]:
-    """Build one schema-v1 replicate row."""
+    """Build one schema-v2 replicate row."""
     return {
         "schema_version": SBC_SCHEMA_VERSION,
         "seed": seed,
@@ -85,7 +111,8 @@ def _row(
             "error": error,
         },
         "elapsed_s": 1.25,
-        "size": {"K": 3, "T": 400, "n_wallets": 30},
+        "size": _FIXTURE_SIZE.to_dict(),
+        "prior": prior_fingerprint(prior if prior is not None else _proper_prior()),
     }
 
 
@@ -114,9 +141,7 @@ def _miscalibrated_rows(n: int = 400, seed: int = 7) -> list[dict[str, Any]]:
     rng = np.random.default_rng(seed)
     rows = []
     for i in range(n):
-        ranks = {
-            c: int(0 if rng.random() < 0.5 else L_DRAWS) for c in PHI_COMPONENTS
-        }
+        ranks = {c: int(0 if rng.random() < 0.5 else L_DRAWS) for c in PHI_COMPONENTS}
         hits = {c: bool(rng.random() < 0.2) for c in PHI_COMPONENTS}
         rows.append(_row(i, ranks=ranks, hits=hits))
     return rows
@@ -210,8 +235,7 @@ def test_calibrated_fixtures_rarely_flag_across_seeds():
     flagged" claim would be worth nothing.
     """
     flagged = [
-        bool(analyze(_calibrated_rows(n=200, seed=1000 + s)).flagged)
-        for s in range(20)
+        bool(analyze(_calibrated_rows(n=200, seed=1000 + s)).flagged) for s in range(20)
     ]
     assert sum(flagged) <= 5
 
@@ -372,9 +396,9 @@ def test_load_results_round_trips_and_drops_duplicate_seeds(tmp_path):
 
 def test_load_results_rejects_wrong_schema_and_malformed_lines(tmp_path):
     """A store this analysis cannot interpret fails loudly with the line number."""
-    bad_version = tmp_path / "v2.jsonl"
+    bad_version = tmp_path / "future_schema.jsonl"
     row = _calibrated_rows(n=1)[0]
-    row["schema_version"] = 2
+    row["schema_version"] = SBC_SCHEMA_VERSION + 1
     _write_jsonl(bad_version, [row])
     with pytest.raises(ValueError, match="schema_version"):
         load_results(bad_version)
@@ -398,6 +422,16 @@ def test_analyze_rejects_mixed_posterior_draw_counts():
     rows = _calibrated_rows(n=10)
     rows[0]["L"] = L_DRAWS + 1
     with pytest.raises(ValueError, match="disagree on L"):
+        analyze(rows)
+
+
+def test_analyze_rejects_replicates_from_different_priors():
+    """Ranks pooled over two priors are well-formed and meaningless; reject them."""
+    rows = _calibrated_rows(n=10)
+    rows[0]["prior"] = prior_fingerprint(
+        replace(_proper_prior(), beta_cauchy_scale=1.5),
+    )
+    with pytest.raises(ValueError, match="disagree on the prior"):
         analyze(rows)
 
 
@@ -448,7 +482,11 @@ def test_write_summary_is_json_serializable(tmp_path):
     assert payload["uniformity"]["beta_S"]["counts"]
     assert "pit" not in payload["uniformity"]["beta_S"]
     assert payload["coverage"][0]["name"] == PHI_COMPONENTS[0]
+    assert payload["prior"] == prior_fingerprint(_proper_prior())
     assert "overconfident" in payload["interpretation_key"]
+    # The P8 caveat travels with the key so no reader takes a U-shape at face
+    # value while the Laplace proposal is the known-dominant explanation.
+    assert "P8" in payload["interpretation_key"]
 
 
 def test_cli_analyze_end_to_end(tmp_path, capsys):
@@ -532,23 +570,6 @@ _TINY_SIZE = ReplicateSize(K=1, T=60, n_wallets=5)
 _TINY_L = 19
 
 
-def _proper_prior() -> PhiPrior:
-    """A samplable prior standing in for the P11-blocked shipped default.
-
-    The tau2 defaults (IG(1e-9, 1e-9)) cannot be drawn from at all, and the
-    beta Cauchy scale is narrowed from 2.5 to 0.5 so a heavy-tailed draw cannot
-    turn a bookkeeping test into a flaky one. The *same* object is threaded into
-    the generator and the fit, which is the property SBC actually depends on.
-    """
-    return PhiPrior(
-        sigma2_ig_alpha=3.0,
-        sigma2_ig_beta=0.05,
-        tau2_ig_alpha=3.0,
-        tau2_ig_beta=0.05,
-        beta_cauchy_scale=0.5,
-    )
-
-
 def _without_timing(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Drop the wall-clock field so rows compare across execution strategies."""
     return [{k: v for k, v in row.items() if k != "elapsed_s"} for row in rows]
@@ -562,6 +583,8 @@ def test_run_replicate_emits_a_complete_schema_row():
     assert row["seed"] == 11
     assert row["L"] == _TINY_L
     assert row["size"] == {"K": 1, "T": 60, "n_wallets": 5}
+    # The regime stamp the resume/analysis checks compare against.
+    assert row["prior"] == prior_fingerprint(_proper_prior())
     assert set(row["phi_true"]) == set(PHI_COMPONENTS)
     assert row["flags"]["failed"] is False
     assert row["flags"]["error"] is None
@@ -630,6 +653,57 @@ def test_run_sbc_resume_computes_only_the_missing_seeds(tmp_path):
         resume=True,
     )
     assert nothing_left == []
+
+
+def test_run_sbc_resume_accepts_a_matching_store(tmp_path):
+    """A store from the same (L, size, prior) regime resumes with nothing to do."""
+    store = _write_jsonl(tmp_path / "sbc.jsonl", _calibrated_rows(n=3))
+    rows = run_sbc(
+        [0, 1, 2],
+        size=_FIXTURE_SIZE,
+        prior=_proper_prior(),
+        L=L_DRAWS,
+        out_path=store,
+        resume=True,
+    )
+    assert rows == []
+
+
+@pytest.mark.parametrize(
+    ("override", "expected"),
+    [
+        ({"L": L_DRAWS + 10}, "L: store has"),
+        ({"prior": replace(_proper_prior(), sigma2_ig_beta=0.5)}, "sigma2_ig_beta"),
+        ({"size": ReplicateSize(K=2, T=400, n_wallets=30)}, "size: store has"),
+    ],
+    ids=["L", "prior", "size"],
+)
+def test_run_sbc_refuses_a_store_from_another_regime(tmp_path, override, expected):
+    """Skipping done seeds is not enough: a regime clash must fail before any fit.
+
+    Each case would otherwise append rows that cannot be pooled with the ones
+    already on disk, leaving a store that is two half-experiments. The conflict
+    is named in the message so the operator knows which field moved.
+    """
+    store = _write_jsonl(tmp_path / "sbc.jsonl", _calibrated_rows(n=3))
+    kwargs = {
+        "size": _FIXTURE_SIZE,
+        "prior": _proper_prior(),
+        "L": L_DRAWS,
+        "out_path": store,
+        **override,
+    }
+
+    with pytest.raises(ValueError, match=expected) as excinfo:
+        run_sbc([0, 1, 2], resume=True, **kwargs)
+    assert "different SBC regime" in str(excinfo.value)
+
+    # Without --resume the same append is just as wrong, so it is refused too.
+    with pytest.raises(ValueError, match=expected):
+        run_sbc([7, 8], resume=False, **kwargs)
+
+    # Nothing was appended by either attempt.
+    assert len(load_results(store)) == 3
 
 
 def test_run_sbc_parallel_matches_sequential(tmp_path):

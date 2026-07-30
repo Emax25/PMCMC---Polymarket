@@ -32,13 +32,13 @@ from scripts import (
     validate_vem,
 )
 from src.analysis.validation import PSIS_KHAT_KEY
-from tests.test_rtds import LIVE_CONDITION_ID, FakeSocket, make_frame
-from src.data.polymarket_api import MarketMeta, RawTrade
+from src.data.polymarket_api import MarketMeta, PolymarketAPIError, RawTrade
 from src.inference.ipmcmc import iPMCMCOutput
 from src.inference.online_scorer import OnlineScorer
 from src.inference.particle_gibbs import PGOutput
 from src.inference.variational_em import VEMOutput
 from src.utils.transforms import logit
+from tests.test_rtds import LIVE_CONDITION_ID, FakeSocket, make_frame
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -273,6 +273,57 @@ def test_pull_data_full_history_uses_windowed_fetch_from_epoch_one(
     # 0 would be dropped server-side as falsy, so the bound must be epoch 1.
     assert calls["windowed"][0]["start_ts"] == 1
     assert calls["windowed"][0]["max_pages"] == 20_000
+
+
+def test_pull_data_full_history_survives_one_market_failing(
+    tmp_path, monkeypatch, caplog
+):
+    """One market's API failure costs that market only, not the whole pull.
+
+    A --full-history backfill is hours per market, so losing the markets already
+    retrieved to a late failure is the expensive kind of bug. The run must keep
+    the survivors *and* say which slugs are missing, or a partial directory is
+    indistinguishable from a complete one.
+    """
+    _mock_pull_data_api(monkeypatch)
+    page1 = json.loads((FIXTURES / "data_trades_page1.json").read_text())
+
+    # The mocked metas all share one condition_id, so the failure is driven by
+    # call order: the second market pulled ("beta") is the one that breaks.
+    calls = {"n": 0}
+
+    def fake_windowed(condition_id, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise PolymarketAPIError("500 Server Error from /trades")
+        return [RawTrade.from_dict(d) for d in page1]
+
+    monkeypatch.setattr("scripts.pull_data.fetch_trades_windowed", fake_windowed)
+
+    with caplog.at_level("ERROR"):
+        rc = pull_data.main(
+            [
+                "--output-dir",
+                str(tmp_path),
+                "--slugs",
+                "alpha",
+                "beta",
+                "gamma",
+                "--full-history",
+                "--log-level",
+                "ERROR",
+            ]
+        )
+
+    assert rc == 0
+    assert calls["n"] == 3  # the loop kept going after the failure
+    assert (tmp_path / "alpha.parquet").exists()
+    assert (tmp_path / "gamma.parquet").exists()
+    assert not (tmp_path / "beta.parquet").exists()
+    assert (tmp_path / "wallet_index.json").exists()
+    assert "FAILED beta" in caplog.text
+    # The closing line must name the gap, not just log it mid-run.
+    assert "INCOMPLETE: 1 of 3" in caplog.text
 
 
 def test_pull_data_full_history_applies_tail_after_retrieval(tmp_path, monkeypatch):
@@ -955,7 +1006,14 @@ def test_validate_vem_artifact_is_self_describing(validate_vem_run):
     assert cfg["real"] is False
     # Fitted phi and the Laplace layer it induced, so the run is reproducible
     # and auditable from the artifact alone.
-    assert payload["best_restart"]["params"]["sigma2_0"] > 0.0
+    best = payload["best_restart"]
+    assert best["params"]["sigma2_0"] > 0.0
+    # theta_w + the centering constants make best_restart a *complete* warm
+    # start: score_stream.py rejects a params-only block, because beta_S/beta_Z
+    # are on the standardized covariate scale (m_S, s_S, m_Z) defines.
+    assert set(best) >= {"params", "theta_w", "m_S", "s_S", "m_Z"}
+    assert len(best["theta_w"]) == cfg["synthetic_n_wallets"]
+    assert best["s_S"] > 0.0
     laplace = payload["laplace"]
     assert len(laplace["dims"]) == 8
     assert len(laplace["mean_u"]) == 8
@@ -1400,6 +1458,76 @@ def test_score_stream_warm_start_restores_centering_constants(tmp_path):
     assert [r["p_z"] for r in _read_jsonl(cold)] != pytest.approx(expected)
 
 
+def _validate_vem_shaped_artifact(vem: VEMOutput, *, centering: bool) -> dict:
+    """A `validate_vem.py`-layout artifact, with or without its centering keys.
+
+    ``centering=False`` reproduces the older artifact that carried ``params``
+    only — the shape whose standardized betas used to be applied to raw
+    covariates without a word.
+    """
+    best = {
+        "index": 0,
+        "seed": 7,
+        **score_stream.warm_start_payload(vem),
+        "beta_S_orig": float(vem.beta_S_orig),
+        "beta_Z_orig": float(vem.beta_Z_orig),
+    }
+    if not centering:
+        dropped = ("theta_w", "m_S", "s_S", "m_Z")
+        best = {k: v for k, v in best.items() if k not in dropped}
+    return {"config": {"n_restarts": 1}, "best_restart": best}
+
+
+def test_score_stream_rejects_params_only_warm_start_with_fitted_betas(tmp_path):
+    """A centering-less artifact with non-zero betas is refused, not guessed at."""
+    vem = _fake_vem(np.array([0.1, 0.05, 0.2]))
+    path = tmp_path / "vem_validation.json"
+    path.write_text(
+        json.dumps(_validate_vem_shaped_artifact(vem, centering=False)),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError) as err:
+        score_stream.load_warm_start(path)
+    # The message has to name both the missing keys and the damage, since the
+    # alternative (running anyway) produces plausible-looking wrong scores.
+    assert "m_S" in str(err.value) and "s_S" in str(err.value)
+    assert "raw covariates" in str(err.value)
+
+
+def test_score_stream_loads_validate_vem_artifact_as_a_full_warm_start(tmp_path):
+    """The current validate_vem.py artifact restores the in-process warm start."""
+    vem = _fake_vem(np.array([0.1, 0.05, 0.2]))
+    path = tmp_path / "vem_validation.json"
+    path.write_text(
+        json.dumps(_validate_vem_shaped_artifact(vem, centering=True)),
+        encoding="utf-8",
+    )
+
+    warm = score_stream.load_warm_start(path)
+    assert warm.params == vem.params
+    assert np.array_equal(warm.theta_w, vem.theta_w)
+    assert (warm.m_S, warm.s_S, warm.m_Z) == (vem.m_S, vem.s_S, vem.m_Z)
+
+
+def test_score_stream_warns_instead_of_raising_when_betas_are_zero(tmp_path, caplog):
+    """With an inert logistic predictor, identity centering is exact — so warn."""
+    vem = _fake_vem(np.array([0.1, 0.05, 0.2]))
+    payload = score_stream.warm_start_payload(vem)
+    payload["params"]["beta_S"] = 0.0
+    payload["params"]["beta_Z"] = 0.0
+    for key in ("m_S", "s_S", "m_Z"):
+        del payload[key]
+    path = tmp_path / "warm.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with caplog.at_level("WARNING"):
+        warm = score_stream.load_warm_start(path)
+
+    assert (warm.m_S, warm.s_S, warm.m_Z) == (0.0, 1.0, 0.0)
+    assert "m_S" in caplog.text and "cold-start" in caplog.text
+
+
 def test_score_stream_replay_sorts_out_of_order_input(tmp_path):
     """Replay imposes (timestamp, tx_hash) order regardless of file order."""
     records = _stream_fixture(12)
@@ -1442,14 +1570,28 @@ def test_score_stream_live_rejects_out_of_order_input(tmp_path, caplog):
     assert len(_read_jsonl(out)) == 3
 
 
-def test_score_stream_live_scores_arrival_order_and_appends(tmp_path):
-    """Live mode consumes an in-order sink and appends across restarts."""
+def test_score_stream_live_scores_arrival_order_and_dedupes_on_restart(
+    tmp_path, monkeypatch
+):
+    """A restarted live run appends to its scores without duplicating them.
+
+    `tail_live` re-reads the sink from byte 0 on every start and the output is
+    opened for append, so the only thing standing between a restart and a
+    doubled scores file is the dedupe set being seeded from that file.
+    """
     records = _stream_fixture(8)
     capture = _write_trades(tmp_path / "trades.jsonl", records)
     out = tmp_path / "scores.jsonl"
 
+    def interrupt_instead_of_polling(_seconds):
+        # The second run scores nothing new, so --max-trades never fires and it
+        # reaches the poll loop — which in a real deployment ends at Ctrl-C.
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(score_stream.time, "sleep", interrupt_instead_of_polling)
+
     for _ in range(2):
-        # --max-trades bounds the tail so the poll loop is never entered.
+        # --max-trades bounds the first run so it stops before polling.
         assert score_stream.main(
             [
                 "--live", str(capture),
@@ -1460,8 +1602,103 @@ def test_score_stream_live_scores_arrival_order_and_appends(tmp_path):
         ) == 0
 
     scored = _read_jsonl(out)
-    assert len(scored) == 16  # second run appended, did not clobber
-    assert [r["ts"] for r in scored[:8]] == [r["timestamp"] for r in records]
+    # Not 16: the second run recognized all 8 hashes as already scored. And not
+    # 0 either — the file was appended to, never truncated.
+    assert len(scored) == 8
+    assert [r["ts"] for r in scored] == [r["timestamp"] for r in records]
+
+
+def test_score_stream_live_accepts_same_second_trades_in_any_hash_order(tmp_path):
+    """Same-second arrivals are not a time regression, whatever their hashes.
+
+    Polymarket timestamps are second-resolution, so a busy market appends
+    several trades per second; enforcing replay's (timestamp, tx_hash) tie-break
+    on a live sink would abort on roughly half of those pairs.
+    """
+    records = _stream_fixture(2)
+    records[1]["timestamp"] = records[0]["timestamp"]
+    records[0]["transaction_hash"] = "0xffffff"
+    records[1]["transaction_hash"] = "0x000001"
+    capture = _write_trades(tmp_path / "trades.jsonl", records)
+    out = tmp_path / "scores.jsonl"
+
+    assert score_stream.main(
+        [
+            "--live", str(capture),
+            "--output", str(out),
+            "--max-trades", "2",
+            "--log-level", "WARNING",
+        ]
+    ) == 0
+    assert [r["tx_hash"] for r in _read_jsonl(out)] == ["0xffffff", "0x000001"]
+
+
+def test_tail_live_holds_back_a_torn_line_until_it_is_whole(tmp_path, monkeypatch):
+    """A newline-less tail is the writer mid-record, not a record to parse."""
+    records = _stream_fixture(2)
+    path = tmp_path / "trades.jsonl"
+    # Second record deliberately unterminated: exactly what a reader sees when
+    # it catches `stream_trades.py` between write and flush.
+    path.write_text(
+        json.dumps(records[0]) + "\n" + json.dumps(records[1]), encoding="utf-8"
+    )
+
+    class _PolledDry(RuntimeError):
+        """Sentinel: the tail loop polled with nothing left to yield."""
+
+    polls = {"n": 0}
+
+    def fake_sleep(_seconds):
+        polls["n"] += 1
+        if polls["n"] == 1:
+            # The writer finishes the torn record between two polls.
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write("\n")
+        elif polls["n"] >= 3:
+            raise _PolledDry
+
+    monkeypatch.setattr(score_stream.time, "sleep", fake_sleep)
+    tail = score_stream.tail_live(path, poll_interval=0.0)
+
+    assert next(tail)["transaction_hash"] == records[0]["transaction_hash"]
+    # The fragment was never yielded truncated: the loop rewound and waited.
+    assert next(tail)["transaction_hash"] == records[1]["transaction_hash"]
+    assert polls["n"] == 1
+    # And it arrived once, not once per poll — the sink is dry from here on.
+    with pytest.raises(_PolledDry):
+        next(tail)
+
+
+def test_score_stream_writes_a_deterministic_run_sidecar(tmp_path):
+    """`<output>.meta.json` describes the run and repeats byte-for-byte."""
+    capture = _write_trades(tmp_path / "trades.jsonl", _stream_fixture(6))
+    out = tmp_path / "scores.jsonl"
+    sidecar = tmp_path / "scores.jsonl.meta.json"
+
+    sidecars = []
+    for _ in range(2):
+        assert score_stream.main(
+            [
+                "--replay", str(capture),
+                "--output", str(out),
+                "--forgetting", "0.97",
+                "--log-level", "WARNING",
+            ]
+        ) == 0
+        sidecars.append(sidecar.read_bytes())
+
+    # Deterministic: no clock reading anywhere in the payload.
+    assert sidecars[0] == sidecars[1]
+    meta = json.loads(sidecars[0])
+    assert meta == {
+        "mode": "replay",
+        "input": str(capture),
+        "forgetting": 0.97,
+        "n_refresh": OnlineScorerConfig.n_refresh,
+        "warm_start": None,
+        "wallet_index": None,
+        "output": str(out),
+    }
 
 
 def test_score_stream_replays_parquet_and_skips_dirty_rows(tmp_path):
@@ -1472,10 +1709,19 @@ def test_score_stream_replays_parquet_and_skips_dirty_rows(tmp_path):
         _raw_trade(901, ts=1_700_000_101, price=0.5, size=0.0, wallet="0xw0"),
         dict(records[0]),  # duplicate transaction_hash
     ]
+    # Uncoercible field: float("n/a") would abort the run and take every
+    # scorer's state with it, instead of dropping one unusable row. JSONL only —
+    # a mixed str/float column has no parquet dtype, and the schema-less sink is
+    # where such a row can actually turn up.
+    unparseable = dict(
+        _raw_trade(902, ts=1_700_000_102, price=0.5, size=5.0, wallet="0xw0"),
+        price="n/a",
+    )
     jsonl_out = tmp_path / "jsonl.scores.jsonl"
     assert score_stream.main(
         [
-            "--replay", str(_write_trades(tmp_path / "trades.jsonl", dirty)),
+            "--replay",
+            str(_write_trades(tmp_path / "trades.jsonl", dirty + [unparseable])),
             "--output", str(jsonl_out),
             "--log-level", "WARNING",
         ]

@@ -13,10 +13,11 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from scipy.special import logsumexp
 
 from config.default_params import ModelParams
 from src.data.synthetic import generate_market
-from src.inference.adf_filter import ADFFilter, ADFStep
+from src.inference.adf_filter import ADFFilter, ADFStep, _logsumexp4
 from src.inference.particle_gibbs import MarketData
 from src.inference.variational_em import _vem_e_step
 
@@ -122,6 +123,48 @@ def _gate_scale_markets(K=10, T=2000, n_wallets=40):
             )
         )
     return mds, params
+
+
+def test_logsumexp4_is_bit_identical_to_scipy():
+    """`_logsumexp4` must reproduce `scipy.special.logsumexp` bit-for-bit.
+
+    It replaces the scipy call inside `step` purely for speed (scipy's
+    array-API dispatch cost dominated the trade step), so equality — not
+    closeness — is the contract; a 1-ulp difference would silently move every
+    downstream q(V, Z). Asserted at exact float equality over the shapes the
+    filter actually produces plus the branches scipy handles specially: exactly
+    tied maxima, the ``[-500, ...]`` trade-0 prior, ``-inf`` from the
+    `_PROB_FLOOR`-free path, all-equal vectors, and NaN.
+    """
+    rng = np.random.default_rng(11)
+    cases = [
+        [0.0, 0.0, 0.0, 0.0],
+        [-500.0, -500.0, -500.0, -500.0],
+        [-np.inf] * 4,
+        [np.inf, 0.0, 1.0, 2.0],
+        [np.nan, 0.0, 1.0, 2.0],
+        [-np.inf, -np.inf, 3.0, 3.0],
+        [1e-300, -1e-300, 0.0, 0.0],
+    ]
+    cases += list(rng.normal(0.0, 50.0, size=(2000, 4)))
+    # Exact ties in the maximum, and the trade-0 log_p_Z = [0, -500] pattern.
+    tied = rng.normal(0.0, 5.0, size=(2000, 4))
+    tied[:, 2] = tied[:, 0]
+    cases += list(tied)
+    pattern = rng.normal(0.0, 3.0, size=(2000, 4))
+    pattern[:, 1] = -500.0
+    pattern[:, 3] = -500.0
+    cases += list(pattern)
+
+    for values in cases:
+        values = np.asarray(values, dtype=float)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            expected = float(logsumexp(values))
+        got = _logsumexp4(values)
+        if np.isnan(expected):
+            assert np.isnan(got), values
+        else:
+            assert got == expected, values
 
 
 @pytest.mark.parametrize("case,degenerate", [("std", False), ("degen", True)])
@@ -251,7 +294,8 @@ def test_z0_prior_pins_first_trade_and_stationary_V():
     md, theta_w, params, m_S, s_S, m_Z = _identity_case(degenerate=False)
     adf = ADFFilter(params, theta_w, m_S, s_S, m_Z)
     rho_V = params.q_01 / (params.q_01 + params.q_10)
-    np.testing.assert_array_equal(adf.prev_q_V, np.array([1.0 - rho_V, rho_V]))
+    assert adf._prev_q_V0 == 1.0 - rho_V
+    assert adf._prev_q_V1 == rho_V
 
     first = adf.step(md.Y[0], md.delta[0], md.log_size_ratio[0], md.wallet_ids[0])
     assert first.Z_prob < 1e-100  # exp(-500) prior, numerically zero

@@ -9,10 +9,12 @@ JSON score record per trade. Two input modes feed **one** scoring loop:
     ``(timestamp, transaction_hash)`` first — the same deterministic tie-break
     `preprocess.clean_trades` uses — and then consumed in that order.
   * ``--live <path>`` — tail an append-only sink that `stream_trades.py` is
-    writing. Arrival order *is* the order; a record that goes backwards in
-    ``(timestamp, transaction_hash)`` is a corrupt or interleaved sink and is
-    rejected rather than silently reordered, because reordering live would mean
-    re-scoring trades that have already been emitted.
+    writing. Arrival order *is* the order; only a record whose ``timestamp``
+    precedes its predecessor's is rejected, because reordering live would mean
+    re-scoring trades that have already been emitted. Same-second arrivals are
+    normal (Polymarket timestamps are second-resolution) and the hash tie-break
+    replay applies is deliberately *not* enforced here — a live sink is in
+    arrival order, not sorted order.
 
 **No lookahead** is the property this module exists to guarantee: every feature
 fed to the filter is a function of trades ``0..t`` only, so deleting the tail of
@@ -42,7 +44,8 @@ Usage:
         --wallet-index data/processed/wallet_index.json --forgetting 0.99
 
 Output is JSONL, one object per scored trade:
-``{ts, tx_hash, market, wallet, p_z, p_v, x_mean}``.
+``{ts, tx_hash, market, wallet, p_z, p_v, x_mean}``, plus a deterministic
+``<output>.meta.json`` sidecar naming the run's mode, input and settings.
 """
 
 from __future__ import annotations
@@ -190,16 +193,25 @@ def cold_start() -> WarmStart:
 def _warm_start_from_dict(payload: dict[str, Any]) -> WarmStart:
     """Rebuild a `WarmStart` from a decoded artifact dict.
 
+    A partial artifact is only accepted when the substitution it forces is
+    harmless. ``beta_S``/``beta_Z`` are fitted against *standardized*
+    covariates, so filling in the `cold_start` identity centering would feed
+    them raw ``log_size_ratio`` and ``E[Z_prev]`` — every score silently
+    mis-scaled. That case raises; a fit whose betas are zero has an inert
+    logistic predictor, so it only warns.
+
     Args:
         payload: Dict in the `warm_start_payload` shape. A ``best_restart``
             wrapper (the `validate_vem.py` artifact layout) is unwrapped first.
 
     Returns:
         The restored warm start; missing centering constants fall back to the
-        `cold_start` identity values so a partial artifact still runs.
+        `cold_start` identity values, which is safe only for zero betas.
 
     Raises:
         KeyError: If no ``params`` block is present anywhere in the payload.
+        ValueError: If a centering constant is missing while ``beta_S`` or
+            ``beta_Z`` is non-zero.
     """
     if "params" not in payload and "best_restart" in payload:
         payload = payload["best_restart"]
@@ -210,6 +222,28 @@ def _warm_start_from_dict(payload: dict[str, Any]) -> WarmStart:
     params = ModelParams(
         **{k: float(v) for k, v in payload["params"].items() if k in fields}
     )
+    missing = [k for k in ("m_S", "s_S", "m_Z") if k not in payload]
+    if missing:
+        if params.beta_S != 0.0 or params.beta_Z != 0.0:
+            raise ValueError(
+                "warm-start artifact is missing the centering constant(s) "
+                f"{', '.join(missing)} while carrying beta_S="
+                f"{params.beta_S:.6g}, beta_Z={params.beta_Z:.6g}. Those betas "
+                "are on the fit's standardized covariate scale, so scoring "
+                "without (m_S, s_S, m_Z) would apply them to raw covariates "
+                "and mis-scale every score. Re-dump the fit with "
+                "score_stream.warm_start_payload (a current validate_vem.py "
+                "artifact already carries them)."
+            )
+        log.warning(
+            "warm-start artifact is missing %s; substituting the cold-start "
+            "identity centering (m_S=%.1f, s_S=%.1f, m_Z=%.1f), which is exact "
+            "here only because beta_S and beta_Z are both zero",
+            ", ".join(missing),
+            fallback.m_S,
+            fallback.s_S,
+            fallback.m_Z,
+        )
     return WarmStart(
         params=params,
         theta_w=np.asarray(payload.get("theta_w", []), dtype=float),
@@ -314,6 +348,13 @@ def tail_live(path: Path, *, poll_interval: float = 0.5) -> Iterator[dict[str, A
     newline caught the writer mid-record, so the read position is rewound and
     retried rather than handing a truncated object to `json.loads`.
 
+    Monotonicity is checked on ``timestamp`` alone, not on the full
+    ``(timestamp, transaction_hash)`` replay key: Polymarket timestamps are
+    second-resolution, so a busy market routinely appends several trades within
+    one second, and their hashes arrive in whatever order the fills did. Holding
+    a live sink to the sorted-order tie-break would reject roughly half of those
+    same-second pairs. The hash stays purely `StreamScorer`'s dedupe key.
+
     Args:
         path: Sink `stream_trades.py` is appending to; must already exist.
         poll_interval: Seconds to sleep when the file is exhausted.
@@ -323,15 +364,15 @@ def tail_live(path: Path, *, poll_interval: float = 0.5) -> Iterator[dict[str, A
 
     Raises:
         FileNotFoundError: If ``path`` does not exist.
-        OutOfOrderTradeError: If a record precedes its predecessor in
-            ``(timestamp, transaction_hash)`` order. Live mode never reorders:
-            the earlier trades have already been scored and emitted, so the
-            only honest response to a backwards record is to stop.
+        OutOfOrderTradeError: If a record's ``timestamp`` precedes its
+            predecessor's. Live mode never reorders: the earlier trades have
+            already been scored and emitted, so the only honest response to a
+            trade from the past is to stop.
     """
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"live sink {path} does not exist")
-    prev_key: tuple[float, str] | None = None
+    prev_ts: float | None = None
     with path.open(encoding="utf-8") as fh:
         while True:
             pos = fh.tell()
@@ -348,14 +389,17 @@ def tail_live(path: Path, *, poll_interval: float = 0.5) -> Iterator[dict[str, A
             except json.JSONDecodeError:
                 log.warning("skipping unparseable line in %s", path)
                 continue
-            key = _sort_key(record)
-            if prev_key is not None and key < prev_key:
+            ts = float(record["timestamp"])
+            if prev_ts is not None and ts < prev_ts:
                 raise OutOfOrderTradeError(
-                    f"live sink {path} went backwards: trade {key[1]} at "
-                    f"t={key[0]:.0f} follows {prev_key[1]} at t={prev_key[0]:.0f}. "
-                    "Live mode does not reorder; re-run with --replay to sort."
+                    f"live sink {path} went backwards in time: trade "
+                    f"{record['transaction_hash']} is stamped t={ts:.0f}, "
+                    f"{prev_ts - ts:.0f}s before the trade already scored at "
+                    f"t={prev_ts:.0f}. Live mode scores in arrival order and "
+                    "cannot un-emit those trades; re-run with --replay to sort "
+                    "the capture instead."
                 )
-            prev_key = key
+            prev_ts = ts
             yield record
 
 
@@ -441,12 +485,19 @@ def _is_scorable(record: dict[str, Any]) -> bool:
     """
     if any(record.get(f) is None for f in _REQUIRED_FIELDS):
         return False
-    return (
-        float(record["size"]) > 0.0
-        and 0.0 < float(record["price"]) < 1.0
-        and len(str(record["wallet"])) > 0
-        and len(str(record["transaction_hash"])) > 0
-    )
+    # An upstream sink can carry a field no one coerced — a string price
+    # ("n/a"), a list where a number belongs. Unscorable is the right verdict,
+    # not a crash: in live mode the exception would take down a run that is
+    # otherwise healthy, discarding the scorer state built up so far.
+    try:
+        return (
+            float(record["size"]) > 0.0
+            and 0.0 < float(record["price"]) < 1.0
+            and len(str(record["wallet"])) > 0
+            and len(str(record["transaction_hash"])) > 0
+        )
+    except (TypeError, ValueError):
+        return False
 
 
 class StreamScorer:
@@ -495,6 +546,25 @@ class StreamScorer:
     def n_markets(self) -> int:
         """Number of distinct markets that have an open scorer."""
         return len(self._streams)
+
+    def mark_seen(self, hashes: Iterable[str]) -> None:
+        """Treat these transaction hashes as already scored.
+
+        The dedupe set lives in this process, but a live run's score sink
+        outlives it: `tail_live` re-reads its sink from byte 0 on every start, so
+        without this a restart re-scores — and re-appends — every trade already
+        in the output. Seeding from that output makes the append idempotent.
+
+        Note:
+            Only ``ScoredTrade`` records are suppressed, not scorer state: the
+            re-read trades still count toward ``n_skipped``, and the filter
+            recursion starts fresh from the warm start, exactly as it would
+            without the pre-seeding.
+
+        Args:
+            hashes: Transaction hashes whose scores are already persisted.
+        """
+        self._seen_hashes.update(str(h) for h in hashes)
 
     def score(self, records: Iterable[dict[str, Any]]) -> Iterator[ScoredTrade]:
         """Score an ordered stream of raw trade records.
@@ -568,6 +638,50 @@ class StreamScorer:
 # ---------------- CLI ----------------
 
 
+def _scored_hashes(path: Path) -> set[str]:
+    """Collect the ``tx_hash`` values already present in a scores JSONL."""
+    return {
+        str(record["tx_hash"])
+        for record in _iter_jsonl(path)
+        if record.get("tx_hash") is not None
+    }
+
+
+def _write_run_meta(args: argparse.Namespace, *, replay: bool) -> Path:
+    """Write the ``<output>.meta.json`` sidecar describing one finished run.
+
+    A scores JSONL carries no provenance — the same 500 lines could have come
+    from a cold start or from a warm-started run with a different forgetting
+    factor, which changes what the numbers mean. The sidecar records the run's
+    inputs so an artifact can be read months later. It is a *sidecar* precisely
+    so the scores file stays byte-identical across identical runs, and it holds
+    no clock reading for the same reason.
+
+    Args:
+        args: Parsed CLI arguments of the run that just finished.
+        replay: True for ``--replay``, False for ``--live``.
+
+    Returns:
+        The sidecar path written.
+    """
+    meta = {
+        "mode": "replay" if replay else "live",
+        "input": str(args.replay if replay else args.live),
+        "forgetting": float(args.forgetting),
+        # None is the default and means "never refresh beta_S/beta_Z", which is
+        # a genuine setting, not a missing one — recorded as JSON null.
+        "n_refresh": int(args.n_refresh) if args.n_refresh is not None else None,
+        "warm_start": str(args.warm_start) if args.warm_start is not None else None,
+        "wallet_index": (
+            str(args.wallet_index) if args.wallet_index is not None else None
+        ),
+        "output": str(args.output),
+    }
+    path = args.output.with_name(args.output.name + ".meta.json")
+    path.write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return path
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse CLI arguments for score_stream."""
     p = argparse.ArgumentParser(
@@ -586,8 +700,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--live",
         type=Path,
         default=None,
-        help="Tail an append-only sink written by stream_trades.py. "
-        "Out-of-order records are rejected, never reordered.",
+        help="Tail an append-only sink written by stream_trades.py. A record "
+        "stamped before an already-scored trade is rejected, never reordered.",
     )
     p.add_argument(
         "--output",
@@ -660,6 +774,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     """Score a replayed capture or a live sink to a JSONL of per-trade scores.
 
+    A successful run also drops a ``<output>.meta.json`` sidecar (see
+    `_write_run_meta`) so the scores can be traced back to their inputs.
+
     Args:
         argv: Argument list passed to argparse; defaults to ``sys.argv[1:]``.
 
@@ -700,6 +817,17 @@ def main(argv: list[str] | None = None) -> int:
     else:
         records = tail_live(args.live, poll_interval=args.poll_interval)
         log.info("following %s", args.live)
+        if args.output.exists():
+            # Live mode appends, and `tail_live` restarts at byte 0 of the sink,
+            # so the trades already in the output would otherwise be scored and
+            # appended a second time.
+            already = _scored_hashes(args.output)
+            scorer.mark_seen(already)
+            log.info(
+                "resuming %s: %d trade(s) already scored will be skipped",
+                args.output,
+                len(already),
+            )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     n_scored = 0
@@ -722,12 +850,15 @@ def main(argv: list[str] | None = None) -> int:
         except KeyboardInterrupt:
             log.info("interrupted — closing score sink cleanly")
 
+    meta_path = _write_run_meta(args, replay=replay)
     log.info(
-        "done — scored %d trades (%d skipped) across %d market(s) to %s",
+        "done — scored %d trades (%d skipped) across %d market(s) to %s (run "
+        "described in %s)",
         n_scored,
         scorer.n_skipped,
         scorer.n_markets,
         args.output,
+        meta_path,
     )
     return 0
 

@@ -39,10 +39,10 @@ Switching State-Space Models", Neural Computation 12(4).
 
 from __future__ import annotations
 
+import math
 from typing import NamedTuple
 
 import numpy as np
-from scipy.special import logsumexp
 
 from config.default_params import ModelParams
 from src.inference.kalman import _kalman_step_all_combos
@@ -67,6 +67,58 @@ _LOG_P_Z0 = -500.0
 # it the step's logsumexp goes to -inf and the normalized q becomes NaN. 1e-300
 # is far below any probability the model can act on, so the floor is inert.
 _PROB_FLOOR = 1e-300
+
+
+def _logsumexp4(log_joint: np.ndarray) -> float:
+    """`scipy.special.logsumexp` for a length-4 array, bit-for-bit.
+
+    scipy's array-API dispatch costs ~70 us per call on an array this small —
+    two thirds of a trade step, ~45x the njit Kalman kernel next to it — so the
+    algorithm is reproduced here operation-for-operation instead: the maximum is
+    separated out of the sum, the residual sum ``s`` is divided by the tie count
+    ``m``, and the result is recomposed as ``log1p(s) + log(m) + a_max`` in that
+    association. The cases where scipy discards that form and falls back to a
+    direct ``log(sum(exp(a)))`` — a non-finite maximum, i.e. any ``+inf``, all
+    ``-inf``, or any NaN (which makes ``m`` zero) — delegate to numpy here for
+    the same reason, off the hot path.
+
+    Bit-identity with scipy is a contract, not an approximation: verified by
+    exact bit comparison (`struct`, not `isclose`) on 570k random 4-vectors
+    covering exact tied maxima, the ``[-500, x, y, z]`` trade-0 pattern,
+    ``-inf`` and NaN entries, all-equal vectors, and 1-ulp near-ties — zero
+    mismatches. Changing the arithmetic or its association breaks the identity
+    fixtures in `tests/test_adf_filter.py`.
+
+    Args:
+        log_joint: (4,) array of log-weights.
+
+    Returns:
+        ``log(sum(exp(log_joint)))``.
+    """
+    v0, v1, v2, v3 = log_joint.tolist()
+    a_max = v0
+    if v1 > a_max:
+        a_max = v1
+    if v2 > a_max:
+        a_max = v2
+    if v3 > a_max:
+        a_max = v3
+    if not (math.isfinite(a_max) and v0 == v0 and v1 == v1 and v2 == v2 and v3 == v3):
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            return float(np.log(np.exp(log_joint).sum()))
+
+    # The tied maxima contribute exp(0) each and are carried by `m`; the rest
+    # are summed in index order, matching scipy's masked sum term for term.
+    m = 0.0
+    s = 0.0
+    for v in (v0, v1, v2, v3):
+        if v == a_max:
+            m += 1.0
+        else:
+            s += math.exp(v - a_max)
+    if s != 0.0:
+        s = s / m
+    return math.log1p(s) + math.log(m) + a_max
 
 
 class ADFStep(NamedTuple):
@@ -99,9 +151,11 @@ class ADFFilter:
     instance filters one market; instances are fully independent, so several
     markets (or live streams) can be advanced interleaved.
 
-    The parameters and centering constants are treated as fixed for the
-    filter's lifetime, matching the batch E-step where they are frozen at the
-    values the current EM iteration started from.
+    The parameters and centering constants are fixed for the filter's lifetime
+    by default, matching the batch E-step where they are frozen at the values
+    the current EM iteration started from; `set_params` and `set_theta_logits`
+    are the supported way for a streaming driver
+    (`online_scorer.OnlineScorer`) to replace them between trades.
     """
 
     def __init__(
@@ -128,11 +182,29 @@ class ADFFilter:
             m_Z: Pooled mean of ``E[Z_prev]``, for centering the persistence
                 covariate.
         """
-        self.params = params
         self.m_S = m_S
         self.s_S = s_S
         self.m_Z = m_Z
         self._logit_theta = logit(theta_w)
+        self.set_params(params)
+        self.reset()
+
+    def set_params(self, params: ModelParams) -> None:
+        """Install parameters and refresh the derived transition cache.
+
+        `_q_01`, `_q_10` and the stationary `_rho_V` are derived from `params`
+        rather than read per trade, which is only valid while the parameters
+        hold still. The online driver adapts them between trades and calls this
+        to keep the cache consistent, instead of rebuilding the filter and
+        transplanting its carried Kalman state.
+
+        The carried state is deliberately untouched: the new parameters take
+        effect from the next `step` onwards.
+
+        Args:
+            params: Model parameters to filter under from now on.
+        """
+        self.params = params
         self._q_01 = params.q_01
         self._q_10 = params.q_10
 
@@ -143,7 +215,20 @@ class ADFFilter:
         denom_q = self._q_01 + self._q_10
         self._rho_V = self._q_01 / denom_q if denom_q > 0 else 0.5
 
-        self.reset()
+    def set_theta_logits(self, logit_theta: np.ndarray) -> None:
+        """Re-point the cached per-wallet insider logits.
+
+        `__init__` converts `theta_w` to logits once, since the predictor needs
+        them every trade. A driver that maintains its own logit array — the
+        streaming scorer, which grows it as new wallets appear and rewrites
+        entries per trade — hands the array over here; it is kept by reference,
+        so in-place updates need no further resync.
+
+        Args:
+            logit_theta: (n_wallets,) logits of the per-wallet propensities,
+                indexed by wallet id. Not copied.
+        """
+        self._logit_theta = logit_theta
 
     def reset(self) -> None:
         """Rewind the filter to trade 0, keeping parameters and constants."""
@@ -160,11 +245,6 @@ class ADFFilter:
         self._prev_q_V0 = 1.0 - self._rho_V
         self._prev_q_V1 = self._rho_V
         self._prev_E_Z = 0.0
-
-    @property
-    def prev_q_V(self) -> np.ndarray:
-        """Previous trade's V-marginal ``[q(V=0), q(V=1)]``, as an array."""
-        return np.array([self._prev_q_V0, self._prev_q_V1])
 
     def _log_priors(
         self, log_size_ratio: float, wallet_id: int
@@ -257,7 +337,7 @@ class ADFFilter:
         )
 
         log_joint = log_prior_joint + log_lik[0]
-        log_Z_t = float(logsumexp(log_joint))
+        log_Z_t = _logsumexp4(log_joint)
         q_t = np.exp(log_joint - log_Z_t)
 
         # Moment-match the 4-component mixture back to one Gaussian: the

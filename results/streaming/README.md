@@ -11,6 +11,13 @@ score here is a function of that trade and the ones before it, nothing later.
 | `will-trump-nominate-judy-shelton-as-the-next-fed-chair.trades.jsonl` | 500 real trades, `stream_trades.py` sink shape (one `RawTrade` per line). |
 | `will-trump-nominate-judy-shelton-as-the-next-fed-chair.scores.jsonl` | 500 score records, one per trade: `{ts, tx_hash, market, wallet, p_z, p_v, x_mean}`. |
 
+A successful run also writes a `<scores>.jsonl.meta.json` sidecar recording the
+run's mode, input path, `--forgetting`, `--n-refresh`, and the warm-start /
+wallet-index paths, so a scores file can be traced back to what produced it (the
+scores committed here predate the sidecar; re-running the command adds one). The
+sidecar is deterministic (no timestamps) and lives beside the scores rather than
+inside them, which keeps the JSONL itself byte-identical across identical runs.
+
 ## Reproducing
 
 **1. Capture.** The trades are the newest 500 fills on the Judy-Shelton Fed
@@ -85,7 +92,15 @@ json.dump(warm_start_payload(vem), open("results/streaming/warm_start.json", "w"
 Pass `--wallet-index` alongside it: `theta_w` is indexed by the wallet ids the
 fit used, and without that mapping every address is a new id that cold-starts at
 the prior mean. `load_warm_start` also reads a pickled `VEMOutput` and a
-`scripts/validate_vem.py` JSON artifact (the latter carries `params` only).
+`scripts/validate_vem.py` JSON artifact, whose `best_restart` block now carries
+the same five fields (`params`, `theta_w`, `m_S`, `s_S`, `m_Z`).
+
+A warm start missing the centering constants is **rejected**, not silently
+patched: `beta_S`/`beta_Z` are fitted against standardized covariates, so
+substituting identity centering would apply them to raw ones and mis-scale every
+score. Artifacts written by an older `validate_vem.py` (`params` only) therefore
+have to be re-dumped through `warm_start_payload` — unless their betas are zero,
+in which case the identity substitution is exact and the CLI only warns.
 
 ## Two things to know before building on this
 

@@ -68,6 +68,7 @@ from scripts._runner import (
     load_inputs,
     make_synthetic_inputs,
 )
+from scripts.score_stream import warm_start_payload
 from src.analysis.plots import (
     plot_elbo_traces,
     plot_heldout_ll,
@@ -605,8 +606,12 @@ def main(argv: list[str] | None = None) -> int:
             "index": best_idx,
             "seed": seeds[best_idx],
             # The fitted phi itself, so the artifact records what was fit and
-            # not merely how well it scored.
-            "params": asdict(best_vem.params),
+            # not merely how well it scored. `warm_start_payload` supplies
+            # `params` *plus* theta_w and the centering constants, which makes
+            # this block a complete warm start for scripts/score_stream.py:
+            # beta_S/beta_Z are on the standardized covariate scale, so a
+            # params-only block would silently mis-scale streamed scores.
+            **warm_start_payload(best_vem),
             "beta_S_orig": float(best_vem.beta_S_orig),
             "beta_Z_orig": float(best_vem.beta_Z_orig),
         },

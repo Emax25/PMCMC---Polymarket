@@ -21,8 +21,11 @@ Reading the output: the two verdicts per component are a chi-square bin test
 (``p``) and a simultaneous ECDF band, and coverage must land inside
 [0.85, 0.95] for nominal-90% intervals. A U-shaped rank histogram means the
 posterior is too narrow (overconfident) — the failure mode this whole exercise
-exists to detect. Read the ``FLAGGED`` block and the failure rate before
-quoting any single number.
+exists to detect. Until STATUS.md P8 lands, though, expect a phi-rank U-shape to
+be dominated by the known mis-calibration of the Laplace proposal (ECM curvature
+in place of observed information) rather than by the inference under test — see
+``docs/solutions/best-practices/em-fixed-point-is-not-a-posterior-mode.md``.
+Read the ``FLAGGED`` block and the failure rate before quoting any single number.
 
 Examples:
     # Run 200 replicates into the default store, 8 at a time, resuming a kill
@@ -227,6 +230,9 @@ def _format_report(summary: SBCSummary) -> str:
         f"Replicates: {summary.n_replicates} read, {summary.n_analysed} analysed, "
         f"L={summary.L} posterior draws  (alpha={summary.alpha:g})",
         f"Sizes: {sizes}",
+        # The prior is part of the regime, not decoration: the ranks are only
+        # uniform under the density the replicates were simulated from.
+        "Prior: " + ", ".join(f"{k}={v:g}" for k, v in summary.prior.items()),
     ]
     if summary.flagged:
         lines.append("")

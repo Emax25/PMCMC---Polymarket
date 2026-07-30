@@ -11,7 +11,7 @@ dataset every EM iteration; this module reads each trade exactly once:
     M-step  phi_t = map(S_t)                              (unchanged batch maps)
 
 Every map is the batch one — `PhiPrior.sigma2_map` / `tau2_map` / `q_map` for
-the variance and transition blocks, `variational_em._update_beta_irls` for the
+the variance and transition blocks, `variational_em.update_beta_irls` for the
 logistic block, and the Beta-count posterior mean for `theta_w`. Nothing here
 invents an estimator; the online part is only *which statistics* the maps see.
 
@@ -29,7 +29,10 @@ Design notes, in the order they bite:
     map reproduces the supplied `params` / `theta_w`, weighted by
     `OnlineScorerConfig.effective_window` pseudo-trades. Adaptation therefore
     starts *at* the batch fit and drifts away from it, rather than jumping to
-    the prior on trade 1. Where the inversion would need a negative statistic
+    the prior on trade 1 — which is also why the Robbins-Monro rate carries the
+    `OnlineScorerConfig.rho_t0` offset: a first-trade rate of exactly 1.0 would
+    decay the seed by a factor of zero and discard it unread. Where the
+    inversion would need a negative statistic
     (a variance below what the Inverse-Gamma prior alone implies) it is clamped
     at zero and the seed is only approximate.
 
@@ -53,7 +56,7 @@ Design notes, in the order they bite:
 
   * **Beta refresh.** `beta_S`/`beta_Z` cannot be updated by a scalar recursion
     (their M-step is an IRLS solve), so they are refit every `n_refresh` trades
-    by calling the batch `_update_beta_irls` on the most recent `beta_window`
+    by calling the batch `update_beta_irls` on the most recent `beta_window`
     trades, warm-started at the current betas. Off by default, matching
     `variational_em(estimate_betas=False)` and for the same reason (§6.2).
 
@@ -73,10 +76,10 @@ import numpy as np
 from config.default_params import ModelParams, OnlineScorerConfig, PhiPrior
 from src.inference.adf_filter import ADFFilter
 from src.inference.particle_gibbs import MarketData
-from src.inference.variational_em import _update_beta_irls
+from src.inference.variational_em import update_beta_irls
 from src.utils.transforms import logit
 
-# Minimum usable rows before a beta refresh is attempted. `_update_beta_irls`
+# Minimum usable rows before a beta refresh is attempted. `update_beta_irls`
 # fits two coefficients; on a handful of near-identical rows the data curvature
 # is rank-deficient and the estimate is pure Cauchy prior, so refreshing that
 # early only injects noise into an otherwise warm-started coefficient.
@@ -92,6 +95,14 @@ _VAR_FLOOR = 1e-6
 # statistics: neutral 0.5/0.5, since the seed encodes the *parameters* of the
 # incoming fit and carries no information about which regime the stream is in.
 _SEED_MASS = 0.5
+
+# Cap on the beta-refresh buffer when `beta_window` is left to follow
+# `effective_window`. At `forgetting = 1.0` that window degenerates to the
+# `_MAX_EFFECTIVE_WINDOW` seed-weight cap (1e6), which as a deque length would
+# allocate a million slots for a rectangular IRLS window no one asked for. Every
+# non-degenerate setting is far below this (0.98 -> 50, 0.999 -> 1000), so the
+# cap only bites where the window length was never meaningful.
+_MAX_BETA_WINDOW = 10_000
 
 
 class OnlineScore(NamedTuple):
@@ -323,7 +334,7 @@ class OnlineScorer:
         self._adf = ADFFilter(self._params, self._theta, self.m_S, self.s_S, self.m_Z)
         # `ADFFilter` caches `logit(theta_w)` at construction; hand it the
         # scorer's own array so per-wallet updates are visible without a resync.
-        self._adf._logit_theta = self._logit_theta
+        self._adf.set_theta_logits(self._logit_theta)
 
         self._prev: OnlineScore | None = None
         self._buffer = self._new_buffer()
@@ -444,19 +455,16 @@ class OnlineScorer:
         ``tau2_1 <= tau2_0`` order constraints that identify the regimes.
         """
         stats, prior = self._stats, self._prior
-        q_01 = float(
-            np.clip(
-                prior.q_map(stats.n_trans[0, 1], stats.n_trans[0, 0]),
-                _Q_CLIP,
-                1.0 - _Q_CLIP,
-            )
+        # `min`/`max` rather than `np.clip`: identical for finite scalars (and
+        # NaN-preserving alike), an order of magnitude cheaper on a per-trade
+        # path, and consistent with the variance floors below.
+        q_01 = min(
+            max(float(prior.q_map(stats.n_trans[0, 1], stats.n_trans[0, 0])), _Q_CLIP),
+            1.0 - _Q_CLIP,
         )
-        q_10 = float(
-            np.clip(
-                prior.q_map(stats.n_trans[1, 0], stats.n_trans[1, 1]),
-                _Q_CLIP,
-                1.0 - _Q_CLIP,
-            )
+        q_10 = min(
+            max(float(prior.q_map(stats.n_trans[1, 0], stats.n_trans[1, 1])), _Q_CLIP),
+            1.0 - _Q_CLIP,
         )
         sigma2_0 = max(prior.sigma2_map(stats.SS_v[0], stats.N_v[0]), _VAR_FLOOR)
         sigma2_1 = max(
@@ -479,20 +487,13 @@ class OnlineScorer:
     def _sync_params(self) -> None:
         """Push the adapted parameters into the wrapped `ADFFilter`.
 
-        `ADFFilter` derives `_q_01`, `_q_10` and the stationary `_rho_V` from
-        `params` once, at construction, because the batch E-step freezes
-        parameters for a whole pass. The online path is precisely the case that
-        invalidates that assumption, so the derived caches are refreshed here
-        rather than rebuilding the filter and transplanting its carried Kalman
-        state (which would touch strictly more of its internals).
+        `ADFFilter.set_params` owns refreshing the caches it derives from them
+        (`_q_01`, `_q_10`, the stationary `_rho_V`), which the batch E-step is
+        free to compute once and the online path is precisely the case that
+        invalidates. It keeps the filter's carried Kalman state, so this is a
+        mid-stream parameter swap rather than a rebuild.
         """
-        params = self._params
-        adf = self._adf
-        adf.params = params
-        adf._q_01 = params.q_01
-        adf._q_10 = params.q_10
-        denom_q = params.q_01 + params.q_10
-        adf._rho_V = params.q_01 / denom_q if denom_q > 0 else 0.5
+        self._adf.set_params(self._params)
 
     # ---------------- Per-wallet theta_w ----------------
 
@@ -518,7 +519,7 @@ class OnlineScorer:
         self._theta = theta
         self._logit_theta = logit_theta
         # Re-point the filter: the old array object it shared is now stale.
-        self._adf._logit_theta = logit_theta
+        self._adf.set_theta_logits(logit_theta)
 
     def _update_theta(self, wallet_id: int, Z_prob: float, rho: float) -> None:
         """Fold one trade into its wallet's decayed Beta counts.
@@ -551,14 +552,17 @@ class OnlineScorer:
 
         Sized one longer than `beta_window` because the batch covariate builder
         spends the window's first trade as the lag supplying ``x_Z~`` for the
-        second (the ``Z_0 := 0`` convention drops trade 0 of any block).
+        second (the ``Z_0 := 0`` convention drops trade 0 of any block). An
+        unset `beta_window` follows `effective_window`, capped at
+        `_MAX_BETA_WINDOW` so its degenerate ``forgetting = 1.0`` value cannot
+        size the deque.
         """
         n_refresh = self._config.n_refresh
         if n_refresh is None or n_refresh <= 0:
             return None
         window = self._config.beta_window
         if window is None:
-            window = int(round(self._config.effective_window))
+            window = int(round(min(self._config.effective_window, _MAX_BETA_WINDOW)))
         return deque(maxlen=max(window, _MIN_BETA_ROWS) + 1)
 
     def _push_buffer(
@@ -581,7 +585,7 @@ class OnlineScorer:
         """Refit ``beta_S``/``beta_Z`` on the recent window via the batch IRLS.
 
         Replays the buffered window as a one-market `MarketData` plus the
-        matching ``q_vz`` and hands it to `variational_em._update_beta_irls`, so
+        matching ``q_vz`` and hands it to `variational_em.update_beta_irls`, so
         the Cauchy(0, 2.5) penalized IRLS — including its step-halving and
         separation handling — is the batch code, not a copy of it. Warm-starting
         at the current coefficients is what keeps successive refreshes smooth:
@@ -612,7 +616,7 @@ class OnlineScorer:
             log_size_ratio=log_size_ratio,
             wallet_ids=wallet_ids,
         )
-        beta_S, beta_Z, _ = _update_beta_irls(
+        beta_S, beta_Z, _ = update_beta_irls(
             [md],
             [q_vz],
             self._theta,

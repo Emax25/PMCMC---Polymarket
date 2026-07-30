@@ -23,6 +23,13 @@ calibrated. Deviations read as:
   * inverted-U (mass in the middle)   — posterior too wide, *underconfident*.
   * monotone slope                    — posterior location *biased*.
 
+On the *current* Laplace layer the first reading is not the likely explanation:
+STATUS.md P8 records ``PhiPosterior`` using expected-complete-data (ECM)
+curvature in place of observed information — 113x over-precise on one axis and
+mis-centred — so until P8 lands a phi-rank U-shape is expected to be dominated
+by that known proposal defect rather than by the inference under test (see
+``docs/solutions/best-practices/em-fixed-point-is-not-a-posterior-mode.md``).
+
 Two numeric verdicts back those shapes so nothing depends on eyeballing a plot:
 a chi-square bin test (the decision, ``p_value``/``rejected``) and a
 Dvoretzky-Kiefer-Wolfowitz simultaneous ECDF band (``band_violation``, and the
@@ -43,15 +50,23 @@ rate; degenerate rows (VEM non-convergence or a Laplace curvature fallback) are
 excluded by default and reported both as a rate and as a sensitivity block that
 re-runs coverage with them included.
 
-Row schema (``schema_version = 1``), one JSON object per line::
+Row schema (``schema_version = 2``), one JSON object per line::
 
-    {"schema_version": 1, "seed": int, "phi_true": {component: float},
+    {"schema_version": 2, "seed": int, "phi_true": {component: float},
      "L": int, "ranks": {component: int in 0..L} | null,
      "hits90": {component: bool} | null, "theta_hits90": [bool, ...] | null,
      "z_auc": float | null,
      "flags": {"vem_converged": bool, "laplace_fallback": bool,
                "failed": bool, "error": str | null},
-     "elapsed_s": float, "size": {"K": int, "T": int, "n_wallets": int}}
+     "elapsed_s": float, "size": {"K": int, "T": int, "n_wallets": int},
+     "prior": {hyperparameter: float}}
+
+Every row therefore carries its whole generating regime — ``L``, ``size`` and
+the ``prior`` fingerprint. That is what lets ``run_sbc`` refuse to append to a
+store built under a different regime (and ``analyze`` refuse to pool one),
+instead of silently mixing two incomparable sets of ranks. Schema 2 added
+``prior`` for exactly that check; ``load_results`` rejects every other version
+outright, and no v1 store was ever produced, so there is nothing to migrate.
 """
 
 from __future__ import annotations
@@ -60,7 +75,7 @@ import json
 import logging
 import math
 import time
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -78,7 +93,7 @@ from src.utils.transforms import logit
 
 log = logging.getLogger(__name__)
 
-SBC_SCHEMA_VERSION = 1
+SBC_SCHEMA_VERSION = 2
 
 # Canonical phi order. Deliberately restated rather than imported from
 # `src.inference.diagnostics.PHI_PARAM_NAMES` or `src.inference.laplace`: both
@@ -116,7 +131,12 @@ RANK_INTERPRETATION_KEY = (
     "in the ECDF difference) = posterior too narrow, overconfident; ranks piled "
     "in the middle = too wide, underconfident; a monotone slope = biased "
     "location. The shaded band holds jointly over every panel, so a curve "
-    "staying inside it is the calibrated case."
+    "staying inside it is the calibrated case. Caveat: until STATUS.md P8 "
+    "(observed information via the Louis identity, and a real posterior mode) "
+    "lands, a phi-rank U-shape here is expected to be dominated by the known "
+    "mis-calibration of the Laplace proposal itself rather than by the "
+    "inference under test - see docs/solutions/best-practices/"
+    "em-fixed-point-is-not-a-posterior-mode.md."
 )
 
 _THETA_DEPENDENCE_NOTE = (
@@ -127,6 +147,24 @@ _THETA_DEPENDENCE_NOTE = (
 
 
 # ---------------- Row I/O and selection ----------------
+
+
+def prior_fingerprint(prior: PhiPrior) -> dict[str, float]:
+    """Serialize the prior a replicate was simulated from and fitted against.
+
+    Recorded verbatim (all six hyperparameters, sorted) rather than hashed: a
+    conflicting store then reports *which* hyperparameter moved, which is the
+    only actionable thing to say when a resume is refused. ``PhiPrior`` holds
+    nothing but floats, so the dict is JSON-safe and compares exactly.
+
+    Args:
+        prior: The prior threaded into the generator, the M-step and the
+            curvature alike (R1/KTD5).
+
+    Returns:
+        ``{hyperparameter: value}`` in sorted key order.
+    """
+    return {name: float(value) for name, value in sorted(asdict(prior).items())}
 
 
 def load_results(path: str | Path) -> list[dict[str, Any]]:
@@ -232,6 +270,35 @@ def _single_L(rows: Sequence[dict[str, Any]]) -> int:
         raise ValueError(
             f"replicates disagree on L (posterior draws per replicate): {values}; "
             "rank bins are only comparable at a single L",
+        )
+    return values[0]
+
+
+def _distinct_priors(rows: Sequence[dict[str, Any]]) -> list[dict[str, float]]:
+    """Distinct prior fingerprints across rows, in first-seen order."""
+    seen: list[dict[str, float]] = []
+    for row in rows:
+        fingerprint = row.get("prior") or {}
+        if fingerprint not in seen:
+            seen.append(fingerprint)
+    return seen
+
+
+def _single_prior(rows: Sequence[dict[str, Any]]) -> dict[str, float]:
+    """Return the common prior fingerprint, or raise if replicates disagree.
+
+    A mixed prior is a harder error than a mixed ``L``: the rank statistic is
+    uniform only when every replicate was simulated from *and* fitted against
+    the one same density (R1/KTD5), so a histogram pooled over two priors tests
+    nothing at all and must never be reported as calibration evidence.
+    """
+    values = _distinct_priors(rows)
+    if not values:
+        raise ValueError("no replicates to analyse")
+    if len(values) > 1:
+        raise ValueError(
+            f"replicates disagree on the prior: {values}; SBC ranks are only "
+            "comparable within one prior",
         )
     return values[0]
 
@@ -862,6 +929,9 @@ class SBCSummary:
         n_analysed: Rows contributing to ranks and coverage.
         L: Posterior draws per replicate.
         sizes: Distinct per-replicate ``{"K", "T", "n_wallets"}`` sizes seen.
+        prior: Fingerprint of the prior every analysed replicate shares; the
+            summary is meaningless without it, since the prior *is* the density
+            the ranks test the posterior against.
         alpha: Significance level threaded through every test and band.
         nominal: Nominal interval level.
         band: R4 acceptance window for the empirical coverage.
@@ -880,6 +950,7 @@ class SBCSummary:
     n_analysed: int
     L: int
     sizes: list[dict[str, int]]
+    prior: dict[str, float]
     alpha: float
     nominal: float
     band: tuple[float, float]
@@ -900,6 +971,7 @@ class SBCSummary:
             "n_analysed": self.n_analysed,
             "L": self.L,
             "sizes": self.sizes,
+            "prior": self.prior,
             "alpha": self.alpha,
             "nominal_coverage": self.nominal,
             "coverage_band": list(self.band),
@@ -1002,7 +1074,8 @@ def analyze(
         The populated ``SBCSummary``.
 
     Raises:
-        ValueError: If no replicate is usable, or the rows are malformed (see
+        ValueError: If no replicate is usable, the rows disagree on ``L`` or on
+            the prior they were generated under, or the rows are malformed (see
             ``rank_uniformity`` and ``coverage_table``).
     """
     selected = usable_rows(rows, include_degenerate=include_degenerate)
@@ -1011,6 +1084,10 @@ def analyze(
             f"no usable replicates among {len(rows)} rows "
             f"(include_degenerate={include_degenerate}); nothing to analyse",
         )
+    # Refuse a store that pools two priors before computing anything from it:
+    # unlike a mixed L (which `_single_L` catches on the way out) a mixed prior
+    # produces perfectly well-formed, perfectly meaningless statistics.
+    single_prior = _single_prior(selected)
     uniformity = rank_uniformity(
         selected,
         components=components,
@@ -1054,6 +1131,7 @@ def analyze(
         n_analysed=len(selected),
         L=_single_L(selected),
         sizes=_distinct_sizes(rows),
+        prior=single_prior,
         alpha=alpha,
         nominal=nominal,
         band=band,
@@ -1285,6 +1363,7 @@ def _replicate_row(
     phi_true: dict[str, float],
     L: int,
     size: ReplicateSize,
+    prior: PhiPrior,
     elapsed_s: float,
     ranks: dict[str, int] | None = None,
     hits90: dict[str, bool] | None = None,
@@ -1294,17 +1373,21 @@ def _replicate_row(
     laplace_fallback: bool = False,
     error: str | None = None,
 ) -> dict[str, Any]:
-    """Assemble one schema-v1 result row.
+    """Assemble one schema-v2 result row.
 
     Both flags are written explicitly on *every* row: ``row_degenerate`` reads a
     missing ``vem_converged`` as True, so an omitted key would silently
-    understate the degeneracy rate the analysis exists to report.
+    understate the degeneracy rate the analysis exists to report. ``L``, ``size``
+    and ``prior`` are likewise written on every row, failed ones included: they
+    are the regime stamp ``run_sbc`` and ``analyze`` compare against, and a row
+    without it could be appended to any store at all.
 
     Args:
         seed: Replicate seed; the store's unique key.
         phi_true: The prior draw, by component; empty if the draw itself failed.
         L: Posterior draws ranked against the truth.
         size: Simulation size of this replicate.
+        prior: Prior this replicate simulated from and fitted against.
         elapsed_s: Wall-clock seconds for the whole replicate.
         ranks: Per-component ranks, or None for a failed replicate.
         hits90: Per-component interval hits, or None for a failed replicate.
@@ -1334,6 +1417,7 @@ def _replicate_row(
         },
         "elapsed_s": float(elapsed_s),
         "size": size.to_dict(),
+        "prior": prior_fingerprint(prior),
     }
 
 
@@ -1420,6 +1504,7 @@ def run_replicate(
             phi_true=phi_true,
             L=L,
             size=size,
+            prior=prior,
             elapsed_s=time.perf_counter() - started,
             ranks=ranks,
             hits90=hits90,
@@ -1444,10 +1529,79 @@ def run_replicate(
             phi_true=phi_true,
             L=L,
             size=size,
+            prior=prior,
             elapsed_s=time.perf_counter() - started,
             error=repr(exc),
         )
     return row
+
+
+def _prior_conflict(
+    stored: Sequence[dict[str, float]],
+    wanted: dict[str, float],
+) -> str:
+    """Spell out how a store's prior fingerprints differ from the current one.
+
+    Args:
+        stored: Distinct fingerprints found in the store.
+        wanted: Fingerprint of the prior this run would use.
+
+    Returns:
+        A one-line description naming each differing hyperparameter (union of
+        both key sets, so a fingerprint written by a different ``PhiPrior``
+        shape is reported rather than silently matching).
+    """
+    parts: list[str] = []
+    for fingerprint in stored:
+        keys = sorted(set(fingerprint) | set(wanted))
+        diffs = [
+            f"{k}={fingerprint.get(k)!r} in store vs {wanted.get(k)!r} in this run"
+            for k in keys
+            if fingerprint.get(k) != wanted.get(k)
+        ]
+        parts.append(", ".join(diffs) if diffs else "identical")
+    return "prior: " + "; ".join(parts)
+
+
+def _regime_conflicts(
+    rows: Sequence[dict[str, Any]],
+    *,
+    size: ReplicateSize,
+    prior: PhiPrior,
+    L: int,
+) -> list[str]:
+    """Name every way an existing store's regime differs from this run's.
+
+    Ranks pool only within one regime: ``L`` fixes the rank support, ``size``
+    fixes how much data each posterior saw, and ``prior`` *is* the density SBC
+    tests the posterior against. Skipping completed seeds therefore is not
+    enough for a resume to be sound — the rows already on disk must have come
+    from the same regime, or the finished store is two half-runs of two
+    different experiments and no statistic over it means anything.
+
+    Args:
+        rows: Rows already in the store, as returned by ``load_results``.
+        size: Simulation size this run would use.
+        prior: Prior this run would use.
+        L: Posterior draws per replicate this run would use.
+
+    Returns:
+        One line per conflicting field, empty when the store matches.
+    """
+    conflicts: list[str] = []
+    stored_L = sorted({int(row["L"]) for row in rows})
+    if stored_L != [int(L)]:
+        conflicts.append(f"L: store has {stored_L}, this run uses {int(L)}")
+    stored_sizes = _distinct_sizes(rows)
+    if stored_sizes != [size.to_dict()]:
+        conflicts.append(
+            f"size: store has {stored_sizes}, this run uses {size.to_dict()}",
+        )
+    wanted = prior_fingerprint(prior)
+    stored_priors = _distinct_priors(rows)
+    if stored_priors != [wanted]:
+        conflicts.append(_prior_conflict(stored_priors, wanted))
+    return conflicts
 
 
 def completed_seeds(path: str | Path) -> set[int]:
@@ -1503,7 +1657,9 @@ def run_sbc(
 
     Raises:
         ValueError: If ``prior`` cannot be sampled (the P11 improper-tau2
-            default), raised before any replicate runs.
+            default), or if ``out_path`` already holds rows from a different
+            ``(L, size, prior)`` regime. Both are raised before any replicate
+            runs.
     """
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1512,9 +1668,23 @@ def run_sbc(
     # the same error once per seed and burn the whole run writing failed rows.
     params_from_prior(prior, np.random.default_rng(0))
 
+    # Fail fast on a regime clash, before a single replicate is dispatched.
+    # Checked whenever the store already holds rows, not only under `resume`:
+    # appending a second regime is exactly as wrong when the seeds happen not to
+    # overlap, and the resulting store cannot be analysed either way.
+    stored = load_results(out_path) if out_path.exists() else []
+    conflicts = _regime_conflicts(stored, size=size, prior=prior, L=L) if stored else []
+    if conflicts:
+        raise ValueError(
+            f"{out_path} was written under a different SBC regime: "
+            + "; ".join(conflicts)
+            + ". Ranks pool only within one (L, size, prior) regime - write this "
+            "run to a new store instead.",
+        )
+
     pending = list(seeds)
     if resume:
-        done = completed_seeds(out_path)
+        done = {int(row["seed"]) for row in stored}
         pending = [s for s in pending if s not in done]
         log.info(
             "resume: %d seed(s) already in %s, %d to run",

@@ -218,7 +218,7 @@ def _pooled_zj_covariates(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Pool the standardized (x_S~, x_Z~) design and q(Z) targets, trades j>=1.
 
-    Shared by `_update_theta_w` and `_update_beta_irls`: both fit the insider
+    Shared by `_update_theta_w` and `update_beta_irls`: both fit the insider
     predictor on trades j >= 1 across all markets (trade 0 is excluded by the
     Z_0 := 0 convention) using the same standardized/centered covariates the
     E-step uses.
@@ -430,7 +430,7 @@ def _beta_grad_fisher(
     return grad, fisher
 
 
-def _update_beta_irls(
+def update_beta_irls(
     markets: list[MarketData],
     q_vz_list: list[np.ndarray],
     theta_w: np.ndarray,
@@ -458,6 +458,10 @@ def _update_beta_irls(
     Fisher information stays positive definite (hence finite estimates) even
     when q(Z) is perfectly separated by a covariate, where the data alone
     would drive the curvature to 0.
+
+    Public because `online_scorer.OnlineScorer` calls it directly for its
+    periodic beta refresh: this signature is a cross-module contract, not an
+    M-step implementation detail, and changing it breaks the streaming path.
 
     Args:
         markets: Input market data.
@@ -535,7 +539,7 @@ def _update_beta_irls(
 
     if not converged:
         warnings.warn(
-            f"_update_beta_irls hit the {_IRLS_MAX_ITER}-iteration cap without "
+            f"update_beta_irls hit the {_IRLS_MAX_ITER}-iteration cap without "
             "converging to the relative-change tolerance; returning the "
             "current estimate.",
             RuntimeWarning,
@@ -734,7 +738,7 @@ def _vem_m_step(
 
     # ---- (c) beta_S, beta_Z: pooled IRLS, offset by the freshly updated theta_w ----
     if estimate_betas:
-        beta_S_new, beta_Z_new, beta_fisher_info = _update_beta_irls(
+        beta_S_new, beta_Z_new, beta_fisher_info = update_beta_irls(
             markets,
             q_vz_list,
             theta_w_new,

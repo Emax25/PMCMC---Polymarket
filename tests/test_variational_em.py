@@ -16,7 +16,7 @@ from src.inference.particle_gibbs import MarketData
 from src.inference.variational_em import (
     VEMOutput,
     _pooled_zj_covariates,
-    _update_beta_irls,
+    update_beta_irls,
     _update_theta_w,
     _vem_e_step,
     _vem_m_step,
@@ -406,7 +406,7 @@ def test_update_beta_irls_recovers_planted_betas(seed):
     q_vz = _oracle_q_vz(mkt)
     m_S, s_S, m_Z = _std_consts(md, mkt)
 
-    beta_S, beta_Z, _ = _update_beta_irls(
+    beta_S, beta_Z, _ = update_beta_irls(
         [md], [q_vz], mkt.theta_w, m_S, s_S, m_Z, 0.0, 0.0
     )
     beta_S_orig = beta_S * 0.5 / s_S
@@ -445,10 +445,10 @@ def test_absorption_offset_naive_theta_w_underestimates_beta_S():
         [md], [q_vz], 15, 0.0, 0.0, m_S, s_S, m_Z, params.a, params.b, phi_init
     )
 
-    beta_S_aware, _, _ = _update_beta_irls(
+    beta_S_aware, _, _ = update_beta_irls(
         [md], [q_vz], tw_aware, m_S, s_S, m_Z, 0.0, 0.0
     )
-    beta_S_naive, _, _ = _update_beta_irls(
+    beta_S_naive, _, _ = update_beta_irls(
         [md], [q_vz], tw_naive, m_S, s_S, m_Z, 0.0, 0.0
     )
 
@@ -536,7 +536,7 @@ def test_vem_beta_S_approximately_centering_invariant(
     regime, T, n_wallets, n_insider, rel_tol
 ):
     """Two-centerings (test 5, KTD5): back-transformed beta_S from
-    `_update_beta_irls` is roughly stable whether x_S~ is centered on the
+    `update_beta_irls` is roughly stable whether x_S~ is centered on the
     pooled mean or on a shifted constant — tightly so with dense wallets,
     only loosely so when wallets are sparse.
 
@@ -565,11 +565,11 @@ def test_vem_beta_S_approximately_centering_invariant(
     q_vz = _oracle_q_vz(mkt)
     m_S, s_S, m_Z = _std_consts(md, mkt)
 
-    beta_S_1, _, _ = _update_beta_irls(
+    beta_S_1, _, _ = update_beta_irls(
         [md], [q_vz], mkt.theta_w, m_S, s_S, m_Z, 0.0, 0.0
     )
     shifted_m_S = m_S + 0.5 * s_S
-    beta_S_2, _, _ = _update_beta_irls(
+    beta_S_2, _, _ = update_beta_irls(
         [md], [q_vz], mkt.theta_w, shifted_m_S, s_S, m_Z, 0.0, 0.0
     )
 
@@ -646,14 +646,14 @@ def test_update_beta_irls_separation_stays_finite():
         # do not raise"); the assertions are on the *estimate*, not on
         # reaching the tolerance-based convergence.
         warnings.simplefilter("ignore", RuntimeWarning)
-        beta_S, beta_Z, fisher = _update_beta_irls(
+        beta_S, beta_Z, fisher = update_beta_irls(
             [md], [q_vz], theta_w,
             m_S=0.0, s_S=1.0, m_Z=0.0, beta_S_init=0.0, beta_Z_init=0.0,
         )
         # Re-fit from a far-away start: a genuine (finite) penalized-MAP fixed
         # point is reached from any init, whereas an unregularized separated
         # fit would keep marching off toward +inf.
-        beta_S_far, _, _ = _update_beta_irls(
+        beta_S_far, _, _ = update_beta_irls(
             [md], [q_vz], theta_w,
             m_S=0.0, s_S=1.0, m_Z=0.0, beta_S_init=500.0, beta_Z_init=0.0,
         )
@@ -714,7 +714,7 @@ def test_update_beta_irls_objective_non_decreasing():
 
     beta_init = np.array([0.3, -0.2])  # deliberately off-mode
     obj_before = _obj(beta_init)
-    beta_S, beta_Z, _ = _update_beta_irls(
+    beta_S, beta_Z, _ = update_beta_irls(
         [md], [q_vz], out.theta_w, out.m_S, out.s_S, out.m_Z,
         float(beta_init[0]), float(beta_init[1]),
     )
