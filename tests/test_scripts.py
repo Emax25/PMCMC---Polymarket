@@ -32,7 +32,9 @@ from scripts import (
     validate_vem,
 )
 from src.analysis.validation import PSIS_KHAT_KEY
+from src.data import trade_stream
 from src.data.polymarket_api import MarketMeta, PolymarketAPIError, RawTrade
+from src.inference import stream_scoring
 from src.inference.ipmcmc import iPMCMCOutput
 from src.inference.online_scorer import OnlineScorer
 from src.inference.particle_gibbs import PGOutput
@@ -1358,7 +1360,7 @@ def test_score_stream_replay_is_byte_identical_across_runs(tmp_path):
     vem = _fake_vem(np.array([0.1, 0.05, 0.2]))
     warm = tmp_path / "warm.json"
     warm.write_text(
-        json.dumps(score_stream.warm_start_payload(vem)), encoding="utf-8"
+        json.dumps(stream_scoring.warm_start_payload(vem)), encoding="utf-8"
     )
 
     outputs = []
@@ -1410,7 +1412,9 @@ def test_score_stream_warm_start_restores_centering_constants(tmp_path):
     theta_w = np.array([0.03, 0.11, 0.27])
     vem = _fake_vem(theta_w)
     warm = tmp_path / "warm.json"
-    warm.write_text(json.dumps(score_stream.warm_start_payload(vem)), encoding="utf-8")
+    warm.write_text(
+        json.dumps(stream_scoring.warm_start_payload(vem)), encoding="utf-8"
+    )
     index = tmp_path / "wallet_index.json"
     index.write_text(
         json.dumps({w: i for i, w in enumerate(_STREAM_WALLETS)}), encoding="utf-8"
@@ -1468,7 +1472,7 @@ def _validate_vem_shaped_artifact(vem: VEMOutput, *, centering: bool) -> dict:
     best = {
         "index": 0,
         "seed": 7,
-        **score_stream.warm_start_payload(vem),
+        **stream_scoring.warm_start_payload(vem),
         "beta_S_orig": float(vem.beta_S_orig),
         "beta_Z_orig": float(vem.beta_Z_orig),
     }
@@ -1488,7 +1492,7 @@ def test_score_stream_rejects_params_only_warm_start_with_fitted_betas(tmp_path)
     )
 
     with pytest.raises(ValueError) as err:
-        score_stream.load_warm_start(path)
+        stream_scoring.load_warm_start(path)
     # The message has to name both the missing keys and the damage, since the
     # alternative (running anyway) produces plausible-looking wrong scores.
     assert "m_S" in str(err.value) and "s_S" in str(err.value)
@@ -1504,7 +1508,7 @@ def test_score_stream_loads_validate_vem_artifact_as_a_full_warm_start(tmp_path)
         encoding="utf-8",
     )
 
-    warm = score_stream.load_warm_start(path)
+    warm = stream_scoring.load_warm_start(path)
     assert warm.params == vem.params
     assert np.array_equal(warm.theta_w, vem.theta_w)
     assert (warm.m_S, warm.s_S, warm.m_Z) == (vem.m_S, vem.s_S, vem.m_Z)
@@ -1513,7 +1517,7 @@ def test_score_stream_loads_validate_vem_artifact_as_a_full_warm_start(tmp_path)
 def test_score_stream_warns_instead_of_raising_when_betas_are_zero(tmp_path, caplog):
     """With an inert logistic predictor, identity centering is exact — so warn."""
     vem = _fake_vem(np.array([0.1, 0.05, 0.2]))
-    payload = score_stream.warm_start_payload(vem)
+    payload = stream_scoring.warm_start_payload(vem)
     payload["params"]["beta_S"] = 0.0
     payload["params"]["beta_Z"] = 0.0
     for key in ("m_S", "s_S", "m_Z"):
@@ -1522,7 +1526,7 @@ def test_score_stream_warns_instead_of_raising_when_betas_are_zero(tmp_path, cap
     path.write_text(json.dumps(payload), encoding="utf-8")
 
     with caplog.at_level("WARNING"):
-        warm = score_stream.load_warm_start(path)
+        warm = stream_scoring.load_warm_start(path)
 
     assert (warm.m_S, warm.s_S, warm.m_Z) == (0.0, 1.0, 0.0)
     assert "m_S" in caplog.text and "cold-start" in caplog.text
@@ -1588,7 +1592,7 @@ def test_score_stream_live_scores_arrival_order_and_dedupes_on_restart(
         # reaches the poll loop — which in a real deployment ends at Ctrl-C.
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(score_stream.time, "sleep", interrupt_instead_of_polling)
+    monkeypatch.setattr(trade_stream.time, "sleep", interrupt_instead_of_polling)
 
     for _ in range(2):
         # --max-trades bounds the first run so it stops before polling.
@@ -1657,8 +1661,8 @@ def test_tail_live_holds_back_a_torn_line_until_it_is_whole(tmp_path, monkeypatc
         elif polls["n"] >= 3:
             raise _PolledDry
 
-    monkeypatch.setattr(score_stream.time, "sleep", fake_sleep)
-    tail = score_stream.tail_live(path, poll_interval=0.0)
+    monkeypatch.setattr(trade_stream.time, "sleep", fake_sleep)
+    tail = trade_stream.tail_live(path, poll_interval=0.0)
 
     assert next(tail)["transaction_hash"] == records[0]["transaction_hash"]
     # The fragment was never yielded truncated: the loop rewound and waited.

@@ -92,7 +92,7 @@ restored:
 
 ```python
 import json
-from scripts.score_stream import warm_start_payload
+from src.inference.stream_scoring import warm_start_payload
 json.dump(warm_start_payload(vem), open("results/streaming/warm_start.json", "w"))
 ```
 

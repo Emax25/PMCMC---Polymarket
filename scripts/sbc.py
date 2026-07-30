@@ -18,8 +18,11 @@ All statistics live in ``src/analysis/sbc.py`` and all drawing in
 reporting and I/O.
 
 Reading the output: the two verdicts per component are a chi-square bin test
-(``p``) and a simultaneous ECDF band, and coverage must land inside
-[0.85, 0.95] for nominal-90% intervals. A U-shaped rank histogram means the
+(``p``) and a simultaneous ECDF band. A coverage row is decided on its Wilson CI,
+not on the point estimate — it *passes* when the CI covers the nominal level and
+is *conclusive* when the CI also fits inside the [0.85, 0.95] acceptance band, so
+``pass (underpowered)`` means too few replicates rather than good calibration.
+A U-shaped rank histogram means the
 posterior is too narrow (overconfident) — the failure mode this whole exercise
 exists to detect. Until STATUS.md P8 lands, though, expect a phi-rank U-shape to
 be dominated by the known mis-calibration of the Laplace proposal (ECM curvature
@@ -280,14 +283,19 @@ def _format_report(summary: SBCSummary) -> str:
         [
             "",
             f"Coverage of nominal-{summary.nominal:.0%} intervals "
-            f"(target [{summary.band[0]:.2f}, {summary.band[1]:.2f}], "
-            f"Wilson {1.0 - summary.alpha:.0%} CI):",
+            f"(pass = Wilson CI covers {summary.nominal:.2f}; conclusive = CI "
+            f"also inside [{summary.band[0]:.2f}, {summary.band[1]:.2f}]; "
+            f"per-row CI Bonferroni-widened to hold jointly at "
+            f"{1.0 - summary.alpha:.0%}):",
         ],
     )
     for row in summary.coverage:
+        # The verdict, not `in_range` alone: a row can pass simply because n is
+        # too small for its CI to exclude anything, and a CLI reader who only
+        # sees the boolean would quote that as calibration demonstrated.
         lines.append(
             f"  {row.name:9s} {row.rate:.3f} [{row.ci_lo:.3f}, {row.ci_hi:.3f}] "
-            f"n={row.n:<6d} in_range={row.in_range}",
+            f"n={row.n:<6d} {row.verdict}",
         )
     if summary.theta_w is not None:
         lines.append(

@@ -354,6 +354,10 @@ class RTDSClient:
                 failures += 1
                 log.warning("RTDS stream dropped (attempt %d): %s", failures, e)
             else:
+                # Unreachable today — `_read_frames` loops forever and only ever
+                # leaves via an exception. Kept as the backoff guard for the day
+                # it grows a clean exit: falling through with failures == 0 would
+                # reconnect with no delay at all, hammering the endpoint.
                 failures += 1
                 log.warning("RTDS stream ended cleanly (attempt %d)", failures)
             finally:

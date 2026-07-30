@@ -68,7 +68,6 @@ from scripts._runner import (
     load_inputs,
     make_synthetic_inputs,
 )
-from scripts.score_stream import warm_start_payload
 from src.analysis.plots import (
     plot_elbo_traces,
     plot_heldout_ll,
@@ -95,6 +94,7 @@ from src.analysis.validation import (
     stability_block,
 )
 from src.inference.laplace import laplace_from_vem
+from src.inference.stream_scoring import warm_start_payload
 from src.inference.variational_em import VEMOutput, variational_em
 
 log = logging.getLogger("validate_vem")

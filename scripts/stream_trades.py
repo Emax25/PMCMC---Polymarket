@@ -33,6 +33,7 @@ import pandas as pd
 
 from src.data.polymarket_api import RawTrade
 from src.data.rtds import RTDS_URL, RTDSClient, RTDSSocket, default_socket_factory
+from src.data.trade_stream import iter_jsonl
 
 log = logging.getLogger("stream_trades")
 
@@ -141,18 +142,11 @@ def compact_to_parquet(jsonl_path: Path, parquet_path: Path) -> int:
     Returns:
         Number of records written.
     """
-    records = []
-    with jsonl_path.open(encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                records.append(json.loads(line))
-            except json.JSONDecodeError:
-                # Only reachable if an external writer truncated the file; our
-                # own sink flushes whole lines. Drop it rather than abort.
-                log.warning("skipping unparseable line in %s", jsonl_path)
+    # Shared reader, so the skip-blank / warn-and-skip-unparseable policy is
+    # stated once (`src/data/trade_stream.py`) rather than per call site. A bad
+    # line is only reachable here if an external writer truncated the file — our
+    # own sink flushes whole lines — and dropping it beats aborting a capture.
+    records = list(iter_jsonl(jsonl_path))
     parquet_path.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(records).to_parquet(parquet_path, index=False)
     return len(records)
