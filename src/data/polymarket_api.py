@@ -110,13 +110,19 @@ class RawTrade:
     """One trade from data-api.polymarket.com/trades.
 
     `wallet` is the taker's proxy wallet (0x-prefixed Polygon address); this
-    is what the model's hierarchical θ_w prior keys on (§3.2).
+    is what the model's hierarchical θ_w prior keys on (§3.2). It is `None`
+    only for anonymous venues that publish no per-account identifier at all
+    (`src/data/kalshi_api.py`) — never for Polymarket, whose parser below
+    yields `""` for a missing address. Downstream code reads that
+    nullability as the anonymous-mode signal, so a Polymarket trade must
+    never carry `None` and an anonymous trade must never carry a stand-in
+    string.
     """
 
     timestamp: int  # unix seconds
     price: float  # in (0, 1)
     size: float  # USDC notional
-    wallet: str
+    wallet: str | None
     side: str  # 'BUY' or 'SELL'
     transaction_hash: str
     condition_id: str

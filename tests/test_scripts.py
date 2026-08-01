@@ -25,6 +25,7 @@ from scripts import (
     make_figures,
     pareto,
     pull_data,
+    pull_kalshi,
     run_ipmcmc,
     run_pg,
     score_stream,
@@ -32,7 +33,8 @@ from scripts import (
     validate_vem,
 )
 from src.analysis.validation import PSIS_KHAT_KEY
-from src.data import trade_stream
+from src.data import kalshi_api, trade_stream
+from src.data.kalshi_api import KalshiAPIError, KalshiMarketMeta
 from src.data.polymarket_api import MarketMeta, PolymarketAPIError, RawTrade
 from src.inference import stream_scoring
 from src.inference.ipmcmc import iPMCMCOutput
@@ -358,6 +360,204 @@ def test_pull_data_full_history_applies_tail_after_retrieval(tmp_path, monkeypat
     mkt = load_processed(tmp_path / "alpha.parquet")
     assert mkt.T == 3
     assert mkt.delta[0] == 0.0
+
+
+# ---------------- pull_kalshi.py ----------------
+
+
+def _kalshi_meta(ticker: str, *, close_time: str = "2026-07-01T03:59:00Z"):
+    """Canned Kalshi market metadata for the offline pull_kalshi smoke tests."""
+    return KalshiMarketMeta.from_dict(
+        {
+            "ticker": ticker,
+            "title": f"Offline smoke market {ticker}",
+            "status": "finalized",
+            "close_time": close_time,
+            "volume_fp": "1234.50",
+        }
+    )
+
+
+def _kalshi_trades(ticker: str, n: int = 8) -> list[RawTrade]:
+    """n anonymous Kalshi-shaped trades, one per hour, ending well before close.
+
+    Timestamps sit ~30 days before the canned close time so the default
+    7-day pre-resolution filter keeps every row.
+    """
+    base = 1_780_000_000
+    return [
+        RawTrade(
+            timestamp=base + 3600 * i,
+            price=0.40 + 0.01 * i,
+            size=10.0 + i,
+            wallet=None,
+            side="BUY" if i % 2 else "SELL",
+            transaction_hash=f"{ticker}-trade-{i:03d}",
+            condition_id=ticker,
+            asset_id="",
+        )
+        for i in range(n)
+    ]
+
+
+def _mock_kalshi_api(monkeypatch) -> dict:
+    """Point pull_kalshi at canned Kalshi responses; returns recorded calls."""
+    calls: dict[str, list] = {"market": [], "trades": []}
+
+    def fake_fetch_market(ticker, **kwargs):
+        calls["market"].append(ticker)
+        return _kalshi_meta(ticker)
+
+    def fake_fetch_trades(ticker, **kwargs):
+        calls["trades"].append({"ticker": ticker, **kwargs})
+        return _kalshi_trades(ticker)
+
+    monkeypatch.setattr("scripts.pull_kalshi.fetch_market", fake_fetch_market)
+    monkeypatch.setattr("scripts.pull_kalshi.fetch_trades", fake_fetch_trades)
+    return calls
+
+
+def test_pull_kalshi_main_with_mocked_api(tmp_path, monkeypatch):
+    """End-to-end pull_kalshi.py against canned GetTrades responses."""
+    calls = _mock_kalshi_api(monkeypatch)
+
+    rc = pull_kalshi.main(
+        [
+            "--tickers",
+            "KXA-26JUL01",
+            "KXB-26JUL01",
+            "--output-dir",
+            str(tmp_path),
+            "--log-level",
+            "WARNING",
+        ]
+    )
+    assert rc == 0
+    assert calls["market"] == ["KXA-26JUL01", "KXB-26JUL01"]
+    # Default pull is the newest-N tail, matching pull_data's budgeted default.
+    assert calls["trades"][0]["max_trades"] == kalshi_api.DEFAULT_MAX_TRADES
+
+    df = pd.read_parquet(tmp_path / "KXA-26JUL01.parquet")
+    assert len(df) == 8
+    assert list(df["timestamp"]) == sorted(df["timestamp"])
+    # No-identity invariant survives the whole CLI path, not just the parser.
+    assert df["wallet"].isna().all()
+
+    meta = json.loads((tmp_path / "KXA-26JUL01.meta.json").read_text())
+    assert meta["source"] == "kalshi"
+    assert meta["mode"] == "anonymous"
+    assert meta["n_trades"] == 8
+    assert (tmp_path / "KXB-26JUL01.parquet").exists()
+
+
+def test_pull_kalshi_full_history_lifts_the_row_budget(tmp_path, monkeypatch):
+    """--full-history walks the cursor to the first trade (max_trades=None)."""
+    calls = _mock_kalshi_api(monkeypatch)
+
+    rc = pull_kalshi.main(
+        [
+            "--tickers",
+            "KXA-26JUL01",
+            "--output-dir",
+            str(tmp_path),
+            "--full-history",
+            "--log-level",
+            "WARNING",
+        ]
+    )
+    assert rc == 0
+    assert calls["trades"][0]["max_trades"] is None
+
+
+def test_pull_kalshi_tail_and_pre_resolution_filter(tmp_path, monkeypatch):
+    """--tail-trades slices post-retrieval; --pre-resolution-days drops the tail."""
+    _mock_kalshi_api(monkeypatch)
+
+    rc = pull_kalshi.main(
+        [
+            "--tickers",
+            "KXA-26JUL01",
+            "--output-dir",
+            str(tmp_path),
+            "--tail-trades",
+            "3",
+            "--log-level",
+            "WARNING",
+        ]
+    )
+    assert rc == 0
+    kept = pd.read_parquet(tmp_path / "KXA-26JUL01.parquet")
+    assert len(kept) == 3
+    assert list(kept["transaction_hash"]) == [
+        "KXA-26JUL01-trade-005",
+        "KXA-26JUL01-trade-006",
+        "KXA-26JUL01-trade-007",
+    ]
+
+    # A close time just after the last trade puts every row inside the 7-day
+    # exclusion window, so nothing survives and the market is reported failed.
+    monkeypatch.setattr(
+        "scripts.pull_kalshi.fetch_market",
+        lambda ticker, **k: _kalshi_meta(ticker, close_time="2026-05-30T00:00:00Z"),
+    )
+    rc = pull_kalshi.main(
+        [
+            "--tickers",
+            "KXA-26JUL01",
+            "--output-dir",
+            str(tmp_path / "empty"),
+            "--log-level",
+            "ERROR",
+        ]
+    )
+    assert rc == 1
+    assert not (tmp_path / "empty" / "KXA-26JUL01.parquet").exists()
+
+
+def test_pull_kalshi_survives_one_failing_ticker(tmp_path, monkeypatch):
+    """One bad ticker is reported but does not discard the markets already pulled."""
+    _mock_kalshi_api(monkeypatch)
+
+    def flaky_fetch_market(ticker, **kwargs):
+        if ticker == "KXBAD-26JUL01":
+            raise KalshiAPIError("HTTP 404: not found")
+        return _kalshi_meta(ticker)
+
+    monkeypatch.setattr("scripts.pull_kalshi.fetch_market", flaky_fetch_market)
+
+    rc = pull_kalshi.main(
+        [
+            "--tickers",
+            "KXBAD-26JUL01",
+            "KXA-26JUL01",
+            "--output-dir",
+            str(tmp_path),
+            "--log-level",
+            "ERROR",
+        ]
+    )
+    assert rc == 0
+    assert (tmp_path / "KXA-26JUL01.parquet").exists()
+    assert not (tmp_path / "KXBAD-26JUL01.parquet").exists()
+
+
+def test_pull_kalshi_wallet_mode_override_is_rejected(tmp_path, monkeypatch):
+    """--mode wallet on an identity-free source fails loudly (KTD3 seam)."""
+    _mock_kalshi_api(monkeypatch)
+
+    with pytest.raises(ValueError, match="no trade carries a wallet"):
+        pull_kalshi.main(
+            [
+                "--tickers",
+                "KXA-26JUL01",
+                "--output-dir",
+                str(tmp_path),
+                "--mode",
+                "wallet",
+                "--log-level",
+                "WARNING",
+            ]
+        )
 
 
 # ---------------- run_pg.py / run_ipmcmc.py ----------------
@@ -1299,9 +1499,7 @@ def _raw_trade(i: int, *, ts: float, price: float, size: float, wallet: str) -> 
 def _write_trades(path: Path, records: list[dict]) -> Path:
     """Write raw trade records as a JSONL capture, one object per line."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        "".join(json.dumps(r) + "\n" for r in records), encoding="utf-8"
-    )
+    path.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
     return path
 
 
@@ -1368,10 +1566,14 @@ def test_score_stream_replay_is_byte_identical_across_runs(tmp_path):
         out = tmp_path / f"scores_{run}.jsonl"
         rc = score_stream.main(
             [
-                "--replay", str(capture),
-                "--warm-start", str(warm),
-                "--output", str(out),
-                "--log-level", "WARNING",
+                "--replay",
+                str(capture),
+                "--warm-start",
+                str(warm),
+                "--output",
+                str(out),
+                "--log-level",
+                "WARNING",
             ]
         )
         assert rc == 0
@@ -1392,9 +1594,19 @@ def test_score_stream_replay_has_no_lookahead(tmp_path):
         out = tmp_path / f"{name}.scores.jsonl"
         # Default forgetting (adaptation on) is the strong version of the
         # invariant: the parameters themselves must depend only on the past.
-        assert score_stream.main(
-            ["--replay", str(capture), "--output", str(out), "--log-level", "WARNING"]
-        ) == 0
+        assert (
+            score_stream.main(
+                [
+                    "--replay",
+                    str(capture),
+                    "--output",
+                    str(out),
+                    "--log-level",
+                    "WARNING",
+                ]
+            )
+            == 0
+        )
         scores.append(out.read_text(encoding="utf-8").splitlines())
 
     assert len(scores[0]) == 40 and len(scores[1]) == 25
@@ -1421,15 +1633,23 @@ def test_score_stream_warm_start_restores_centering_constants(tmp_path):
     )
 
     out = tmp_path / "scores.jsonl"
-    assert score_stream.main(
-        [
-            "--replay", str(capture),
-            "--warm-start", str(warm),
-            "--wallet-index", str(index),
-            "--output", str(out),
-            "--log-level", "WARNING",
-        ]
-    ) == 0
+    assert (
+        score_stream.main(
+            [
+                "--replay",
+                str(capture),
+                "--warm-start",
+                str(warm),
+                "--wallet-index",
+                str(index),
+                "--output",
+                str(out),
+                "--log-level",
+                "WARNING",
+            ]
+        )
+        == 0
+    )
 
     reference = OnlineScorer(
         vem.params,
@@ -1456,9 +1676,12 @@ def test_score_stream_warm_start_restores_centering_constants(tmp_path):
 
     # And the constants are load-bearing: a cold start scores differently.
     cold = tmp_path / "cold.jsonl"
-    assert score_stream.main(
-        ["--replay", str(capture), "--output", str(cold), "--log-level", "WARNING"]
-    ) == 0
+    assert (
+        score_stream.main(
+            ["--replay", str(capture), "--output", str(cold), "--log-level", "WARNING"]
+        )
+        == 0
+    )
     assert [r["p_z"] for r in _read_jsonl(cold)] != pytest.approx(expected)
 
 
@@ -1546,9 +1769,19 @@ def test_score_stream_replay_sorts_out_of_order_input(tmp_path):
     outs = []
     for name, capture in (("shuffled", shuffled), ("ordered", ordered)):
         out = tmp_path / f"{name}.scores.jsonl"
-        assert score_stream.main(
-            ["--replay", str(capture), "--output", str(out), "--log-level", "WARNING"]
-        ) == 0
+        assert (
+            score_stream.main(
+                [
+                    "--replay",
+                    str(capture),
+                    "--output",
+                    str(out),
+                    "--log-level",
+                    "WARNING",
+                ]
+            )
+            == 0
+        )
         outs.append(out.read_bytes())
 
     assert outs[0] == outs[1]
@@ -1596,14 +1829,21 @@ def test_score_stream_live_scores_arrival_order_and_dedupes_on_restart(
 
     for _ in range(2):
         # --max-trades bounds the first run so it stops before polling.
-        assert score_stream.main(
-            [
-                "--live", str(capture),
-                "--output", str(out),
-                "--max-trades", "8",
-                "--log-level", "WARNING",
-            ]
-        ) == 0
+        assert (
+            score_stream.main(
+                [
+                    "--live",
+                    str(capture),
+                    "--output",
+                    str(out),
+                    "--max-trades",
+                    "8",
+                    "--log-level",
+                    "WARNING",
+                ]
+            )
+            == 0
+        )
 
     scored = _read_jsonl(out)
     # Not 16: the second run recognized all 8 hashes as already scored. And not
@@ -1626,14 +1866,21 @@ def test_score_stream_live_accepts_same_second_trades_in_any_hash_order(tmp_path
     capture = _write_trades(tmp_path / "trades.jsonl", records)
     out = tmp_path / "scores.jsonl"
 
-    assert score_stream.main(
-        [
-            "--live", str(capture),
-            "--output", str(out),
-            "--max-trades", "2",
-            "--log-level", "WARNING",
-        ]
-    ) == 0
+    assert (
+        score_stream.main(
+            [
+                "--live",
+                str(capture),
+                "--output",
+                str(out),
+                "--max-trades",
+                "2",
+                "--log-level",
+                "WARNING",
+            ]
+        )
+        == 0
+    )
     assert [r["tx_hash"] for r in _read_jsonl(out)] == ["0xffffff", "0x000001"]
 
 
@@ -1681,14 +1928,21 @@ def test_score_stream_writes_a_deterministic_run_sidecar(tmp_path):
 
     sidecars = []
     for _ in range(2):
-        assert score_stream.main(
-            [
-                "--replay", str(capture),
-                "--output", str(out),
-                "--forgetting", "0.97",
-                "--log-level", "WARNING",
-            ]
-        ) == 0
+        assert (
+            score_stream.main(
+                [
+                    "--replay",
+                    str(capture),
+                    "--output",
+                    str(out),
+                    "--forgetting",
+                    "0.97",
+                    "--log-level",
+                    "WARNING",
+                ]
+            )
+            == 0
+        )
         sidecars.append(sidecar.read_bytes())
 
     # Deterministic: no clock reading anywhere in the payload.
@@ -1722,25 +1976,36 @@ def test_score_stream_replays_parquet_and_skips_dirty_rows(tmp_path):
         price="n/a",
     )
     jsonl_out = tmp_path / "jsonl.scores.jsonl"
-    assert score_stream.main(
-        [
-            "--replay",
-            str(_write_trades(tmp_path / "trades.jsonl", dirty + [unparseable])),
-            "--output", str(jsonl_out),
-            "--log-level", "WARNING",
-        ]
-    ) == 0
+    assert (
+        score_stream.main(
+            [
+                "--replay",
+                str(_write_trades(tmp_path / "trades.jsonl", dirty + [unparseable])),
+                "--output",
+                str(jsonl_out),
+                "--log-level",
+                "WARNING",
+            ]
+        )
+        == 0
+    )
 
     parquet = tmp_path / "trades.parquet"
     pd.DataFrame(dirty).to_parquet(parquet, index=False)
     parquet_out = tmp_path / "parquet.scores.jsonl"
-    assert score_stream.main(
-        [
-            "--replay", str(parquet),
-            "--output", str(parquet_out),
-            "--log-level", "WARNING",
-        ]
-    ) == 0
+    assert (
+        score_stream.main(
+            [
+                "--replay",
+                str(parquet),
+                "--output",
+                str(parquet_out),
+                "--log-level",
+                "WARNING",
+            ]
+        )
+        == 0
+    )
 
     assert len(_read_jsonl(jsonl_out)) == 10
     assert jsonl_out.read_bytes() == parquet_out.read_bytes()

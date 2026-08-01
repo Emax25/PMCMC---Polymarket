@@ -182,20 +182,25 @@ def trades_to_dataframe(trades: list[RawTrade]) -> pd.DataFrame:
     )
 
 
-def clean_trades(df: pd.DataFrame) -> pd.DataFrame:
+def clean_trades(df: pd.DataFrame, *, require_wallet: bool = True) -> pd.DataFrame:
     """Apply §8.3 cleaning: drop invalid rows, dedupe, sort.
 
     Drops:
       * zero or negative size (fee-only and dust)
       * price outside (0, 1) — Polymarket guarantees this but the API has
         rounding pathologies
-      * missing wallet or transaction hash
+      * missing wallet (unless ``require_wallet`` is False) or transaction hash
     Sorts by (timestamp asc, transaction_hash asc) — hash breaks same-second
     ties deterministically. Drops exact duplicates on transaction_hash since
     the Data API occasionally double-counts a fill across pages.
 
     Args:
         df: Raw trade DataFrame as produced by ``trades_to_dataframe``.
+        require_wallet: Drop rows with a missing wallet address. Pass False for
+            anonymous venues (Kalshi), whose feeds publish no per-account
+            identifier at all, so *every* row is legitimately wallet-less and
+            the default filter would empty the table. Keyword-only; the
+            default preserves the Polymarket behaviour exactly.
 
     Returns:
         Cleaned copy with invalid rows removed, transaction_hash duplicates
@@ -206,13 +211,17 @@ def clean_trades(df: pd.DataFrame) -> pd.DataFrame:
         return df.copy()
 
     out = df.copy()
-    out = out[
+    keep = (
         (out["size"] > 0)
         & (out["price"] > 0.0)
         & (out["price"] < 1.0)
-        & (out["wallet"].astype(str).str.len() > 0)
         & (out["transaction_hash"].astype(str).str.len() > 0)
-    ]
+    )
+    if require_wallet:
+        # `astype(str)` turns a null wallet into the literal "None", which would
+        # sail through a length check — test for nullness explicitly instead.
+        keep &= out["wallet"].notna() & (out["wallet"].astype(str).str.len() > 0)
+    out = out[keep]
     out = out.drop_duplicates(subset=["transaction_hash"], keep="first")
     out = out.sort_values(["timestamp", "transaction_hash"], kind="mergesort")
     out = out.reset_index(drop=True)
