@@ -20,6 +20,7 @@ from src.data.synthetic import generate_market
 from src.inference.adf_filter import ADFFilter, ADFStep, _logsumexp4
 from src.inference.particle_gibbs import MarketData
 from src.inference.variational_em import _vem_e_step
+from src.utils.transforms import logit
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -348,3 +349,69 @@ def test_batch_e_step_is_linear_and_fast_at_gate_scale():
     assert per_trade < 250e-6, (
         f"gate-scale E-step at {per_trade * 1e6:.1f} us/trade, budget 250 us"
     )
+
+
+# ---------------- Anonymous mode (Kalshi variant) ----------------
+
+
+def test_z_logit_level_is_the_only_mode_switch():
+    """`ModelParams.z_logit_level` passes wallet logits through, or replaces them."""
+    wallet = ModelParams.warm_start(np.zeros(4))
+    anon = replace(wallet, anonymous=True, alpha=-2.5)
+
+    assert wallet.z_logit_level(1.75) == 1.75
+    assert anon.z_logit_level(1.75) == -2.5
+
+
+def test_anonymous_filter_equals_a_single_wallet_pinned_at_alpha():
+    """The cached anonymous branch is `z_logit_level`, bit-for-bit.
+
+    `ADFFilter` hoists the mode switch into `set_params` (it is a
+    per-parameter-set constant, and anonymous mode has no wallet array to
+    index), so nothing but a test keeps that cache honest. Wallet mode with one
+    wallet whose `logit(theta_w)` *is* `alpha` must therefore produce identical
+    output — `alpha` is taken from the same `logit` call the filter makes, so
+    the two levels agree to the last bit rather than to a tolerance.
+    """
+    rng = np.random.default_rng(5)
+    base = ModelParams.warm_start(rng.standard_normal(200))
+    theta_w = np.array([0.05])
+    alpha = float(logit(theta_w)[0])
+
+    wallet_params = replace(base, beta_S=0.7, beta_Z=1.3)
+    anon_params = replace(wallet_params, anonymous=True, alpha=alpha)
+
+    mkt = generate_market(
+        anon_params, n_trades=250, mean_inter_trade_time=1.0,
+        rng=np.random.default_rng(8),
+    )
+    log_size_ratio = np.log(mkt.S / mkt.S_bar)
+    m_S, s_S, m_Z = float(log_size_ratio.mean()), float(log_size_ratio.std()), 0.3
+
+    anon = ADFFilter(anon_params, np.empty(0), m_S, s_S, m_Z)
+    wallet = ADFFilter(wallet_params, theta_w, m_S, s_S, m_Z)
+    for t in range(len(mkt.Y)):
+        got = anon.step(mkt.Y[t], mkt.delta[t], log_size_ratio[t], 0)
+        want = wallet.step(mkt.Y[t], mkt.delta[t], log_size_ratio[t], 0)
+        assert got.Z_prob == want.Z_prob
+        assert got.X_mean == want.X_mean
+        assert got.log_evidence == want.log_evidence
+        np.testing.assert_array_equal(got.q_vz, want.q_vz)
+
+
+def test_anonymous_filter_never_indexes_theta_w():
+    """An empty `theta_w` and an out-of-range wallet id are both fine anonymously.
+
+    A Kalshi feed supplies no account identifier at all, so the batch driver
+    stamps a placeholder id; the filter must not treat it as an index.
+    """
+    base = ModelParams.warm_start(np.linspace(-1.0, 1.0, 50))
+    params = replace(base, anonymous=True, alpha=-3.0, beta_S=0.5)
+    filt = ADFFilter(params, np.empty(0), 0.0, 0.5, 0.0)
+
+    for wallet_id in (0, 7, 10_000):
+        out = filt.step(0.1, 1.0, 0.2, wallet_id)
+        assert 0.0 < out.Z_prob < 1.0
+    # `set_params` must refresh the cached level, not just the transitions.
+    filt.set_params(replace(params, alpha=3.0))
+    assert filt.step(0.1, 1.0, 0.2, 0).Z_prob > 0.5

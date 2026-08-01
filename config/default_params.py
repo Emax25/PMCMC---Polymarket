@@ -17,6 +17,7 @@ overnight runs; individual scripts may override specific fields via
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -31,6 +32,15 @@ class ModelParams:
     be set either via ``warm_start`` (recommended) or explicitly before running
     inference. Running the sampler with NaN params will raise immediately on
     the first Kalman update.
+
+    Two *model modes* share every field but the insider predictor's level term
+    (`z_logit_level`), selected by the `anonymous` flag:
+
+      * **wallet** (default, Polymarket): the level is the per-wallet
+        ``logit(theta_w[w])``, shrunk by the Beta(a, b) hierarchy;
+      * **anonymous** (Kalshi): the public trade feed carries no per-account
+        identifier, so there is no ``theta_w`` to anchor on and the level is the
+        single per-market intercept `alpha`, estimated in the IRLS M-step.
     """
 
     # Regime-switched process variances
@@ -58,16 +68,67 @@ class ModelParams:
     gamma: float = 1.0  # size-informativeness scaling
     s0_2: float = 1.0  # initialization variance for X_{t_0}
 
+    # ---- Model mode (see the class docstring) ----
+    # A bool rather than a mode *string* on purpose: `stream_scoring` restores a
+    # warm-start artifact by coercing every ModelParams field through `float`,
+    # which a string would break, while `float(False)/float(True)` round-trips
+    # the flag's truth value intact.
+    anonymous: bool = False
+    # Per-market insider intercept on the logit scale; used only when
+    # `anonymous` is set. Estimated by the IRLS M-step block (it rides on
+    # `estimate_betas`, so with beta estimation off it stays at this value).
+    # The 0.0 default is a 50% base rate and is deliberately *not* a sensible
+    # anonymous starting point — `warm_start(..., anonymous=True)` sets it to
+    # the Beta(a, b) prior-mean logit, matching how wallet mode initializes
+    # theta_w.
+    alpha: float = 0.0
+
     @classmethod
-    def warm_start(cls, Y: np.ndarray) -> ModelParams:
-        """Moment-matched initialization from logit-price observations (§10)."""
+    def warm_start(cls, Y: np.ndarray, *, anonymous: bool = False) -> ModelParams:
+        """Moment-matched initialization from logit-price observations (§10).
+
+        Args:
+            Y: Logit-price observations pooled over the dataset.
+            anonymous: Select the anonymous (no-wallet) mode, which additionally
+                seeds `alpha` at the Beta(a, b) prior-mean logit — the level
+                wallet mode starts every `theta_w` at. Keyword-only; the default
+                reproduces the wallet-mode initialization bit for bit.
+
+        Returns:
+            Parameters with the four variances moment-matched to ``Var[Y]``.
+        """
         var_Y = float(np.var(Y))
-        return cls(
+        params = cls(
             sigma2_0=0.1 * var_Y,
             sigma2_1=var_Y,
             tau2_0=var_Y,
             tau2_1=0.01 * var_Y,
+            anonymous=anonymous,
         )
+        if anonymous:
+            base_rate = params.a / (params.a + params.b)
+            params.alpha = math.log(base_rate / (1.0 - base_rate))
+        return params
+
+    def z_logit_level(self, logit_theta_w: float | np.ndarray) -> float | np.ndarray:
+        """Level term of the insider logistic predictor under the active mode.
+
+        The single mode switch the whole model shares (KTD1): the synthetic
+        generator, the ADF filter, the VEM M-step and the online scorer all
+        build ``logit(pi_Z) = level + beta_S * x_S~ + beta_Z * x_Z~`` and differ
+        only in what ``level`` is. Passing the wallet logits through unchanged
+        keeps wallet mode bit-identical; anonymous mode ignores them and returns
+        the scalar per-market intercept, which broadcasts against any covariate
+        shape.
+
+        Args:
+            logit_theta_w: ``logit(theta_w[w])`` for the trade(s) in question.
+                Ignored in anonymous mode, where no wallet identity exists.
+
+        Returns:
+            `alpha` in anonymous mode, otherwise ``logit_theta_w`` unchanged.
+        """
+        return self.alpha if self.anonymous else logit_theta_w
 
 
 @dataclass
@@ -119,6 +180,25 @@ class PhiPrior:
     q_beta_b: float = 1.0
     # Cauchy(0, scale) weakly-informative prior on each *standardized* beta.
     beta_cauchy_scale: float = 2.5
+    # Cauchy(0, scale) prior on the anonymous-mode intercept `ModelParams.alpha`
+    # (unused in wallet mode, where `theta_w`'s Beta hierarchy carries the
+    # level). Gelman et al. (2008) recommend a *wider* scale for an intercept
+    # than for slopes because it must absorb the base rate, hence 10 rather than
+    # 2.5. Note what this buys and what it costs: `alpha` is fit from one
+    # market's trades with far less shrinkage than Beta(1, 19) ever applied to
+    # `theta_w`, so a low-trade-count market carries an incidental-parameters
+    # -style bias here (plan 2026-07-23-005 KTD2). Measured on the anonymous
+    # synthetic generator (24 seeds, planted alpha = logit(0.05)), the
+    # intercept's RMSE falls 0.466 -> 0.173 -> 0.113 logit across
+    # T = 200/1000/3000 and its bias -0.161 -> -0.043 -> +0.012, the small-T
+    # bias being under two Monte Carlo standard errors. Tightening to
+    # Cauchy(0, 2.5) improved that by less than one MC standard error and not
+    # at all past T = 1000, so the wider scale was kept — it is also the one
+    # that stays honest for base rates rarer than 5%, where a 2.5 scale would
+    # shrink the level hard toward zero. See
+    # `tests/test_variational_em.py::test_anonymous_alpha_bias_shrinks_with_T`.
+    # No hierarchical pooling across markets is built.
+    alpha_cauchy_scale: float = 10.0
 
     def sigma2_map(self, ss: float, n: float) -> float:
         """Inverse-Gamma MAP mode for a process variance from its E-step stats.

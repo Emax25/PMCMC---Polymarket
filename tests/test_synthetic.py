@@ -257,3 +257,74 @@ def test_prior_predictive_matches_generate_market_zero_insiders(params):
     )
     np.testing.assert_array_equal(mkt1.Y, mkt2.Y)
     np.testing.assert_array_equal(mkt1.theta_w, mkt2.theta_w)
+
+
+# ---------------- Anonymous mode (Kalshi variant) ----------------
+
+# logit(0.05) — the Beta(1, 19) prior mean, i.e. the base rate the wallet-mode
+# hierarchy shrinks toward, expressed as the anonymous intercept.
+ANON_ALPHA = float(np.log(0.05 / 0.95))
+
+
+@pytest.fixture
+def anon_params(params):
+    """Anonymous-mode params: no wallet layer, per-market intercept `alpha`."""
+    return replace(params, anonymous=True, alpha=ANON_ALPHA)
+
+
+def test_anonymous_market_has_no_wallet_layer(anon_params, rng):
+    """Anonymous generation emits no propensities, insiders or real wallet ids."""
+    mkt = generate_market(anon_params, n_trades=200, n_wallets=20, rng=rng)
+
+    assert mkt.theta_w.shape == (0,)
+    assert mkt.insider_wallet_ids == []
+    np.testing.assert_array_equal(mkt.wallet_ids, np.zeros(200, dtype=int))
+    # Everything else keeps the wallet-mode contract, so downstream code needs
+    # no anonymous-mode special case.
+    assert mkt.Y.shape == mkt.Z.shape == mkt.V.shape == (200,)
+    assert mkt.Z[0] == 0
+
+
+def test_anonymous_wallet_kwargs_are_inert(anon_params):
+    """`n_wallets`/`n_insider_wallets` cannot change an anonymous market."""
+    mkt_a = generate_market(
+        anon_params, n_trades=150, n_wallets=5, n_insider_wallets=0,
+        rng=np.random.default_rng(11),
+    )
+    mkt_b = generate_market(
+        anon_params, n_trades=150, n_wallets=500, n_insider_wallets=99,
+        rng=np.random.default_rng(11),
+    )
+    np.testing.assert_array_equal(mkt_a.Y, mkt_b.Y)
+    np.testing.assert_array_equal(mkt_a.Z, mkt_b.Z)
+
+
+def test_anonymous_base_rate_tracks_alpha(params):
+    """With both slopes zero, P(Z=1) is exactly sigmoid(alpha), not sigmoid(theta_w).
+
+    The whole point of the anonymous variant: `alpha` — and nothing else —
+    carries the insider base rate. Sampling noise at T = 4000 and a 5% rate is
+    ~0.0034, so the 0.015 band is ~4 standard errors.
+    """
+    anon = replace(params, anonymous=True, alpha=ANON_ALPHA, beta_S=0.0, beta_Z=0.0)
+    mkt = generate_market(anon, n_trades=4000, rng=np.random.default_rng(3))
+
+    # Z[0] is pinned to 0 by convention and is excluded from the rate.
+    observed = float(mkt.Z[1:].mean())
+    assert abs(observed - 0.05) < 0.015, f"base rate {observed:.4f} != 0.05"
+
+
+def test_warm_start_anonymous_seeds_alpha_at_the_prior_mean(params):
+    """`warm_start(anonymous=True)` starts the level where theta_w starts."""
+    rng = np.random.default_rng(0)
+    Y = rng.standard_normal(200)
+    anon = ModelParams.warm_start(Y, anonymous=True)
+
+    assert anon.anonymous
+    assert anon.alpha == pytest.approx(ANON_ALPHA, abs=1e-12)
+    # The wallet-mode default is untouched — including `alpha`, which is not a
+    # parameter there.
+    assert not params.anonymous
+    assert params.alpha == 0.0
+    for field in ("sigma2_0", "sigma2_1", "tau2_0", "tau2_1"):
+        assert getattr(anon, field) == getattr(params, field)

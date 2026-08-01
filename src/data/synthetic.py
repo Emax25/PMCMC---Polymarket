@@ -19,6 +19,13 @@ Two generation modes are supported:
     ``params_from_prior`` this yields exact draws from the joint
     ``p(phi) p(latents, data | phi)``, the sampling scheme simulation-based
     calibration requires.
+
+Both honour the model mode on ``ModelParams``. Under ``anonymous=True`` (the
+Kalshi variant, whose public feed carries no per-account identifier) there are
+no wallets at all: ``theta_w`` comes back empty, every trade is stamped with
+wallet id 0, and the insider predictor's level is the per-market intercept
+``params.alpha`` instead of ``logit(θ_w)``. The wallet-mode RNG draw order is
+untouched by the branch, so wallet-mode markets are unchanged for a given seed.
 """
 
 from __future__ import annotations
@@ -44,6 +51,9 @@ class SyntheticMarket:
 
     All arrays are length T (number of trades). Ground-truth latents (X, V,
     Z, theta_w) are only available here — they have no analog for real data.
+    In anonymous mode ``theta_w`` and ``insider_wallet_ids`` are empty and
+    ``wallet_ids`` is all zeros; the ground-truth insider level is
+    ``params.alpha``, which the caller already holds.
     """
 
     # Ground-truth latent variables (available only in synthetic experiments)
@@ -170,14 +180,21 @@ def generate_market(
     noisy logit-price observations Y. RNG calls are made in this fixed order
     — reordering them changes the realization even with the same seed.
 
+    In anonymous mode (``params.anonymous``) the wallet layer is skipped
+    entirely — ``n_wallets`` and ``n_insider_wallets`` are ignored, ``theta_w``
+    is empty and every trade carries wallet id 0 — and the insider logit is
+    ``params.alpha + β_S log(S/S̄) + β_Z 1{Z_prev}``.
+
     Args:
         params: Model hyperparameters; all variance fields must be non-NaN.
         n_trades: Number of trades T to simulate.
-        n_wallets: Total number of wallets in the market.
+        n_wallets: Total number of wallets in the market. Ignored in anonymous
+            mode.
         n_insider_wallets: Wallets [0, n_insider_wallets) are forced to high
             propensity via Beta(9, 1) (mean 0.9) and are up-weighted 3x in the
             wallet assignment. Pass 0 (or use
             ``generate_prior_predictive_market``) for an unplanted market.
+            Ignored in anonymous mode, which has no wallets to plant.
         mean_inter_trade_time: Mean of the Exponential inter-trade gap in
             seconds (delta[1:] ~ Exp(1/mean_inter_trade_time)).
         log_size_mean: Mean of the log-normal trade size distribution (log-USDC).
@@ -188,13 +205,20 @@ def generate_market(
         SyntheticMarket with ground-truth latents and noisy observations.
     """
     T = n_trades
+    anonymous = params.anonymous
 
     # --- Wallet propensities ---
-    # Regular wallets drawn from the prior; insider wallets forced to high propensity
-    theta_w = rng.beta(params.a, params.b, size=n_wallets)
-    insider_wallet_ids = list(range(n_insider_wallets))
-    for w in insider_wallet_ids:
-        theta_w[w] = rng.beta(9.0, 1.0)  # Beta(9,1) has mean 0.9
+    # Regular wallets drawn from the prior; insider wallets forced to high propensity.
+    # Anonymous mode has no wallet layer, and draws nothing here: the branch keeps
+    # wallet mode's RNG consumption (and therefore every seeded fixture) untouched.
+    if anonymous:
+        theta_w = np.empty(0)
+        insider_wallet_ids: list[int] = []
+    else:
+        theta_w = rng.beta(params.a, params.b, size=n_wallets)
+        insider_wallet_ids = list(range(n_insider_wallets))
+        for w in insider_wallet_ids:
+            theta_w[w] = rng.beta(9.0, 1.0)  # Beta(9,1) has mean 0.9
 
     # --- Trade times ---
     delta = np.zeros(T)
@@ -208,11 +232,17 @@ def generate_market(
 
     # --- Wallet assignments ---
     # Insider wallets trade 3x more often to make them identifiable
-    wallet_weights = np.ones(n_wallets)
-    for w in insider_wallet_ids:
-        wallet_weights[w] = 3.0
-    wallet_weights /= wallet_weights.sum()
-    wallet_ids = rng.choice(n_wallets, size=T, p=wallet_weights)
+    if anonymous:
+        # A single placeholder id: the trades still come from *someone*, the
+        # feed just does not say who. Kept as a real column so downstream code
+        # (MarketData, the ADF filter) needs no anonymous-mode special case.
+        wallet_ids = np.zeros(T, dtype=int)
+    else:
+        wallet_weights = np.ones(n_wallets)
+        for w in insider_wallet_ids:
+            wallet_weights[w] = 3.0
+        wallet_weights /= wallet_weights.sum()
+        wallet_ids = rng.choice(n_wallets, size=T, p=wallet_weights)
 
     # --- Latent state generation ---
     X = np.empty(T)
@@ -226,7 +256,10 @@ def generate_market(
     Z[0] = 0
 
     sigma2_by_regime = np.array([params.sigma2_0, params.sigma2_1])
-    logit_theta = logit(theta_w)  # pre-compute; shape (n_wallets,)
+    # Per-trade level of the insider predictor, pre-gathered so the loop below
+    # has a single mode-agnostic expression. Anonymous mode has no theta_w to
+    # gather, and `ModelParams.z_logit_level` discards this term there anyway.
+    logit_theta_by_trade = np.zeros(T) if anonymous else logit(theta_w)[wallet_ids]
 
     for i in range(1, T):
         # Volatility regime — flip with row-dependent probability
@@ -236,9 +269,11 @@ def generate_market(
         # Latent logit-probability — Gaussian random walk
         X[i] = rng.normal(X[i - 1], np.sqrt(sigma2_by_regime[V[i]] * delta[i]))
 
-        # Insider indicator
+        # Insider indicator. The level is `logit(theta_w[w])` in wallet mode and
+        # the per-market intercept `alpha` in anonymous mode — one switch, in
+        # `ModelParams.z_logit_level`, shared with the filter and the M-step.
         logit_pi_Z = (
-            logit_theta[wallet_ids[i]]
+            params.z_logit_level(logit_theta_by_trade[i])
             + params.beta_S * log_size_ratio[i]
             + params.beta_Z * float(Z[i - 1])
         )

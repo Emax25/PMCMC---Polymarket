@@ -10,8 +10,9 @@ single Gaussian, which is what makes the pass O(1) per trade — O(4T) per marke
 — rather than exponential in T:
 
     prior   P(V_t) = P(V_{t-1}) @ [[1-q_01, q_01], [q_10, 1-q_10]]
-            logit P(Z_t=1) = logit(theta_w[w_t])
-                             + beta_S * x_S~_t + beta_Z * x_Z~_t
+            logit P(Z_t=1) = level_t + beta_S * x_S~_t + beta_Z * x_Z~_t
+            level_t        = logit(theta_w[w_t])   (wallet mode)
+                           = alpha                 (anonymous mode)
     update  one Kalman predict+update per (v, z) combo off the *shared*
             incoming (mu, sigma2) — see `kalman._kalman_step_all_combos`
     collapse q_t(v, z) proportional to P(V_t=v) P(Z_t=z) p(Y_t | v, z)
@@ -30,8 +31,11 @@ output identity:
   * ``E[Z_{t-1}]`` (the filtered value, not the true latent) feeds the next
     trade's logistic predictor — a plug-in that attenuates ``beta_Z``
     (see `variational_em`'s module docstring on regression dilution).
-  * Covariates are centered/standardized (Gelman et al. 2008) with no free
-    intercept; the theta_w Beta hierarchy carries the level.
+  * Covariates are centered/standardized (Gelman et al. 2008). In wallet mode
+    there is no free intercept — the theta_w Beta hierarchy carries the level.
+    In anonymous mode (Kalshi's feed has no per-account identifier, so no
+    theta_w exists) the per-market intercept ``alpha`` is that level, and
+    ``wallet_id`` is ignored entirely.
 
 Reference: Ghahramani, Z. & Hinton, G.E. (2000) "Variational Learning for
 Switching State-Space Models", Neural Computation 12(4).
@@ -173,7 +177,8 @@ class ADFFilter:
                 *internal* (standardized) covariate scale.
             theta_w: (n_wallets,) per-wallet insider propensities on the
                 probability scale; converted to logits once here since the
-                predictor needs them every trade.
+                predictor needs them every trade. May be empty in anonymous
+                mode, where the predictor never consults it.
             m_S: Pooled mean of log_size_ratio, for centering the size covariate.
             s_S: Pooled std of log_size_ratio; at or below `S_STD_FLOOR`
                 (degenerate constant-size data) the 0.5/s_S scale factor is
@@ -207,6 +212,14 @@ class ADFFilter:
         self.params = params
         self._q_01 = params.q_01
         self._q_10 = params.q_10
+        # Cached hot-path form of `ModelParams.z_logit_level` — the one place
+        # the wallet/anonymous mode switch is *defined*. Hoisted out of the
+        # per-trade predictor because it is a per-parameter-set constant, and
+        # because in anonymous mode there is no wallet index to look up at all:
+        # `_logit_theta` is legitimately empty there. `test_adf_filter.py` pins
+        # the two against each other so the cache cannot drift from the method.
+        self._anonymous = params.anonymous
+        self._alpha = params.alpha
 
         # Stationary V-marginal of the 2-state chain, used as trade 0's prior
         # (there is no previous trade to transition from). A degenerate chain
@@ -253,7 +266,8 @@ class ADFFilter:
 
         Args:
             log_size_ratio: ``log(S_t / S_bar)`` for this trade.
-            wallet_id: Integer wallet index of this trade's trader.
+            wallet_id: Integer wallet index of this trade's trader; ignored (and
+                never indexed) in anonymous mode.
 
         Returns:
             ``(log_p_V, log_p_Z)``, each a length-2 array over ``{0, 1}``.
@@ -276,8 +290,10 @@ class ADFFilter:
         )
 
         # Standardize/center covariates (Gelman et al. 2008) before the
-        # logistic predictor: no free intercept here, theta_w's Beta
-        # hierarchy carries the level. Guard s_S below a small floor
+        # logistic predictor. The *level* the covariates tilt is mode-dependent
+        # (see `set_params`): wallet mode has no free intercept because
+        # theta_w's Beta hierarchy carries it; anonymous mode has no theta_w and
+        # uses the estimated per-market intercept. Guard s_S below a small floor
         # (degenerate/near-constant-size data) rather than exactly 0: a
         # constant column's std is only ~machine-epsilon due to floating-point
         # rounding, not exactly zero, and dividing by that residual noise would
@@ -288,11 +304,10 @@ class ADFFilter:
         )
         x_Z_tilde = self._prev_E_Z - self.m_Z
         params = self.params
-        logit_pi = (
-            float(self._logit_theta[int(wallet_id)])
-            + params.beta_S * x_S_tilde
-            + params.beta_Z * x_Z_tilde
+        level = (
+            self._alpha if self._anonymous else float(self._logit_theta[int(wallet_id)])
         )
+        logit_pi = level + params.beta_S * x_S_tilde + params.beta_Z * x_Z_tilde
         # log(1 + exp(x)) in the stable form: log_p_Z = [-lp, logit_pi - lp]
         # is exactly [log(1 - pi), log(pi)] without ever forming pi itself.
         lp = float(log1pexp(logit_pi))
@@ -311,7 +326,9 @@ class ADFFilter:
             y: Logit-price observation ``Y_t``.
             delta: Inter-trade time since the previous trade; ``0.0`` at trade 0.
             log_size_ratio: ``log(S_t / S_bar)`` for this trade.
-            wallet_id: Integer wallet index of this trade's trader.
+            wallet_id: Integer wallet index of this trade's trader; ignored in
+                anonymous mode, where any value (including 0 against an empty
+                `theta_w`) is accepted.
 
         Returns:
             The `ADFStep` for this trade. The filter's state is advanced, so

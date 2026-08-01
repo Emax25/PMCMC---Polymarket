@@ -18,6 +18,7 @@ import pytest
 from config.default_params import ModelParams, OnlineScorerConfig
 from src.inference.adf_filter import ADFFilter
 from src.inference.online_scorer import _MAX_BETA_WINDOW, OnlineScorer
+from src.utils.transforms import logit
 
 # Centering/standardization constants. The scorer holds these fixed for a
 # stream's lifetime, so the tests pass plain, already-representative values
@@ -479,3 +480,149 @@ def test_robbins_monro_converges_toward_the_batch_variance():
     # Filtered (not smoothed) increments bias sigma2 low, so this is a
     # containment band, not a point estimate check.
     assert 0.2 * sigma2_true < occupied < 3.0 * sigma2_true
+
+
+# ---------------- Anonymous mode + the trade-record seam (R3) ----------------
+
+
+def _trade_records(n, *, seed=0, with_wallet=False, n_wallets=3):
+    """Raw `{ts, p, S, side}` records, the shape an external feed hands over."""
+    rng = np.random.default_rng(seed)
+    ts = np.cumsum(rng.exponential(2.0, n))
+    p = np.clip(0.5 + np.cumsum(rng.normal(0.0, 0.01, n)), 0.02, 0.98)
+    S = np.exp(rng.normal(4.0, 1.0, n))
+    records = [
+        {"ts": float(ts[t]), "p": float(p[t]), "S": float(S[t]),
+         "side": "BUY" if t % 2 else "SELL"}
+        for t in range(n)
+    ]
+    if with_wallet:
+        for t, rec in enumerate(records):
+            rec["wallet"] = int(rng.integers(0, n_wallets))
+    return records
+
+
+def test_anonymous_scorer_matches_a_single_wallet_pinned_at_alpha():
+    """Anonymous mode is wallet mode with the level moved onto `alpha`.
+
+    Frozen schedule so neither `theta_w` nor the parameters adapt, which is the
+    only regime in which the two modes *can* agree — anonymous mode has no
+    per-wallet counts to update. `alpha` is read off the same `logit` call the
+    wallet-mode filter makes, so the levels match to the last bit.
+    """
+    theta_w = np.array([0.05])
+    alpha = float(logit(theta_w)[0])
+    wallet_params = _params(beta_S=0.7, beta_Z=1.3)
+    anon_params = replace(wallet_params, anonymous=True, alpha=alpha)
+    Y, delta, log_size_ratio, _ = _stream(200, n_wallets=1, seed=4)
+    frozen = OnlineScorerConfig(forgetting=1.0, n_refresh=None)
+
+    anon = OnlineScorer(anon_params, np.empty(0), M_S, S_S, M_Z, config=frozen)
+    wallet = OnlineScorer(wallet_params, theta_w, M_S, S_S, M_Z, config=frozen)
+    for t in range(len(Y)):
+        got = anon.step(Y[t], delta[t], log_size_ratio[t])
+        want = wallet.step(Y[t], delta[t], log_size_ratio[t], 0)
+        assert got.Z_prob == want.Z_prob
+        assert got.X_mean == want.X_mean
+        assert got.log_evidence == want.log_evidence
+    # No per-wallet propensity exists anonymously, and none is invented.
+    assert np.isnan(anon.step(Y[0], 1.0, 0.0).theta_w)
+
+
+def test_wallet_mode_step_without_a_wallet_id_raises():
+    """Wallet mode refuses to attribute every trade to one synthetic trader."""
+    scorer = OnlineScorer(_params(), np.array([0.05]), M_S, S_S, M_Z)
+    with pytest.raises(ValueError, match="wallet mode requires a wallet_id"):
+        scorer.step(0.1, 1.0, 0.0)
+
+
+def test_step_trade_accepts_a_wallet_less_record_in_anonymous_mode():
+    """`{ts, p, S, side}` alone is enough — the Kalshi integration seam."""
+    params = replace(_params(beta_S=0.5), anonymous=True, alpha=-2.9)
+    scorer = OnlineScorer(params, np.empty(0), M_S, S_S, M_Z)
+
+    scores = [scorer.step_trade(rec) for rec in _trade_records(40, seed=1)]
+
+    assert len(scores) == 40
+    assert all(0.0 < s.Z_prob < 1.0 for s in scores)
+    assert scorer.t == 40
+
+
+def test_step_trade_requires_a_wallet_only_in_wallet_mode():
+    """A wallet-less record is an error in wallet mode, and only there."""
+    record = _trade_records(1, seed=2)[0]
+
+    wallet_scorer = OnlineScorer(_params(), np.array([0.05]), M_S, S_S, M_Z)
+    with pytest.raises(ValueError, match="missing required field.*wallet"):
+        wallet_scorer.step_trade(record)
+
+    anon_scorer = OnlineScorer(
+        replace(_params(), anonymous=True, alpha=-2.9), np.empty(0), M_S, S_S, M_Z
+    )
+    assert anon_scorer.step_trade(record).t == 0
+
+
+@pytest.mark.parametrize("field", ["ts", "p", "S"])
+def test_step_trade_names_the_missing_field(field):
+    """A malformed record fails with the field name, not a bare KeyError."""
+    record = _trade_records(1, seed=3, with_wallet=True)[0]
+    del record[field]
+    scorer = OnlineScorer(_params(), np.array([0.05]), M_S, S_S, M_Z)
+
+    with pytest.raises(ValueError, match=f"missing required field.*{field}"):
+        scorer.step_trade(record)
+
+
+def test_step_trade_features_are_causal_and_match_a_manual_step():
+    """The seam derives exactly the features a caller would compute by hand.
+
+    ``S_bar`` is an *expanding* mean including the current trade (a live feed
+    cannot see the whole-market mean the batch pipeline uses), and ``delta``
+    comes from the previous record's timestamp with trade 0 at 0.0.
+    """
+    params = replace(_params(beta_S=0.6), anonymous=True, alpha=-2.5)
+    records = _trade_records(30, seed=5)
+    frozen = OnlineScorerConfig(forgetting=1.0, n_refresh=None)
+
+    seam = OnlineScorer(params, np.empty(0), M_S, S_S, M_Z, config=frozen)
+    manual = OnlineScorer(params, np.empty(0), M_S, S_S, M_Z, config=frozen)
+
+    sum_S = 0.0
+    prev_ts = None
+    for t, rec in enumerate(records):
+        sum_S += rec["S"]
+        S_bar = sum_S / (t + 1)
+        delta = 0.0 if prev_ts is None else max(rec["ts"] - prev_ts, 0.0)
+        prev_ts = rec["ts"]
+
+        got = seam.step_trade(rec)
+        want = manual.step(
+            float(logit(rec["p"])), delta, np.log(rec["S"] / S_bar)
+        )
+        assert got.Z_prob == want.Z_prob
+        assert got.X_mean == want.X_mean
+    # Trade 0's ratio is exactly log(1) = 0 under the inclusive window.
+    assert records[0]["S"] / records[0]["S"] == 1.0
+
+
+def test_anonymous_beta_refresh_moves_the_intercept():
+    """`alpha` rides on the IRLS refresh — off by default, live when enabled."""
+    params = replace(_params(), anonymous=True, alpha=-2.9)
+    records = _trade_records(120, seed=6)
+
+    frozen = OnlineScorer(
+        params, np.empty(0), M_S, S_S, M_Z,
+        config=OnlineScorerConfig(forgetting=0.98, n_refresh=None),
+    )
+    for rec in records:
+        frozen.step_trade(rec)
+    assert frozen.params.alpha == params.alpha
+
+    refreshing = OnlineScorer(
+        params, np.empty(0), M_S, S_S, M_Z,
+        config=OnlineScorerConfig(forgetting=0.98, n_refresh=20, beta_window=60),
+    )
+    for rec in records:
+        refreshing.step_trade(rec)
+    assert refreshing.params.alpha != params.alpha
+    assert np.isfinite(refreshing.params.alpha)

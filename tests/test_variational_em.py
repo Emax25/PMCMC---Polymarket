@@ -406,9 +406,9 @@ def test_update_beta_irls_recovers_planted_betas(seed):
     q_vz = _oracle_q_vz(mkt)
     m_S, s_S, m_Z = _std_consts(md, mkt)
 
-    beta_S, beta_Z, _ = update_beta_irls(
+    beta_S, beta_Z = update_beta_irls(
         [md], [q_vz], mkt.theta_w, m_S, s_S, m_Z, 0.0, 0.0
-    )
+    )[:2]
     beta_S_orig = beta_S * 0.5 / s_S
     beta_Z_orig = beta_Z
 
@@ -445,12 +445,12 @@ def test_absorption_offset_naive_theta_w_underestimates_beta_S():
         [md], [q_vz], 15, 0.0, 0.0, m_S, s_S, m_Z, params.a, params.b, phi_init
     )
 
-    beta_S_aware, _, _ = update_beta_irls(
+    beta_S_aware = update_beta_irls(
         [md], [q_vz], tw_aware, m_S, s_S, m_Z, 0.0, 0.0
-    )
-    beta_S_naive, _, _ = update_beta_irls(
+    ).beta_S
+    beta_S_naive = update_beta_irls(
         [md], [q_vz], tw_naive, m_S, s_S, m_Z, 0.0, 0.0
-    )
+    ).beta_S
 
     assert beta_S_naive < beta_S_aware, (
         f"expected absorption bias: offset-naive beta_S={beta_S_naive:.3f} "
@@ -565,13 +565,13 @@ def test_vem_beta_S_approximately_centering_invariant(
     q_vz = _oracle_q_vz(mkt)
     m_S, s_S, m_Z = _std_consts(md, mkt)
 
-    beta_S_1, _, _ = update_beta_irls(
+    beta_S_1 = update_beta_irls(
         [md], [q_vz], mkt.theta_w, m_S, s_S, m_Z, 0.0, 0.0
-    )
+    ).beta_S
     shifted_m_S = m_S + 0.5 * s_S
-    beta_S_2, _, _ = update_beta_irls(
+    beta_S_2 = update_beta_irls(
         [md], [q_vz], mkt.theta_w, shifted_m_S, s_S, m_Z, 0.0, 0.0
-    )
+    ).beta_S
 
     beta_S_orig_1 = beta_S_1 * 0.5 / s_S
     beta_S_orig_2 = beta_S_2 * 0.5 / s_S
@@ -646,17 +646,17 @@ def test_update_beta_irls_separation_stays_finite():
         # do not raise"); the assertions are on the *estimate*, not on
         # reaching the tolerance-based convergence.
         warnings.simplefilter("ignore", RuntimeWarning)
-        beta_S, beta_Z, fisher = update_beta_irls(
+        beta_S, beta_Z, fisher, _ = update_beta_irls(
             [md], [q_vz], theta_w,
             m_S=0.0, s_S=1.0, m_Z=0.0, beta_S_init=0.0, beta_Z_init=0.0,
         )
         # Re-fit from a far-away start: a genuine (finite) penalized-MAP fixed
         # point is reached from any init, whereas an unregularized separated
         # fit would keep marching off toward +inf.
-        beta_S_far, _, _ = update_beta_irls(
+        beta_S_far = update_beta_irls(
             [md], [q_vz], theta_w,
             m_S=0.0, s_S=1.0, m_Z=0.0, beta_S_init=500.0, beta_Z_init=0.0,
-        )
+        ).beta_S
 
     assert np.isfinite(beta_S)
     assert np.isfinite(beta_Z)
@@ -714,10 +714,10 @@ def test_update_beta_irls_objective_non_decreasing():
 
     beta_init = np.array([0.3, -0.2])  # deliberately off-mode
     obj_before = _obj(beta_init)
-    beta_S, beta_Z, _ = update_beta_irls(
+    beta_S, beta_Z = update_beta_irls(
         [md], [q_vz], out.theta_w, out.m_S, out.s_S, out.m_Z,
         float(beta_init[0]), float(beta_init[1]),
-    )
+    )[:2]
     obj_after = _obj(np.array([beta_S, beta_Z]))
 
     assert obj_after >= obj_before - 1e-6, (
@@ -945,3 +945,217 @@ def test_phiprior_log_prior_finite_and_beta11_uniform():
     np.testing.assert_allclose(batch, lp)
     # The Beta(1,1) q-block density is identically 0 (uniform).
     assert PhiPrior._beta_logpdf(np.array(0.4), 1.0, 1.0) == pytest.approx(0.0)
+
+
+# ---------------- Anonymous mode (Kalshi variant, plan 2026-07-23-005) ----------------
+
+# Planted anonymous intercept: logit(0.05), i.e. the same 5% base rate the
+# wallet-mode Beta(1, 19) prior centres theta_w on.
+_ANON_ALPHA = float(np.log(0.05 / 0.95))
+
+# Variance regime the anonymous end-to-end AUC test generates under. Deliberately
+# observation-noise-dominated (tau2_0 >> sigma2, tau2_1 << tau2_0) so that Z is
+# *identifiable from the residuals at all*: the shipped warm-start ratios leave
+# the process noise swamping the tau2 contrast, and ARCHITECTURE.md §6.2 records
+# that the ADF E-step then cannot see Z. That limitation is orthogonal to this
+# unit — it is present identically in wallet mode — so the anonymous tests pick a
+# regime where the E-step has something to find.
+_ANON_SIGMA2 = (0.0005, 0.005)
+_ANON_TAU2 = (1.0, 0.001)
+
+
+def _make_anon_synth(*, T, beta_S=1.0, beta_Z=0.0, seed):
+    """Anonymous synthetic market plus the params that generated it.
+
+    Anonymous mode plants `alpha` where wallet mode plants theta_w: the market
+    has no wallets, `mkt.theta_w` is empty and every trade carries the
+    placeholder id 0. `beta_S`/`beta_Z` are consumed against the *raw*
+    covariates by the generator, as in wallet mode.
+    """
+    params = ModelParams(
+        sigma2_0=_ANON_SIGMA2[0],
+        sigma2_1=_ANON_SIGMA2[1],
+        tau2_0=_ANON_TAU2[0],
+        tau2_1=_ANON_TAU2[1],
+        anonymous=True,
+        alpha=_ANON_ALPHA,
+        beta_S=beta_S,
+        beta_Z=beta_Z,
+    )
+    mkt = generate_market(
+        params, n_trades=T, mean_inter_trade_time=1.0,
+        rng=np.random.default_rng(seed),
+    )
+    return mkt, params
+
+
+def _fit_anon_irls(mkt, md, *, alpha_cauchy_scale=None):
+    """Anonymous IRLS on the oracle q(Z), back-transformed to raw covariate units.
+
+    Mirrors the wallet-mode M-step tests above: the oracle q(Z) isolates the
+    M-step's deliverable (here, the intercept column) from the separate E-step
+    identifiability question (`_oracle_q_vz`).
+
+    Returns:
+        `(alpha_orig, beta_S_orig, beta_Z)` on the original covariate scale.
+    """
+    m_S, s_S, m_Z = _std_consts(md, mkt)
+    fit = update_beta_irls(
+        [md], [_oracle_q_vz(mkt)], np.empty(0), m_S, s_S, m_Z, 0.0, 0.0,
+        anonymous=True, alpha_init=0.0, alpha_cauchy_scale=alpha_cauchy_scale,
+    )
+    beta_S_orig = fit.beta_S * 0.5 / s_S
+    alpha_orig = fit.alpha - beta_S_orig * m_S - fit.beta_Z * m_Z
+    return alpha_orig, beta_S_orig, fit.beta_Z
+
+
+@pytest.mark.parametrize("seed", [101, 202, 303])
+def test_anonymous_irls_recovers_planted_alpha_and_beta_S(seed):
+    """Anonymous recovery: the intercept column recovers alpha = logit(0.05).
+
+    Given an identified q(Z), the 3-column anonymous design recovers both the
+    level and the size slope with the right sign. Measured at T = 1500:
+    alpha_orig in {-2.87, -3.24, -2.92} against the planted -2.944, and
+    beta_S_orig in {0.90, 1.18, 1.03} against the planted 1.0 — the bands below
+    are those spreads with headroom, not tight fits.
+    """
+    mkt, params = _make_anon_synth(T=1500, seed=seed)
+    md = _to_market_data(mkt)
+
+    alpha_orig, beta_S_orig, _ = _fit_anon_irls(mkt, md)
+
+    assert alpha_orig < 0.0, f"wrong sign: alpha_orig={alpha_orig:.3f}"
+    assert beta_S_orig > 0.0, f"wrong sign: beta_S_orig={beta_S_orig:.3f}"
+    assert abs(alpha_orig - _ANON_ALPHA) < 0.5, f"alpha_orig={alpha_orig:.3f}"
+    assert abs(beta_S_orig - 1.0) < 0.35, f"beta_S_orig={beta_S_orig:.3f}"
+
+
+_ALPHA_T_SWEEP = (200, 1000, 3000)
+_ALPHA_SWEEP_SEEDS = 24
+
+
+def test_anonymous_alpha_bias_shrinks_with_T():
+    """KTD2: the per-market intercept's small-T bias shrinks as T grows.
+
+    `alpha` is fit from one market's trades under a Cauchy(0, 10) prior — far
+    weaker shrinkage than Beta(1, 19) ever applied to theta_w — so a
+    low-trade-count market is exposed to an incidental-parameters-style bias.
+    This sweep is the evidence for the prior-scale choice recorded on
+    `PhiPrior.alpha_cauchy_scale`.
+
+    Measured over these 24 seeds at the shipped Cauchy(0, 10), with the Monte
+    Carlo standard error of the bias in brackets:
+
+        T = 200   bias -0.161 [0.089]  rmse 0.466
+        T = 1000  bias -0.043 [0.034]  rmse 0.173
+        T = 3000  bias +0.012 [0.023]  rmse 0.113
+
+    RMSE carries the assertion: a single T's bias is only ~1.8 MC standard
+    errors from zero even at T = 200, whereas the RMSE ordering is unambiguous.
+    Cauchy(0, 2.5), the alternative KTD2 names, was measured on the same seeds
+    — bias -0.081 / -0.029 / +0.016, rmse 0.413 / 0.168 / 0.113 — i.e. an
+    improvement well inside one MC standard error at T = 200 and nil from
+    T = 1000. The wider intercept scale was therefore kept: it also stays honest
+    for base rates rarer than the 5% planted here, where a Cauchy(0, 2.5) would
+    shrink the level hard toward zero.
+    """
+    rmse_by_T = []
+    bias_by_T = []
+    for T in _ALPHA_T_SWEEP:
+        errors = []
+        for s in range(_ALPHA_SWEEP_SEEDS):
+            mkt, _ = _make_anon_synth(T=T, seed=1000 + s)
+            alpha_orig, _, _ = _fit_anon_irls(mkt, _to_market_data(mkt))
+            errors.append(alpha_orig - _ANON_ALPHA)
+        errors = np.array(errors)
+        rmse_by_T.append(float(np.sqrt(np.mean(errors**2))))
+        bias_by_T.append(float(errors.mean()))
+
+    assert rmse_by_T[0] > rmse_by_T[1] > rmse_by_T[2], (
+        f"alpha RMSE did not shrink with T: {np.round(rmse_by_T, 4)}"
+    )
+    assert abs(bias_by_T[-1]) < abs(bias_by_T[0]), (
+        f"alpha bias did not shrink with T: {np.round(bias_by_T, 4)}"
+    )
+    # Absolute floor: even the shortest market's level is worth reporting.
+    assert rmse_by_T[0] < 0.8, f"T=200 alpha RMSE={rmse_by_T[0]:.3f}"
+
+
+@pytest.mark.parametrize("seed", [101, 202, 303])
+def test_anonymous_vem_z_prob_beats_a_size_only_baseline(seed):
+    """The regime/state machinery adds discrimination without any theta_w.
+
+    Scores under the known anonymous parameters (one E-step, betas held) and
+    compares q(Z) against ranking trades by size alone — the signal the
+    predictor's `beta_S` term already carries. Beating it is what shows the
+    Kalman/regime layer is contributing, not just the logistic prior.
+
+    Measured margins over the size-only AUC at T = 1500: +0.087 / +0.045 /
+    +0.107 for these three seeds (absolute AUCs 0.909 / 0.929 / 0.937), and a
+    minimum margin of +0.059 over a wider 12-seed check.
+
+    Only one E-step: run to convergence, `tau2_0` and `tau2_1` collapse onto
+    each other (ARCHITECTURE.md §6.2, a wallet-mode limitation this unit does
+    not touch), q(Z) degenerates to a monotone function of size, and the AUC
+    lands *exactly* on the baseline. That collapse is the pre-existing
+    identifiability gap, not an anonymous-mode regression.
+    """
+    mkt, params = _make_anon_synth(T=1500, seed=seed)
+    md = _to_market_data(mkt)
+
+    out = variational_em(
+        [md], InferenceConfig(N=20), params_init=params, n_iter=1
+    )
+    auc = _z_prob_auc(out.Z_prob[0], mkt.Z)
+    auc_size_only = _z_prob_auc(md.log_size_ratio, mkt.Z)
+
+    assert auc > 0.88, f"anonymous AUC={auc:.4f}"
+    assert auc - auc_size_only > 0.03, (
+        f"anonymous AUC={auc:.4f} barely beats size-only {auc_size_only:.4f}"
+    )
+
+
+def test_anonymous_vem_drops_theta_w_and_gates_alpha_on_estimate_betas():
+    """Anonymous VEM fits no wallets, and `alpha` rides on the beta M-step block.
+
+    Pins the answer to "what happens to alpha when estimate_betas=False": it is
+    frozen at its incoming value, exactly like the slopes, because it *is* a
+    column of the same IRLS solve. An anonymous run that wants its level fitted
+    must opt in.
+    """
+    mkt, params = _make_anon_synth(T=600, seed=77)
+    md = _to_market_data(mkt)
+    cfg = InferenceConfig(N=20)
+
+    frozen = variational_em([md], cfg, params_init=params, n_iter=4)
+    assert frozen.theta_w.shape == (0,)
+    assert frozen.theta_w_logit_mean.shape == (0,)
+    assert frozen.params.anonymous
+    assert frozen.params.alpha == params.alpha
+    assert frozen.beta_fisher_info.shape == (3, 3)
+
+    fitted = variational_em(
+        [md], cfg, params_init=params, n_iter=4, estimate_betas=True
+    )
+    assert fitted.theta_w.shape == (0,)
+    assert fitted.params.alpha != params.alpha
+    assert fitted.beta_fisher_info.shape == (3, 3)
+    # The reported intercept is on the raw covariate scale, so it is comparable
+    # to the planted value; the internal one is not.
+    assert abs(fitted.alpha_orig - _ANON_ALPHA) < 1.5, (
+        f"alpha_orig={fitted.alpha_orig:.3f}"
+    )
+
+
+def test_wallet_mode_vem_reports_no_intercept():
+    """Wallet mode is untouched: no intercept is fit, and none is reported."""
+    mkt, params = _make_synth(T=120, seed=5)
+    out = variational_em(
+        [_to_market_data(mkt)], InferenceConfig(N=20), n_wallets=10,
+        params_init=params, n_iter=3, estimate_betas=True,
+    )
+
+    assert not out.params.anonymous
+    assert out.params.alpha == params.alpha  # echoed back, never fitted
+    assert out.alpha_orig == 0.0
+    assert out.beta_fisher_info.shape == (2, 2)

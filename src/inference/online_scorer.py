@@ -74,6 +74,32 @@ Design notes, in the order they bite:
     trades, warm-started at the current betas. Off by default, matching
     `variational_em(estimate_betas=False)` and for the same reason (§6.2).
 
+  * **Model mode.** `ModelParams.anonymous` switches the whole scorer between
+    the wallet-anchored model and the anonymous one (a feed such as Kalshi's
+    publishes no per-account identifier). In anonymous mode the per-wallet
+    `theta_w` block is inert — there is nothing to key it on — and the
+    predictor's level is the intercept `params.alpha`, refreshed by the same
+    IRLS block as the slopes and therefore subject to the same `n_refresh`
+    opt-in.
+
+Integration seam (R3). `OnlineScorer` depends on nothing venue-specific: an
+external trading system feeds it raw trade records through `step_trade` and
+reads `Z_prob` back. Minimal anonymous-mode usage::
+
+    from config.default_params import ModelParams
+    from src.inference.online_scorer import OnlineScorer
+
+    params = ModelParams.warm_start(y_history, anonymous=True)
+    scorer = OnlineScorer(params, theta_w=[], m_S=0.0, s_S=1.0, m_Z=0.0)
+    for trade in feed:                      # {"ts", "p", "S", "side"}
+        score = scorer.step_trade(trade)
+        if score.Z_prob > 0.8:
+            ...                             # act on the insider signal
+
+Wallet mode is the same call with a ``"wallet"`` key (an integer wallet index)
+on each record; omitting it there raises rather than silently scoring every
+trade as one trader.
+
 Reference: Cappé, O. & Moulines, E. (2009) "On-line expectation-maximization
 algorithm for latent data models", JRSS-B 71(3) — the decayed-sufficient-
 statistic recursion and its Robbins-Monro / forgetting-factor rates.
@@ -81,9 +107,11 @@ statistic recursion and its Robbins-Monro / forgetting-factor rates.
 
 from __future__ import annotations
 
+import math
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import numpy as np
 
@@ -92,6 +120,11 @@ from src.inference.adf_filter import ADFFilter
 from src.inference.particle_gibbs import MarketData
 from src.inference.variational_em import update_beta_irls
 from src.utils.transforms import logit
+
+# Fields `step_trade` reads off a raw trade record. `side` is accepted and
+# ignored: the observation is `logit(p)` whichever way the trade went, and
+# requiring the key would only make a caller's record harder to pass through.
+_TRADE_FIELDS = ("ts", "p", "S")
 
 # Minimum usable rows before a beta refresh is attempted. `update_beta_irls`
 # fits two coefficients; on a handful of near-identical rows the data curvature
@@ -135,7 +168,8 @@ class OnlineScore(NamedTuple):
             for this trade.
         theta_w: The per-wallet propensity the trade was scored *under*, i.e.
             before this trade's own count update — the prior-mean
-            ``a / (a + b)`` for a wallet never seen before.
+            ``a / (a + b)`` for a wallet never seen before, and NaN in anonymous
+            mode, which has no per-wallet propensity to report.
         t: 0-based position of this trade in the stream.
     """
 
@@ -277,9 +311,11 @@ class OnlineScorer:
         Args:
             params: Starting parameters, normally a batch `VEMOutput.params`;
                 ``beta_S``/``beta_Z`` are on the internal (standardized) scale.
+                Also selects the model mode via ``ModelParams.anonymous``.
             theta_w: (n_wallets,) per-wallet propensities on the probability
                 scale. May be empty — every wallet then cold-starts at the
-                `Beta(a, b)` prior mean. Copied, never mutated.
+                `Beta(a, b)` prior mean, and in anonymous mode empty is the
+                only sensible value. Copied, never mutated.
             m_S: Pooled mean of log_size_ratio (standardization), held fixed for
                 the stream's lifetime: re-standardizing mid-stream would move
                 `beta_S`'s scale under the estimate that is tracking it.
@@ -353,12 +389,20 @@ class OnlineScorer:
         self._prev: OnlineScore | None = None
         self._buffer = self._new_buffer()
 
+        # Causal feature state for `step_trade`: the previous timestamp (for
+        # `delta`) and an *expanding* size mean (for `log_size_ratio`). The
+        # batch pipeline uses the whole-market mean, which peeks at the future
+        # and so cannot exist on a live feed.
+        self._prev_ts: float | None = None
+        self._n_sized = 0
+        self._sum_S = 0.0
+
     def step(
         self,
         y: float,
         delta: float,
         log_size_ratio: float,
-        wallet_id: int,
+        wallet_id: int | None = None,
     ) -> OnlineScore:
         """Score one trade, then adapt the parameters on it.
 
@@ -372,14 +416,34 @@ class OnlineScorer:
                 legitimately ``0.0`` for same-second trades thereafter.
             log_size_ratio: ``log(S_t / S_bar)`` for this trade.
             wallet_id: Integer wallet index; ids beyond anything seen so far are
-                admitted and cold-start at the `Beta(a, b)` prior mean.
+                admitted and cold-start at the `Beta(a, b)` prior mean. Omit it
+                in anonymous mode, which has no wallet layer.
 
         Returns:
-            The `OnlineScore` for this trade.
+            The `OnlineScore` for this trade. In anonymous mode its ``theta_w``
+            is NaN: no per-wallet propensity was consulted, and reporting a
+            placeholder number would invite it being averaged.
+
+        Raises:
+            ValueError: In wallet mode, if ``wallet_id`` is omitted — every
+                trade would otherwise be attributed to one synthetic trader.
         """
-        w = int(wallet_id)
-        self._ensure_wallet(w)
-        theta_used = float(self._theta[w])
+        anonymous = self._params.anonymous
+        if anonymous:
+            # No wallet layer: skip the array growth and the Beta-count block,
+            # and index the filter at a fixed slot it will never read.
+            w = 0
+            theta_used = float("nan")
+        elif wallet_id is None:
+            raise ValueError(
+                "wallet mode requires a wallet_id; pass one, or run the scorer "
+                "with ModelParams(anonymous=True) if the feed has no per-account "
+                "identifier."
+            )
+        else:
+            w = int(wallet_id)
+            self._ensure_wallet(w)
+            theta_used = float(self._theta[w])
 
         out = self._adf.step(y, delta, log_size_ratio, w)
         score = OnlineScore(
@@ -397,13 +461,65 @@ class OnlineScorer:
         if rho > 0.0:
             self._accumulate(score, float(y), float(delta), float(log_size_ratio), rho)
             self._refit_params()
-            self._update_theta(w, score.Z_prob, rho)
+            if not anonymous:
+                self._update_theta(w, score.Z_prob, rho)
             self._sync_params()
 
         self._t += 1
         self._prev = score
         self._push_buffer(w, float(log_size_ratio), score.Z_prob)
         return score
+
+    def step_trade(self, trade: Mapping[str, Any]) -> OnlineScore:
+        """Score one raw trade record — the external-integration seam (R3).
+
+        Derives the filter's ``(y, delta, log_size_ratio)`` from a venue-neutral
+        record and forwards to `step`, so an outside trading system needs no
+        feature pipeline of its own. Both derived features are strictly causal:
+        ``delta`` comes from the previously seen timestamp, and ``S_bar`` is the
+        mean size over trades ``0..t`` *inclusive* — an expanding window, not
+        the batch whole-market mean, which would peek at the future. Including
+        the current trade also keeps the very first ratio at exactly
+        ``log(1) = 0`` rather than undefined.
+
+        Args:
+            trade: A mapping carrying ``ts`` (unix seconds), ``p`` (price in
+                (0, 1)), ``S`` (size, positive) and — in wallet mode only —
+                ``wallet`` (integer wallet index). ``side`` and any other keys
+                are ignored, so a venue's own record can be passed unmodified.
+
+        Returns:
+            The `OnlineScore` for this trade.
+
+        Raises:
+            ValueError: If a required field is missing. ``wallet`` is required
+                exactly when the model is in wallet mode.
+        """
+        anonymous = self._params.anonymous
+        missing = [k for k in _TRADE_FIELDS if k not in trade]
+        if not anonymous and "wallet" not in trade:
+            missing.append("wallet")
+        if missing:
+            raise ValueError(
+                f"trade record is missing required field(s) {', '.join(missing)}; "
+                f"{'anonymous' if anonymous else 'wallet'} mode needs "
+                f"{_TRADE_FIELDS + (() if anonymous else ('wallet',))}."
+            )
+
+        ts = float(trade["ts"])
+        # Clamped at 0: a same-second pair sorted by some tiebreaker can differ
+        # by a negative float epsilon, and the process-variance statistic
+        # divides by delta (ARCHITECTURE.md §6.1).
+        delta = 0.0 if self._prev_ts is None else max(ts - self._prev_ts, 0.0)
+        self._prev_ts = ts
+
+        self._n_sized += 1
+        self._sum_S += float(trade["S"])
+        S_bar = self._sum_S / self._n_sized
+        log_size_ratio = math.log(float(trade["S"]) / S_bar)
+
+        wallet_id = None if anonymous else int(trade["wallet"])
+        return self.step(float(logit(trade["p"])), delta, log_size_ratio, wallet_id)
 
     # ---------------- Online sufficient statistics ----------------
 
@@ -596,7 +712,12 @@ class OnlineScorer:
             self._refresh_betas()
 
     def _refresh_betas(self) -> None:
-        """Refit ``beta_S``/``beta_Z`` on the recent window via the batch IRLS.
+        """Refit the predictor coefficients on the recent window via batch IRLS.
+
+        In anonymous mode this block also carries the intercept `alpha` — the
+        predictor's entire level there — so a scorer running anonymously with
+        ``n_refresh = None`` never updates its level at all, exactly as batch
+        `variational_em(estimate_betas=False)` never updates it.
 
         Replays the buffered window as a one-market `MarketData` plus the
         matching ``q_vz`` and hands it to `variational_em.update_beta_irls`, so
@@ -630,7 +751,7 @@ class OnlineScorer:
             log_size_ratio=log_size_ratio,
             wallet_ids=wallet_ids,
         )
-        beta_S, beta_Z, _ = update_beta_irls(
+        beta_S, beta_Z, _, alpha = update_beta_irls(
             [md],
             [q_vz],
             self._theta,
@@ -640,6 +761,9 @@ class OnlineScorer:
             self._params.beta_S,
             self._params.beta_Z,
             cauchy_scale=self._prior.beta_cauchy_scale,
+            anonymous=self._params.anonymous,
+            alpha_init=self._params.alpha,
+            alpha_cauchy_scale=self._prior.alpha_cauchy_scale,
         )
-        self._params = replace(self._params, beta_S=beta_S, beta_Z=beta_Z)
+        self._params = replace(self._params, beta_S=beta_S, beta_Z=beta_Z, alpha=alpha)
         self._sync_params()
