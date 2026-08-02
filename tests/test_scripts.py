@@ -22,6 +22,7 @@ from scripts import (
     _runner,
     benchmark,
     eval_c4,
+    event_study,
     make_figures,
     pareto,
     pull_data,
@@ -2009,3 +2010,165 @@ def test_score_stream_replays_parquet_and_skips_dirty_rows(tmp_path):
 
     assert len(_read_jsonl(jsonl_out)) == 10
     assert jsonl_out.read_bytes() == parquet_out.read_bytes()
+
+
+# ---------------- event_study.py ----------------
+
+# Two markets, 150 trades each at ~2.8 h spacing: ~17 days of history, so the
+# locked 5-day window sits inside it with 12 days left over for the time-shift
+# null to place comparison windows in.
+_EVENT_STUDY_MARKETS = ("0xevent01", "0xevent02")
+
+
+def _event_study_scores(tmp_path: Path) -> tuple[Path, Path]:
+    """Replay a two-market capture through score_stream, as the study demands.
+
+    Going through the real CLI rather than hand-writing a scores file is the
+    point: it is what makes the provenance sidecar the study gates on a genuine
+    `--replay` artifact instead of a fixture that agrees with the gate by
+    construction.
+
+    Returns:
+        ``(scores path, resolutions path)``.
+    """
+    rng = np.random.default_rng(11)
+    records = []
+    for m, market in enumerate(_EVENT_STUDY_MARKETS):
+        prices = np.clip(0.4 + np.cumsum(rng.normal(0.0, 0.01, 150)), 0.05, 0.95)
+        records += [
+            dict(
+                _raw_trade(
+                    1000 * m + i,
+                    ts=1_700_000_000 + 10_000 * i,
+                    price=float(prices[i]),
+                    size=float(5.0 + 40.0 * rng.random()),
+                    wallet=_STREAM_WALLETS[i % len(_STREAM_WALLETS)],
+                ),
+                condition_id=market,
+            )
+            for i in range(150)
+        ]
+
+    scores = tmp_path / "scores.jsonl"
+    assert (
+        score_stream.main(
+            [
+                "--replay",
+                str(_write_trades(tmp_path / "capture.jsonl", records)),
+                "--output",
+                str(scores),
+                "--log-level",
+                "WARNING",
+            ]
+        )
+        == 0
+    )
+
+    resolutions = tmp_path / "resolutions.json"
+    resolutions.write_text(
+        # Close at the last trade of each market, plus one absent market so the
+        # join is exercised in both directions.
+        json.dumps({m: 1_700_000_000 + 10_000 * 149 for m in _EVENT_STUDY_MARKETS}),
+        encoding="utf-8",
+    )
+    return scores, resolutions
+
+
+def test_event_study_smoke(tmp_path):
+    """A replayed capture runs end to end at the locked window and reports."""
+    scores, resolutions = _event_study_scores(tmp_path)
+    summary_path = tmp_path / "event_study" / "summary.json"
+
+    rc = event_study.main(
+        [
+            "--scores",
+            str(scores),
+            "--resolutions",
+            str(resolutions),
+            "--json-out",
+            str(summary_path),
+            "--fig-dir",
+            str(tmp_path / "figures"),
+            "--n-permutations",
+            "99",
+            "--seed",
+            "5",
+            "--log-level",
+            "WARNING",
+        ]
+    )
+
+    assert rc == 0
+    payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    # The window the run used is the pre-registered one, and it says so.
+    assert payload["window"]["locked"] is True
+    assert payload["window"]["W_days"] == pytest.approx(5.0)
+    assert payload["provenance"]["mode"] == "replay"
+    assert payload["n_markets"] == 2
+    assert {row["market"] for row in payload["markets"]} == set(_EVENT_STUDY_MARKETS)
+    for row in payload["markets"]:
+        assert 0.0 < row["p_value"] <= 1.0  # add-one: never exactly zero
+        assert set(row["robustness"]) >= {"p_value_max", "p_value_cross_market"}
+    assert payload["figures"]
+    assert all(Path(p).is_file() for p in payload["figures"])
+
+
+def test_event_study_refuses_live_mode_scores(tmp_path):
+    """The no-lookahead gate is the sidecar: live-mode scores exit 2, unanalysed."""
+    scores, resolutions = _event_study_scores(tmp_path)
+    sidecar = scores.with_name(scores.name + ".meta.json")
+    meta = json.loads(sidecar.read_text(encoding="utf-8"))
+    sidecar.write_text(json.dumps({**meta, "mode": "live"}), encoding="utf-8")
+    summary_path = tmp_path / "summary.json"
+
+    rc = event_study.main(
+        [
+            "--scores",
+            str(scores),
+            "--resolutions",
+            str(resolutions),
+            "--json-out",
+            str(summary_path),
+            "--no-figures",
+            "--log-level",
+            "ERROR",
+        ]
+    )
+
+    assert rc == 2
+    assert not summary_path.exists()
+
+
+def test_event_study_missing_study_arguments_exit_one():
+    """Study mode without inputs fails fast instead of half-running."""
+    assert event_study.main(["--log-level", "ERROR"]) == 1
+
+
+def test_event_study_calibrate_writes_its_own_artifact(tmp_path):
+    """--calibrate produces the window table, not a study summary."""
+    out = tmp_path / "calibration.json"
+
+    rc = event_study.main(
+        [
+            "--calibrate",
+            "--n-replicates",
+            "1",
+            "--n-permutations",
+            "19",
+            "--seed",
+            "3",
+            "--json-out",
+            str(out),
+            "--log-level",
+            "WARNING",
+        ]
+    )
+
+    assert rc == 0
+    report = json.loads(out.read_text(encoding="utf-8"))
+    assert report["n_replicates"] == 1
+    # One row per candidate window, each carrying all three arms.
+    assert len(report["windows"]) == len(event_study.CALIBRATION_GRID_DAYS)
+    for row in report["windows"]:
+        assert set(row["mean_p"]) == {"planted", "seam", "null"}
+    assert "realized size" in report["arms_note"]
