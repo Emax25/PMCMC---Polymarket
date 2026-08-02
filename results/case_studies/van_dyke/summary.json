@@ -1,0 +1,516 @@
+{
+  "schema_version": 1,
+  "manifest": {
+    "path": "results/case_studies/van_dyke/markets.json",
+    "case": {
+      "name": "U.S. v. Gannon Ken Van Dyke",
+      "summary": "First U.S. criminal and civil insider-trading action over prediction-market event contracts. A U.S. Army Master Sergeant with access to classified planning for the operation that captured Nicolas Maduro is alleged to have bought 'Yes' shares in Polymarket Venezuela/Maduro contracts in the days before the operation was announced publicly on 2026-01-03.",
+      "criminal": "United States v. Van Dyke, S.D.N.Y. \u2014 indictment unsealed 2026-04-23.",
+      "civil": "CFTC v. Gannon Ken Van Dyke, No. 1:26-cv-03369 (S.D.N.Y., complaint filed 2026-04-23).",
+      "sources": [
+        {
+          "id": "cftc_pr",
+          "kind": "primary",
+          "title": "CFTC Press Release 9217-26 \u2014 CFTC Charges U.S. Service Member with Insider Trading in Nicolas Maduro-Related Event Contracts",
+          "url": "https://www.cftc.gov/PressRoom/PressReleases/9217-26",
+          "retrieved": "2026-08-02",
+          "note": "Fetched and read in full."
+        },
+        {
+          "id": "cftc_complaint",
+          "kind": "primary",
+          "title": "CFTC v. Van Dyke, Complaint, No. 1:26-cv-03369 (S.D.N.Y. filed 2026-04-23)",
+          "url": "https://www.cftc.gov/media/13761/EnfGannonKenVanDykeComplaint042326/download",
+          "retrieved": "2026-08-02",
+          "note": "Fetched and read in full. Every market title, share count, price and timestamp in this manifest that is marked verified comes from this document, cited by paragraph."
+        },
+        {
+          "id": "doj_pr",
+          "kind": "primary",
+          "title": "DOJ \u2014 U.S. Soldier Charged With Using Classified Information To Profit From Prediction Market Bets",
+          "url": "https://www.justice.gov/opa/pr/us-soldier-charged-using-classified-information-profit-prediction-market-bets",
+          "retrieved": null,
+          "note": "NOT FETCHED \u2014 justice.gov returned HTTP 403 to every request made while building this manifest. Any figure attributed to it below is recorded as unverified."
+        },
+        {
+          "id": "doj_indictment",
+          "kind": "primary",
+          "title": "DOJ/SDNY \u2014 indictment PDF",
+          "url": "https://www.justice.gov/usao-sdny/media/1437781/dl",
+          "retrieved": null,
+          "note": "NOT FETCHED \u2014 same 403. Listed so a later run can try again."
+        },
+        {
+          "id": "gamma",
+          "kind": "primary",
+          "title": "Polymarket Gamma API market registry (gamma-api.polymarket.com/events?slug=...)",
+          "url": "https://gamma-api.polymarket.com",
+          "retrieved": "2026-08-02",
+          "note": "Authoritative for slug, conditionId, creation time, close time and resolved outcome. Used to map the complaint's market titles onto on-chain condition ids."
+        }
+      ]
+    },
+    "identification": {
+      "method": "manual, documented (plan 2026-07-23-005 KTD5)",
+      "procedure": "The CFTC complaint names four Polymarket contracts by title (paragraphs 29, 55) and states the resolution outcome of three of them (paragraph 56). Each title was matched against the Gamma market registry, and the match was then cross-checked against an independent fact the complaint supplies: listing date, resolved outcome, or resolution time. No market is listed below whose Gamma record contradicts the complaint, and no market is listed on title similarity alone.",
+      "residual_risk": "Polymarket relists near-duplicate questions. The 'War Powers by January 31' title exists twice; the two are separated here by creation date and resolved outcome (see that market's cross_check). If Polymarket re-slugs a market, the condition_id below remains the stable key."
+    },
+    "reconstruction": {
+      "status": "confirmed",
+      "method": "The manifest's redacted-address pattern was applied to trades pulled from data-api.polymarket.com for the four charged condition ids over the analysis window (2025-12-26 to 2026-01-03T09:21Z). One wallet matched. Its trades were then compared, without tuning, against every quantity the CFTC complaint itemizes.",
+      "date": "2026-08-02",
+      "wallet": "0x31a56e9e690c621ed21de08cb559e9524cdb8ed9",
+      "n_wallets_screened": 2247,
+      "n_wallets_matched": 1,
+      "checks": [
+        "13 buys across the four charged markets, first at 2025-12-27T05:05:41Z (2025-12-27 00:05 ET), last at 2026-01-03T02:58:25Z (2026-01-02 21:58 ET) \u2014 matches the DOJ description of 'approximately 13 bets from December 27, 2025 through the evening of January 2' that this manifest otherwise records as unverified.",
+        "January Contract: 7 buys, 436,760 'Yes' shares, $32,538.34 cost, $0.0745 average \u2014 complaint paragraph 52 says 'more than 436,000 Yes shares at an average price of approximately $0.074 for a total cost of approximately $32,538'.",
+        "Purchase schedule matches complaint paragraph 50 line for line: 13,769 + 850 = 14,619 shares in two transactions on the evening of Dec 30 ET ('approximately 14,600 shares across two transactions'); 73,685 on the evening of Jan 1 ET ('73,700'); 90,347 on the morning of Jan 2 ET ('approximately 90,300'); 82,421 + 87,500 + 88,187 = 258,108 in three transactions between 20:38 and 21:58 ET on Jan 2 ('more than 250,000 shares across three separate transactions between 8:30 and 10:00 PM ET').",
+        "Zero trades in the 'Maduro out in 2025?' control market, consistent with the complaint alleging no trading there.",
+        "All 13 trades are BUYs; total outlay $33,934.34 across the four markets."
+      ],
+      "note": "This reconstruction uses only public trade data plus the redacted pattern the complaint published; it adds no non-public information. It is recorded so a reader can see that the wallet anchoring is an identification, not an assumption. It is NOT independent evidence that the trades were insider trades \u2014 that allegation is the government's, and it is untested."
+    },
+    "analysis_window": {
+      "start_ts": 1766707200.0,
+      "end_ts": 1767432060.0,
+      "start": "2025-12-26T00:00:00Z",
+      "end": "2026-01-03T09:21:00Z",
+      "rationale": "Opens on the day the complaint says the Polymarket account was created (paragraph 48) and closes at the first public announcement of the operation \u2014 President Trump's TruthSocial post at 4:21 AM ET on 2026-01-03 (paragraph 32). Every trade inside the window is pre-disclosure by construction, which is what makes an elevated score inside it interesting. The window is fixed by the documented case facts, not chosen after looking at scores."
+    },
+    "markets": [
+      {
+        "slug": "maduro-out-by-january-31-2026-318",
+        "condition_id": "0x580adc1327de9bf7c179ef5aaffa3377bb5cb252b7d6390b027172d43fd6f993",
+        "question": "Maduro out by January 31, 2026?",
+        "role": "primary",
+        "why": "The 'January Contract' of the CFTC complaint and the only contract the complaint quantifies: >436,000 'Yes' shares at an average ~$0.074, ~$32,538 cost, >$404,000 profit (paragraphs 29, 52, 53).",
+        "cross_check": "Gamma createdAt 2025-12-11T21:44:09Z matches complaint paragraph 29 ('On December 11, 2025'); Gamma closedTime 2026-01-03T12:14:07Z matches paragraph 33 ('at or around 7:14 AM ET on January 3, 2026'); resolved Yes as paragraph 53 requires.",
+        "resolved": "Yes",
+        "verified": true
+      },
+      {
+        "slug": "us-forces-in-venezuela-by-january-31-2026",
+        "condition_id": "0xbb8bfdef9052b2709557a6f8f28b23551e3134bfb86eca800211e2191703ee65",
+        "question": "US forces in Venezuela by January 31, 2026?",
+        "role": "cluster",
+        "why": "One of the three further Venezuela contracts the complaint says Van Dyke bought 'Yes' shares in (paragraph 55); paragraph 56 says he held this one to resolution.",
+        "cross_check": "Complaint paragraph 56 says this contract resolved 'Yes'; Gamma reports outcomePrices ['1','0'] (Yes) with closedTime 2026-01-03T15:51:23Z. Created 2025-12-17, before the trading window.",
+        "resolved": "Yes",
+        "verified": true
+      },
+      {
+        "slug": "will-the-us-invade-venezuela-by-january-31-2026",
+        "condition_id": "0x7f3c6b9029a1a4a932509c147a2cc0762e1116b7a4568cde472908b29dd4889d",
+        "question": "Will the U.S. invade Venezuela by January 31, 2026?",
+        "role": "cluster",
+        "why": "Named in complaint paragraph 55; paragraph 56 says the 'Yes' position was sold at a profit on 2026-01-03 before the contract resolved.",
+        "cross_check": "Complaint paragraph 56 says this contract 'ultimately resolved to No'; Gamma reports outcomePrices ['0','1'] (No). Created 2025-12-17, before the trading window.",
+        "resolved": "No",
+        "verified": true
+      },
+      {
+        "slug": "trump-invokes-war-powers-against-venezuela-by-january-31-134-583",
+        "condition_id": "0x79801a0feefbc4c35df8f35d33583eef8ff2bd7a514c619929ac62e23c2cf93d",
+        "question": "Trump invokes War Powers against Venezuela by January 31?",
+        "role": "cluster",
+        "why": "Named in complaint paragraph 55 as 'Trump Invokes War Powers Against Venezuela by January 31, 2026?'; paragraph 56 says the 'Yes' shares were sold at a profit on 2026-01-03.",
+        "cross_check": "Polymarket lists two markets with this title. This one was created 2025-12-18 (before the trading window) and resolved Yes, matching paragraph 56 ('Even though it ultimately resolved to Yes'). The other, slug trump-invokes-war-powers-against-venezuela-by-january-31 / condition 0xf1845cdd2f7277938ad3327f0910be4c97b2deb4ca76102149b1e369f63fdc4b, was created 2026-01-06 \u2014 after the alleged conduct \u2014 and resolved No, so it is excluded.",
+        "resolved": "Yes",
+        "verified": true
+      },
+      {
+        "slug": "maduro-out-in-2025-411",
+        "condition_id": "0xafc235557ace53ff0b0d2e93392314a7c3f3daab26a79050e985c11282f66df7",
+        "question": "Maduro out in 2025?",
+        "role": "control",
+        "why": "The 'December Contract' of complaint paragraph 28 \u2014 same question, expiring 2025-12-31, live throughout the alleged trading window. The complaint does NOT allege any trading in it. It is pulled as a within-cluster negative control: a market whose price responded to the same Venezuela news flow but which the anchored wallet is not alleged to have touched.",
+        "cross_check": "Gamma createdAt 2024-12-31T18:56:24Z matches complaint paragraph 28 ('On or around December 31, 2024').",
+        "resolved": "No",
+        "verified": true
+      }
+    ],
+    "doj_timeline": [
+      {
+        "ts": 1765152000.0,
+        "iso": "2025-12-08T00:00:00Z",
+        "label": "Classified information security briefing; NDA signed",
+        "source": "cftc_complaint",
+        "citation": "paragraph 35",
+        "verified": true
+      },
+      {
+        "ts": 1765489449.0,
+        "iso": "2025-12-11T21:44:09Z",
+        "label": "'Maduro out by January 31, 2026?' listed",
+        "source": "gamma",
+        "citation": "createdAt; complaint paragraph 29 says 'On December 11, 2025'",
+        "verified": true
+      },
+      {
+        "ts": 1766707200.0,
+        "iso": "2025-12-26T00:00:00Z",
+        "label": "Polymarket account created; exchange account funded with ~$35,000",
+        "source": "cftc_complaint",
+        "citation": "paragraphs 46, 48",
+        "verified": true
+      },
+      {
+        "ts": 1767146400.0,
+        "iso": "2025-12-31T02:00:00Z",
+        "label": "~14,600 'Yes' shares across two transactions (evening of Dec 30 ET)",
+        "source": "cftc_complaint",
+        "citation": "paragraph 50",
+        "verified": true
+      },
+      {
+        "ts": 1767319200.0,
+        "iso": "2026-01-02T02:00:00Z",
+        "label": "73,700 'Yes' shares (evening of Jan 1 ET)",
+        "source": "cftc_complaint",
+        "citation": "paragraph 50",
+        "verified": true
+      },
+      {
+        "ts": 1767366000.0,
+        "iso": "2026-01-02T15:00:00Z",
+        "label": "~90,300 'Yes' shares (morning of Jan 2 ET)",
+        "source": "cftc_complaint",
+        "citation": "paragraph 50",
+        "verified": true
+      },
+      {
+        "ts": 1767403800.0,
+        "iso": "2026-01-03T01:30:00Z",
+        "label": ">250,000 'Yes' shares across three transactions (8:30-10:00 PM ET Jan 2)",
+        "source": "cftc_complaint",
+        "citation": "paragraph 50",
+        "verified": true
+      },
+      {
+        "ts": 1767432060.0,
+        "iso": "2026-01-03T09:21:00Z",
+        "label": "Public announcement of Maduro's capture (TruthSocial, 4:21 AM ET)",
+        "source": "cftc_complaint",
+        "citation": "paragraph 32",
+        "verified": true
+      },
+      {
+        "ts": 1767442440.0,
+        "iso": "2026-01-03T12:14:00Z",
+        "label": "'Maduro out by January 31, 2026?' resolves Yes (7:14 AM ET)",
+        "source": "cftc_complaint",
+        "citation": "paragraph 33; Gamma closedTime 2026-01-03T12:14:07Z agrees",
+        "verified": true
+      }
+    ],
+    "wallet_anchor": {
+      "handle": "Burdensome-Mix",
+      "address": "0x31a56e9e690c621ed21de08cb559e9524cdb8ed9",
+      "address_pattern": "^0x31a5[0-9a-fA-F]{32}8ed9$",
+      "citation": "Complaint paragraphs 48, 57 (pattern); resolved to the full address by the reconstruction below.",
+      "note": "The complaint redacts the middle of the address, quoting it as '0x31a5*...*8ed9' \u2014 4 leading and 4 trailing hex characters of a 40-hex Polygon address. The pattern is therefore the primary-source anchor and remains the identification of record. Applied to the public Data API trade history of the four charged markets over the analysis window, it matched exactly one of 2,247 distinct wallets, and that wallet's trades then reproduce the complaint's itemized share counts (see 'reconstruction'). The full address is recorded here as a derived convenience; the analysis still matches on the pattern, reports how many wallets matched, and treats zero or several matches as inconclusive rather than negative."
+    },
+    "pull": {
+      "command": "python -m scripts.pull_data --slugs maduro-out-by-january-31-2026-318 us-forces-in-venezuela-by-january-31-2026 will-the-us-invade-venezuela-by-january-31-2026 trump-invokes-war-powers-against-venezuela-by-january-31-134-583 maduro-out-in-2025-411 --full-history --pre-resolution-days 0 --output-dir data/case_studies/van_dyke",
+      "pre_resolution_days": 0.0,
+      "full_history": true,
+      "deviation_note": "Every other pull in this repository uses --pre-resolution-days 7, because resolved markets pin at 0/1 and the observation model then reads the pin as an insider signal (ARCHITECTURE.md 9.5). This case study sets it to 0 deliberately: the alleged insider window sits immediately before the EVENT (the 2026-01-03 announcement), which is also immediately before resolution, so the default filter would delete exactly the trades the case is about. The cost is that resolution-period over-flagging is NOT filtered out here, which is one reason the analysis window closes at the public announcement and the headline claim is made on trades strictly inside it.",
+      "capture_note": "scripts/pull_data.py writes the batch processed format (integer wallet ids), which the streaming scorer cannot replay. `python -m scripts.case_study --capture` writes the same markets in the stream_trades.py raw record shape (timestamp/price/size/wallet/transaction_hash/condition_id) so that `score_stream.py --replay` can consume them. Both walk the full history and neither applies a pre-resolution filter."
+    },
+    "unverified": [
+      "The DOJ press release and the SDNY indictment PDF were never read: justice.gov returned HTTP 403 to every request. Everything cited to 'doj_pr' anywhere in this project therefore rests on secondary reporting of it.",
+      "'Approximately 13 bets from December 27, 2025 through the evening of January 2' \u2014 a DOJ figure this manifest could not read at source. The on-chain reconstruction above independently produces exactly 13 buys over exactly that span, which is strong corroboration but is not the same as having read the document.",
+      "'~$33,034 total wagered' \u2014 this figure appears in the plan that commissioned the case study and could not be located in any primary document. The CFTC complaint gives ~$32,538 for the January Contract alone (paragraph 52). The reconstruction totals $33,934.34 across all four charged markets. Treat $33,034 as unsourced, most likely a transposition of $33,934.",
+      "The full wallet address is redacted in the CFTC complaint. The address recorded in wallet_anchor is derived (see 'reconstruction'), not quoted from a primary source.",
+      "That the four contracts named in complaint paragraphs 29 and 55 are the *complete* set the charged trader touched. The complaint names four; nothing rules out others it did not name."
+    ]
+  },
+  "n_trades_total": 77766,
+  "n_trades_window": 15698,
+  "n_wallets_total": 22892,
+  "n_wallets_window": 6110,
+  "baseline_mean_p_z": 0.05002278774655703,
+  "window_mean_p_z": 0.05002144837171236,
+  "markets_without_trades": [],
+  "markets_off_manifest": [],
+  "anchored_wallets": [
+    "0x31a56e9e690c621ed21de08cb559e9524cdb8ed9"
+  ],
+  "anchored_ranks": {
+    "0x31a56e9e690c621ed21de08cb559e9524cdb8ed9": 1497
+  },
+  "top_k": 10,
+  "wallets": [
+    {
+      "wallet": "0x2b9edb595ea75c118077c7d2c17d4852b0770db0",
+      "n_window": 1,
+      "n_total": 4,
+      "mean_p_z": 0.06323433333828,
+      "max_p_z": 0.06323433333828,
+      "elevation": 0.013211545591722974,
+      "anchored": false,
+      "sufficiency": "prior-dominated"
+    },
+    {
+      "wallet": "0xfcc4e78ca3f229949b8106fb380bf14266853067",
+      "n_window": 1,
+      "n_total": 1,
+      "mean_p_z": 0.05845537825498569,
+      "max_p_z": 0.05845537825498569,
+      "elevation": 0.008432590508428657,
+      "anchored": false,
+      "sufficiency": "prior-dominated"
+    },
+    {
+      "wallet": "0xa5c5d420674488b0a11c114627c0f13c564bd8ee",
+      "n_window": 1,
+      "n_total": 1,
+      "mean_p_z": 0.05530308143837302,
+      "max_p_z": 0.05530308143837302,
+      "elevation": 0.005280293691815992,
+      "anchored": false,
+      "sufficiency": "prior-dominated"
+    },
+    {
+      "wallet": "0x50781ba59a7386fea3ad360a7b62d70ef8a3dd86",
+      "n_window": 1,
+      "n_total": 1,
+      "mean_p_z": 0.05511629067736439,
+      "max_p_z": 0.05511629067736439,
+      "elevation": 0.0050935029308073615,
+      "anchored": false,
+      "sufficiency": "prior-dominated"
+    },
+    {
+      "wallet": "0x202d2b8ed386228fc928dac406d1a888739a9890",
+      "n_window": 1,
+      "n_total": 1,
+      "mean_p_z": 0.055048510109912775,
+      "max_p_z": 0.055048510109912775,
+      "elevation": 0.005025722363355745,
+      "anchored": false,
+      "sufficiency": "prior-dominated"
+    },
+    {
+      "wallet": "0xa347cd256d8d962715c6bffd4e5f541b2de0ba0c",
+      "n_window": 1,
+      "n_total": 1,
+      "mean_p_z": 0.05492777837263981,
+      "max_p_z": 0.05492777837263981,
+      "elevation": 0.004904990626082781,
+      "anchored": false,
+      "sufficiency": "prior-dominated"
+    },
+    {
+      "wallet": "0x1a799c0af8a939ba4ed95df95188c2f357491ccb",
+      "n_window": 2,
+      "n_total": 2,
+      "mean_p_z": 0.05458318264899359,
+      "max_p_z": 0.05675661496611819,
+      "elevation": 0.004560394902436558,
+      "anchored": false,
+      "sufficiency": "prior-dominated"
+    },
+    {
+      "wallet": "0xa2cc453e5d2869d480accf8e71d6328c33391857",
+      "n_window": 1,
+      "n_total": 1,
+      "mean_p_z": 0.054577395357086805,
+      "max_p_z": 0.054577395357086805,
+      "elevation": 0.004554607610529775,
+      "anchored": false,
+      "sufficiency": "prior-dominated"
+    },
+    {
+      "wallet": "0x7b76ff3a1acd99622af06aeaec49562f0fbb5960",
+      "n_window": 1,
+      "n_total": 1,
+      "mean_p_z": 0.054160422119443705,
+      "max_p_z": 0.054160422119443705,
+      "elevation": 0.004137634372886674,
+      "anchored": false,
+      "sufficiency": "prior-dominated"
+    },
+    {
+      "wallet": "0xd719eb46721f2618185c99c19d93ba609c01d8e5",
+      "n_window": 2,
+      "n_total": 2,
+      "mean_p_z": 0.05371021974974506,
+      "max_p_z": 0.057081639299287265,
+      "elevation": 0.0036874320031880306,
+      "anchored": false,
+      "sufficiency": "prior-dominated"
+    },
+    {
+      "wallet": "0x31a56e9e690c621ed21de08cb559e9524cdb8ed9",
+      "n_window": 13,
+      "n_total": 15,
+      "mean_p_z": 0.05000001711090722,
+      "max_p_z": 0.05000625363342891,
+      "elevation": -2.2770635649808912e-05,
+      "anchored": true,
+      "sufficiency": "prior-dominated"
+    }
+  ],
+  "wallets_note": "The top-k rows plus every anchored wallet, matching the report's table. `n_wallets_window` is the full count; the per-wallet rows behind it are regenerated by re-running the CLI with a larger --top-k.",
+  "data_sufficiency": {
+    "thresholds": {
+      "prior_dominated_below": 20,
+      "meaningful_at_or_above": 100,
+      "source": "agent_reference/ARCHITECTURE.md 9.5"
+    },
+    "counts": {
+      "prior-dominated": 5788,
+      "weak": 291,
+      "meaningful": 31
+    }
+  },
+  "top_trades": [
+    {
+      "ts": 1767075091.0,
+      "iso": "2025-12-30T06:11:31Z",
+      "market": "0xbb8bfdef9052b2709557a6f8f28b23551e3134bfb86eca800211e2191703ee65",
+      "wallet": "0x2b9edb595ea75c118077c7d2c17d4852b0770db0",
+      "p_z": 0.06323433333828,
+      "anchored": false
+    },
+    {
+      "ts": 1767075099.0,
+      "iso": "2025-12-30T06:11:39Z",
+      "market": "0xbb8bfdef9052b2709557a6f8f28b23551e3134bfb86eca800211e2191703ee65",
+      "wallet": "0xbf36df9171ba68b07334f024818df1d9bbef95ad",
+      "p_z": 0.06097069493941506,
+      "anchored": false
+    },
+    {
+      "ts": 1767061483.0,
+      "iso": "2025-12-30T02:24:43Z",
+      "market": "0xbb8bfdef9052b2709557a6f8f28b23551e3134bfb86eca800211e2191703ee65",
+      "wallet": "0x0de61278e7467aba680659da5b40e122c16ddaa2",
+      "p_z": 0.059094873062165314,
+      "anchored": false
+    },
+    {
+      "ts": 1766739699.0,
+      "iso": "2025-12-26T09:01:39Z",
+      "market": "0x7f3c6b9029a1a4a932509c147a2cc0762e1116b7a4568cde472908b29dd4889d",
+      "wallet": "0xfcc4e78ca3f229949b8106fb380bf14266853067",
+      "p_z": 0.05845537825498569,
+      "anchored": false
+    },
+    {
+      "ts": 1767425981.0,
+      "iso": "2026-01-03T07:39:41Z",
+      "market": "0xbb8bfdef9052b2709557a6f8f28b23551e3134bfb86eca800211e2191703ee65",
+      "wallet": "0x2b366034b69b64a444406b2db7ec1ff7869c473b",
+      "p_z": 0.05809640027196586,
+      "anchored": false
+    },
+    {
+      "ts": 1767425983.0,
+      "iso": "2026-01-03T07:39:43Z",
+      "market": "0xbb8bfdef9052b2709557a6f8f28b23551e3134bfb86eca800211e2191703ee65",
+      "wallet": "0x2b366034b69b64a444406b2db7ec1ff7869c473b",
+      "p_z": 0.05803517188967005,
+      "anchored": false
+    },
+    {
+      "ts": 1767426483.0,
+      "iso": "2026-01-03T07:48:03Z",
+      "market": "0xbb8bfdef9052b2709557a6f8f28b23551e3134bfb86eca800211e2191703ee65",
+      "wallet": "0x2b366034b69b64a444406b2db7ec1ff7869c473b",
+      "p_z": 0.05789465167526732,
+      "anchored": false
+    },
+    {
+      "ts": 1767426553.0,
+      "iso": "2026-01-03T07:49:13Z",
+      "market": "0xbb8bfdef9052b2709557a6f8f28b23551e3134bfb86eca800211e2191703ee65",
+      "wallet": "0x2b366034b69b64a444406b2db7ec1ff7869c473b",
+      "p_z": 0.05777033585007042,
+      "anchored": false
+    },
+    {
+      "ts": 1767426553.0,
+      "iso": "2026-01-03T07:49:13Z",
+      "market": "0xbb8bfdef9052b2709557a6f8f28b23551e3134bfb86eca800211e2191703ee65",
+      "wallet": "0x2b366034b69b64a444406b2db7ec1ff7869c473b",
+      "p_z": 0.057692019202068595,
+      "anchored": false
+    },
+    {
+      "ts": 1767427273.0,
+      "iso": "2026-01-03T08:01:13Z",
+      "market": "0xbb8bfdef9052b2709557a6f8f28b23551e3134bfb86eca800211e2191703ee65",
+      "wallet": "0x2b366034b69b64a444406b2db7ec1ff7869c473b",
+      "p_z": 0.05759898430777704,
+      "anchored": false
+    },
+    {
+      "ts": 1766963763.0,
+      "iso": "2025-12-28T23:16:03Z",
+      "market": "0x79801a0feefbc4c35df8f35d33583eef8ff2bd7a514c619929ac62e23c2cf93d",
+      "wallet": "0xd719eb46721f2618185c99c19d93ba609c01d8e5",
+      "p_z": 0.057081639299287265,
+      "anchored": false
+    },
+    {
+      "ts": 1766964977.0,
+      "iso": "2025-12-28T23:36:17Z",
+      "market": "0x79801a0feefbc4c35df8f35d33583eef8ff2bd7a514c619929ac62e23c2cf93d",
+      "wallet": "0x1a799c0af8a939ba4ed95df95188c2f357491ccb",
+      "p_z": 0.05675661496611819,
+      "anchored": false
+    },
+    {
+      "ts": 1766737949.0,
+      "iso": "2025-12-26T08:32:29Z",
+      "market": "0x7f3c6b9029a1a4a932509c147a2cc0762e1116b7a4568cde472908b29dd4889d",
+      "wallet": "0xa8af4c7923857533b687df9bf02115156e3a325e",
+      "p_z": 0.05619004417187069,
+      "anchored": false
+    },
+    {
+      "ts": 1767420919.0,
+      "iso": "2026-01-03T06:15:19Z",
+      "market": "0xbb8bfdef9052b2709557a6f8f28b23551e3134bfb86eca800211e2191703ee65",
+      "wallet": "0x2b366034b69b64a444406b2db7ec1ff7869c473b",
+      "p_z": 0.05586516963518466,
+      "anchored": false
+    },
+    {
+      "ts": 1766745899.0,
+      "iso": "2025-12-26T10:44:59Z",
+      "market": "0xbb8bfdef9052b2709557a6f8f28b23551e3134bfb86eca800211e2191703ee65",
+      "wallet": "0xa4bd8f49695cf5d55924aca4cc2694952874e8a2",
+      "p_z": 0.055854622878671115,
+      "anchored": false
+    }
+  ],
+  "cold_start": true,
+  "headline_claim": "No claim. This run was cold-started, so every P(Z) is the prior mean plus filter noise and neither the wallet ranking nor the per-trade timing carries information about the model. Re-run with `--warm-start <fitted VEM artifact>`.",
+  "caveats": [
+    "**COLD START \u2014 THIS RUN IS NOT A RESULT.** The scores provenance records `warm_start: null`. `stream_scoring.cold_start` leaves `theta_w` empty and the logistic coefficients uninformative, and `--n-refresh` defaults to never refreshing them, so every P(Z) is the prior mean plus filter noise and any ranking over it is a ranking of noise. Re-run `score_stream.py --replay` with `--warm-start <fitted VEM artifact>` before reading anything below as evidence about the model.",
+    "**One case.** n = 1. Nothing here estimates a false-positive rate, a detection rate, or any quantity that generalizes. A score that lights up on the one labelled episode available is consistent with a useful detector and equally consistent with a detector that lights up often.",
+    "**Post-hoc identification.** The markets, the wallet pattern and the window all come from a charging document written after the fact. Nobody pointed this detector at Polymarket in December 2025 and got an alert. The no-lookahead guarantee inherited from replay scoring is about the *scorer's state*, not about how the cluster was chosen.",
+    "**No counterfactual.** There is no matched control episode \u2014 no market where the same news broke with no insider present \u2014 so the elevation reported here has no null it was tested against. The pre-registered permutation test lives in `src.analysis.event_study`; this module deliberately reports description, not a p-value.",
+    "**Resolution-period contamination is not filtered.** The pull that feeds this study sets `--pre-resolution-days 0` (see the pull section), so the known over-flagging near resolution (ARCHITECTURE.md 9.5) is present in the data. Trades after the public announcement are outside the analysis window for exactly this reason, but the contamination is real and the in-window scores are not immune to a market already drifting toward its resolution.",
+    "**The anchor is a redacted pattern.** The complaint gives four leading and four trailing hex characters of the wallet address. A match is strong evidence but not a certified identification, and a run that matches zero or several wallets is inconclusive rather than negative."
+  ],
+  "provenance": {
+    "forgetting": 0.98,
+    "input": "data/case_studies/van_dyke/trades.jsonl",
+    "mode": "replay",
+    "n_refresh": null,
+    "output": "results/case_studies/van_dyke/scores.jsonl",
+    "wallet_index": null,
+    "warm_start": null
+  },
+  "scores": "results/case_studies/van_dyke/scores.jsonl",
+  "report": "results/case_studies/van_dyke/report.md",
+  "figures": [
+    "results/case_studies/van_dyke/figures/van_dyke_case_study.pdf",
+    "results/case_studies/van_dyke/figures/van_dyke_case_study.png"
+  ]
+}

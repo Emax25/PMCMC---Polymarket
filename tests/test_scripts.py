@@ -21,6 +21,7 @@ from config.default_params import ModelParams, OnlineScorerConfig
 from scripts import (
     _runner,
     benchmark,
+    case_study,
     eval_c4,
     event_study,
     make_figures,
@@ -33,6 +34,7 @@ from scripts import (
     stream_trades,
     validate_vem,
 )
+from src.analysis import case_study as case_study_lib
 from src.analysis.validation import PSIS_KHAT_KEY
 from src.data import kalshi_api, trade_stream
 from src.data.kalshi_api import KalshiAPIError, KalshiMarketMeta
@@ -2172,3 +2174,401 @@ def test_event_study_calibrate_writes_its_own_artifact(tmp_path):
     for row in report["windows"]:
         assert set(row["mean_p"]) == {"planted", "seam", "null"}
     assert "realized size" in report["arms_note"]
+
+
+# ---------------- case_study.py ----------------
+
+# Two manifest markets, one of which is deliberately given no trades so the
+# "incomplete cluster" path is exercised on every run rather than only when a
+# real pull happens to fail.
+_CASE_MARKET = "0xcase01"
+_CASE_MARKET_EMPTY = "0xcase02"
+
+# 40 hex characters, built to match the manifest's redacted-address pattern the
+# way the CFTC complaint's "0x31a5*...*8ed9" matches the charged wallet.
+_CASE_ANCHOR_WALLET = "0xa1b2" + "0" * 32 + "c3d4"
+_CASE_ANCHOR_PATTERN = "^0xa1b2[0-9a-fA-F]{32}c3d4$"
+_CASE_WALLETS = ("0xc0", "0xc1", "0xc2")
+# Trades the whole back half of the capture and nothing inside the window: the
+# wallet that must stay out of the elevation table but stay in the timeline.
+_CASE_LATE_WALLET = "0xlate"
+
+_CASE_T0 = 1_766_700_000
+_CASE_N_TRADES = 100
+_CASE_STEP = 10
+# Half the capture is in-window; the anchored wallet's four trades sit late
+# inside it, just before the window closes. The bound is the timestamp of
+# trade 49, not of trade 50: the window is closed on both ends, so ending it on
+# trade 50 would pull the first late-wallet trade back inside it.
+_CASE_WINDOW_END = _CASE_T0 + 49 * _CASE_STEP
+_CASE_ANCHOR_INDICES = (40, 42, 44, 46)
+
+
+def _case_wallet_for(i: int) -> str:
+    """Wallet address for trade ``i`` of the synthetic cluster capture."""
+    if i >= 50:
+        return _CASE_LATE_WALLET if i % 2 == 0 else _CASE_WALLETS[i % 3]
+    if i in _CASE_ANCHOR_INDICES:
+        return _CASE_ANCHOR_WALLET
+    return _CASE_WALLETS[i % 3]
+
+
+def _case_manifest_payload(**overrides) -> dict:
+    """A schema-v1 manifest over the synthetic cluster."""
+    payload = {
+        "schema_version": case_study_lib.CASE_STUDY_SCHEMA_VERSION,
+        "case": {
+            "name": "Synthetic labeled case",
+            "summary": "Fixture standing in for the Van Dyke cluster.",
+            "sources": [
+                {
+                    "id": "fixture",
+                    "kind": "primary",
+                    "title": "test fixture",
+                    "url": "https://example.invalid/fixture",
+                    "retrieved": "2026-08-02",
+                },
+            ],
+        },
+        "identification": {"procedure": "fixed by this fixture, not inferred"},
+        "analysis_window": {
+            "start": _CASE_T0,
+            "end": _CASE_WINDOW_END,
+            "rationale": "closes at the synthetic public announcement",
+        },
+        "wallet_anchor": {
+            "handle": "Fixture-Handle",
+            "address": None,
+            "address_pattern": _CASE_ANCHOR_PATTERN,
+            "citation": "fixture",
+            "note": "redacted-address anchor, as in the real manifest",
+        },
+        "pull": {
+            "command": "python -m scripts.pull_data --slugs fixture-market",
+            "pre_resolution_days": 0.0,
+            "full_history": True,
+            "deviation_note": "0 instead of the 7-day default, on purpose.",
+            "capture_note": "capture written in the stream sink shape",
+        },
+        "doj_timeline": [
+            {
+                "ts": _CASE_WINDOW_END,
+                "label": "public announcement",
+                "source": "fixture",
+                "citation": "fixture",
+                "verified": True,
+            },
+        ],
+        "markets": [
+            {
+                "slug": "fixture-market",
+                "condition_id": _CASE_MARKET,
+                "question": "Fixture market?",
+                "role": "primary",
+                "why": "carries every synthetic trade",
+                "cross_check": "n/a",
+                "resolved": "Yes",
+                "verified": True,
+            },
+            {
+                "slug": "fixture-market-empty",
+                "condition_id": _CASE_MARKET_EMPTY,
+                "question": "Fixture market with no trades?",
+                "role": "cluster",
+                "why": "documented in the cluster but absent from the pull",
+                "cross_check": "n/a",
+                "resolved": "No",
+                "verified": True,
+            },
+        ],
+        "unverified": ["a claim no source could back"],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _write_case_manifest(tmp_path: Path, **overrides) -> Path:
+    """Write the fixture manifest and return its path."""
+    path = tmp_path / "markets.json"
+    path.write_text(json.dumps(_case_manifest_payload(**overrides)), encoding="utf-8")
+    return path
+
+
+def _case_scores(tmp_path: Path) -> Path:
+    """Replay a synthetic cluster capture through score_stream.
+
+    Going through the real CLI is what makes the provenance sidecar the case
+    study gates on a genuine ``--replay`` artifact rather than a hand-written
+    file that satisfies the gate by construction.
+
+    Returns:
+        Path of the scores JSONL.
+    """
+    rng = np.random.default_rng(23)
+    prices = np.clip(
+        0.3 + np.cumsum(rng.normal(0.0, 0.01, _CASE_N_TRADES)), 0.05, 0.95
+    )
+    records = [
+        dict(
+            _raw_trade(
+                i,
+                ts=_CASE_T0 + _CASE_STEP * i,
+                price=float(prices[i]),
+                size=float(5.0 + 40.0 * rng.random()),
+                wallet=_case_wallet_for(i),
+            ),
+            condition_id=_CASE_MARKET,
+        )
+        for i in range(_CASE_N_TRADES)
+    ]
+    scores = tmp_path / "scores.jsonl"
+    assert (
+        score_stream.main(
+            [
+                "--replay",
+                str(_write_trades(tmp_path / "capture.jsonl", records)),
+                "--output",
+                str(scores),
+                "--log-level",
+                "WARNING",
+            ]
+        )
+        == 0
+    )
+    return scores
+
+
+def _run_case_study(tmp_path: Path, manifest: Path, scores: Path, *args) -> int:
+    """Invoke the case_study CLI in report mode over the fixture bundle."""
+    return case_study.main(
+        [
+            "--manifest",
+            str(manifest),
+            "--scores",
+            str(scores),
+            "--out-dir",
+            str(tmp_path / "bundle"),
+            "--log-level",
+            "WARNING",
+            *args,
+        ]
+    )
+
+
+def test_case_study_smoke_writes_every_report_section(tmp_path):
+    """Manifest + replayed scores produce the full bundle, all sections present."""
+    manifest = _write_case_manifest(tmp_path)
+    scores = _case_scores(tmp_path)
+
+    assert _run_case_study(tmp_path, manifest, scores) == case_study.EXIT_OK
+
+    bundle = tmp_path / "bundle"
+    report = (bundle / case_study.REPORT_NAME).read_text(encoding="utf-8")
+    for section in case_study_lib.REPORT_SECTIONS:
+        assert report.count(section) == 1, section
+    # The data-sufficiency subsection is mandatory, and it must actually carry
+    # the ARCHITECTURE.md 9.5 thresholds rather than merely exist.
+    assert case_study_lib.SECTION_SUFFICIENCY in report
+    assert str(case_study_lib.THETA_W_PRIOR_DOMINATED_N_TRADES) in report
+    assert str(case_study_lib.THETA_W_MEANINGFUL_N_TRADES) in report
+    # The pre-resolution deviation is documented in the report, not only in
+    # the manifest.
+    assert "pre-resolution-days 0" in report
+
+    payload = json.loads((bundle / case_study.SUMMARY_NAME).read_text("utf-8"))
+    assert payload["schema_version"] == case_study_lib.CASE_STUDY_SCHEMA_VERSION
+    assert payload["provenance"]["mode"] == "replay"
+    assert payload["n_trades_total"] == _CASE_N_TRADES
+    assert payload["anchored_wallets"] == [_CASE_ANCHOR_WALLET]
+    assert payload["figures"]
+    assert all(Path(p).is_file() for p in payload["figures"])
+
+
+def test_case_study_window_excludes_late_wallet_but_keeps_it_in_the_timeline(
+    tmp_path,
+):
+    """Out-of-window trades leave the elevation table, not the record."""
+    manifest = _write_case_manifest(tmp_path)
+    scores = _case_scores(tmp_path)
+
+    assert _run_case_study(tmp_path, manifest, scores) == case_study.EXIT_OK
+    payload = json.loads(
+        (tmp_path / "bundle" / case_study.SUMMARY_NAME).read_text("utf-8")
+    )
+
+    ranked = {row["wallet"] for row in payload["wallets"]}
+    # Trades only after the window closes: no in-window mean, so no row...
+    assert _CASE_LATE_WALLET not in ranked
+    # ...but its trades are still counted in the cluster totals the timeline
+    # and the baseline are built from.
+    assert payload["n_trades_window"] == 50
+    assert payload["n_trades_total"] == _CASE_N_TRADES
+    assert payload["n_wallets_total"] == payload["n_wallets_window"] + 1
+
+    anchored = next(row for row in payload["wallets"] if row["anchored"])
+    assert anchored["wallet"] == _CASE_ANCHOR_WALLET
+    assert anchored["n_window"] == len(_CASE_ANCHOR_INDICES)
+    # Four trades is far below the ~20-trade floor, so the run must grade the
+    # wallet as prior-dominated rather than let its rank read as a result.
+    assert anchored["sufficiency"] == case_study_lib.SUFFICIENCY_PRIOR_DOMINATED
+    # Every listed top trade is inside the window.
+    assert payload["top_trades"]
+    assert all(row["ts"] <= _CASE_WINDOW_END for row in payload["top_trades"])
+
+
+def test_case_study_refuses_to_claim_anything_from_a_cold_started_run(tmp_path):
+    """A cold start has no theta_w, so the whole bundle must disown itself."""
+    manifest = _write_case_manifest(tmp_path)
+    # The fixture goes through score_stream with no --warm-start, which is
+    # exactly the run the report has to refuse to be read as a result.
+    scores = _case_scores(tmp_path)
+
+    assert _run_case_study(tmp_path, manifest, scores, "--no-figures") == 0
+    bundle = tmp_path / "bundle"
+    payload = json.loads((bundle / case_study.SUMMARY_NAME).read_text("utf-8"))
+    assert payload["provenance"]["warm_start"] is None
+    assert payload["cold_start"] is True
+    assert payload["headline_claim"].startswith("No claim.")
+    report = (bundle / case_study.REPORT_NAME).read_text(encoding="utf-8")
+    assert "COLD START" in report
+
+
+def test_case_study_headline_leans_on_timing_not_rank_when_warm_started(tmp_path):
+    """Warm-started and prior-dominated: the rank is reported, never led with."""
+    manifest = case_study_lib.load_manifest(_write_case_manifest(tmp_path))
+    trades = case_study_lib.load_scored_trades(
+        _case_scores(tmp_path), condition_ids=manifest.condition_ids
+    )
+
+    summary = case_study_lib.run_case_study(
+        trades,
+        manifest,
+        provenance={"mode": "replay", "warm_start": "results/warm_start.json"},
+    )
+
+    assert summary.is_cold_start is False
+    claim = case_study_lib.headline_claim(summary)
+    assert "NOT the claim" in claim
+    assert case_study_lib.SUFFICIENCY_PRIOR_DOMINATED in claim
+    # The elevation and the pre-announcement framing lead; the rank trails.
+    assert claim.index("elevation") < claim.index("rank")
+
+
+def test_case_study_reports_a_manifest_market_with_no_trades(tmp_path):
+    """A documented market the pull missed is named, not silently dropped."""
+    manifest = _write_case_manifest(tmp_path)
+    scores = _case_scores(tmp_path)
+
+    assert _run_case_study(tmp_path, manifest, scores, "--no-figures") == 0
+    bundle = tmp_path / "bundle"
+    payload = json.loads((bundle / case_study.SUMMARY_NAME).read_text("utf-8"))
+    assert payload["markets_without_trades"] == [_CASE_MARKET_EMPTY]
+    assert "Incomplete cluster" in (bundle / case_study.REPORT_NAME).read_text("utf-8")
+
+
+def test_case_study_rejects_a_malformed_or_missing_manifest(tmp_path):
+    """A manifest that cannot be trusted stops the run before any analysis."""
+    scores = _case_scores(tmp_path)
+
+    broken = tmp_path / "broken.json"
+    broken.write_text("{not json", encoding="utf-8")
+    assert (
+        _run_case_study(tmp_path, broken, scores) == case_study.EXIT_BAD_MANIFEST
+    )
+
+    absent = tmp_path / "nope.json"
+    assert (
+        _run_case_study(tmp_path, absent, scores) == case_study.EXIT_BAD_MANIFEST
+    )
+
+    wrong_version = _write_case_manifest(tmp_path, schema_version=99)
+    assert (
+        _run_case_study(tmp_path, wrong_version, scores)
+        == case_study.EXIT_BAD_MANIFEST
+    )
+    assert not (tmp_path / "bundle" / case_study.SUMMARY_NAME).exists()
+
+
+def test_case_study_refuses_live_mode_scores(tmp_path):
+    """The no-lookahead gate is the sidecar, exactly as in the event study."""
+    manifest = _write_case_manifest(tmp_path)
+    scores = _case_scores(tmp_path)
+    sidecar = scores.with_name(scores.name + ".meta.json")
+    meta = json.loads(sidecar.read_text(encoding="utf-8"))
+    sidecar.write_text(json.dumps({**meta, "mode": "live"}), encoding="utf-8")
+
+    assert (
+        _run_case_study(tmp_path, manifest, scores)
+        == case_study.EXIT_NO_PROVENANCE
+    )
+    assert not (tmp_path / "bundle" / case_study.SUMMARY_NAME).exists()
+
+
+def test_case_study_exits_three_when_no_cluster_market_was_scored(tmp_path):
+    """Scores for other markets are filtered out, and that is a hard failure."""
+    scores = _case_scores(tmp_path)
+    manifest = _write_case_manifest(
+        tmp_path,
+        markets=[
+            {
+                "slug": "somewhere-else",
+                "condition_id": "0xnotinthecapture",
+                "question": "?",
+                "role": "primary",
+                "why": "not in the capture",
+                "cross_check": "n/a",
+                "resolved": "No",
+                "verified": True,
+            },
+        ],
+    )
+
+    assert (
+        _run_case_study(tmp_path, manifest, scores)
+        == case_study.EXIT_NOTHING_TO_ANALYSE
+    )
+
+
+def test_case_study_print_pull_command_echoes_the_manifest(tmp_path, capsys):
+    """The documented pull is read off the manifest, never rebuilt in the CLI."""
+    manifest = _write_case_manifest(tmp_path)
+
+    rc = case_study.main(
+        ["--manifest", str(manifest), "--print-pull-command", "--log-level", "ERROR"]
+    )
+
+    assert rc == case_study.EXIT_OK
+    assert capsys.readouterr().out.strip() == (
+        _case_manifest_payload()["pull"]["command"]
+    )
+
+
+def test_case_study_shipped_manifest_parses_and_names_its_cluster():
+    """The checked-in Van Dyke manifest is loadable and self-describing."""
+    manifest = case_study_lib.load_manifest(
+        Path(__file__).resolve().parents[1]
+        / "results"
+        / "case_studies"
+        / "van_dyke"
+        / "markets.json"
+    )
+
+    assert manifest.markets
+    # Every market carries the condition id the scores JSONL keys on, plus the
+    # cross-check that ties its slug back to a charging document.
+    for market in manifest.markets:
+        assert market.condition_id.startswith("0x")
+        assert len(market.condition_id) == 66
+        assert market.why and market.cross_check
+    # KTD5: the anchor and the window are documented, not inferred, and the
+    # redacted-pattern anchor carries the record of how it was resolved.
+    assert manifest.anchor.address_pattern
+    assert manifest.reconstruction.get("checks")
+    assert manifest.anchor.matches(manifest.reconstruction["wallet"])
+    assert manifest.window.end_ts > manifest.window.start_ts
+    # R7: the pull deviates from the 7-day pre-resolution default, on record.
+    assert manifest.pull.pre_resolution_days == 0.0
+    assert manifest.pull.full_history
+    assert "--pre-resolution-days 0" in manifest.pull.command
+    # Figures that no readable primary source backs are listed as unverified.
+    assert manifest.unverified
