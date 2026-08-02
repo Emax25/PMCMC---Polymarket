@@ -4,6 +4,6 @@
   "mode": "replay",
   "n_refresh": null,
   "output": "results/case_studies/van_dyke/scores.jsonl",
-  "wallet_index": null,
-  "warm_start": null
+  "wallet_index": "data/processed/wallet_index.json",
+  "warm_start": "results/plan5/warm_start_train.json"
 }

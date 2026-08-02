@@ -48,10 +48,12 @@ Properties probed against the live API on 2026-08-01 (ticker
   normalized row here carries ``wallet=None`` and why that nullability is the
   signal downstream code keys anonymous mode off.
 * **Fee model** (for consumers sizing a live strategy): Kalshi charges
-  ``ceil(0.07 · C · p · (1 - p))`` dollars on a taker order of ``C``
+  ``ceil(0.07 · C · p · (1 - p))`` **cents** on a taker order of ``C``
   contracts at price ``p``, i.e. ~1.75¢/contract at p = 0.5 and ~0.07¢ at
-  p = 0.01. Fees are maximal exactly where this model's insider signal is
-  weakest (mid-book) and cheapest in the tails.
+  p = 0.01. The ceiling is at cent granularity — reading the formula as
+  dollars would bill a one-contract mid-book order a full $1. Fees are
+  maximal exactly where this model's insider signal is weakest (mid-book)
+  and cheapest in the tails. `src/analysis/backtest.py` implements it.
 
 Retries mirror `src/data/polymarket_api.py`: bounded exponential backoff on
 429/5xx, everything else surfacing as `KalshiAPIError`. The backoff helper is

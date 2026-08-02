@@ -4,8 +4,6 @@ An externally labelled insider episode — the only kind of ground truth this pr
 
 Manifest: `results/case_studies/van_dyke/markets.json` (schema v1)
 
-**COLD START — THIS RUN IS NOT A RESULT.** The scores provenance records `warm_start: null`. `stream_scoring.cold_start` leaves `theta_w` empty and the logistic coefficients uninformative, and `--n-refresh` defaults to never refreshing them, so every P(Z) is the prior mean plus filter noise and any ranking over it is a ranking of noise. Re-run `score_stream.py --replay` with `--warm-start <fitted VEM artifact>` before reading anything below as evidence about the model.
-
 ## 1. Case and sources
 
 **U.S. v. Gannon Ken Van Dyke**
@@ -66,17 +64,17 @@ Cluster baseline mean P(Z) (all trades): 0.0500; in-window mean: 0.0500.
 
 | rank | wallet | n_window | n_total | mean P(Z) | max P(Z) | elevation | theta_w evidence | anchored |
 |---:|---|---:|---:|---:|---:|---:|---|---|
-| 1 | `0x2b9edb595ea75c118077c7d2c17d4852b0770db0` | 1 | 4 | 0.0632 | 0.0632 | +0.0132 | prior-dominated |  |
-| 2 | `0xfcc4e78ca3f229949b8106fb380bf14266853067` | 1 | 1 | 0.0585 | 0.0585 | +0.0084 | prior-dominated |  |
-| 3 | `0xa5c5d420674488b0a11c114627c0f13c564bd8ee` | 1 | 1 | 0.0553 | 0.0553 | +0.0053 | prior-dominated |  |
-| 4 | `0x50781ba59a7386fea3ad360a7b62d70ef8a3dd86` | 1 | 1 | 0.0551 | 0.0551 | +0.0051 | prior-dominated |  |
-| 5 | `0x202d2b8ed386228fc928dac406d1a888739a9890` | 1 | 1 | 0.0550 | 0.0550 | +0.0050 | prior-dominated |  |
-| 6 | `0xa347cd256d8d962715c6bffd4e5f541b2de0ba0c` | 1 | 1 | 0.0549 | 0.0549 | +0.0049 | prior-dominated |  |
-| 7 | `0x1a799c0af8a939ba4ed95df95188c2f357491ccb` | 2 | 2 | 0.0546 | 0.0568 | +0.0046 | prior-dominated |  |
-| 8 | `0xa2cc453e5d2869d480accf8e71d6328c33391857` | 1 | 1 | 0.0546 | 0.0546 | +0.0046 | prior-dominated |  |
-| 9 | `0x7b76ff3a1acd99622af06aeaec49562f0fbb5960` | 1 | 1 | 0.0542 | 0.0542 | +0.0041 | prior-dominated |  |
-| 10 | `0xd719eb46721f2618185c99c19d93ba609c01d8e5` | 2 | 2 | 0.0537 | 0.0571 | +0.0037 | prior-dominated |  |
-| 1497 | `0x31a56e9e690c621ed21de08cb559e9524cdb8ed9` | 13 | 15 | 0.0500 | 0.0500 | -0.0000 | prior-dominated | **YES** |
+| 1 | `0x7ab6ac0f0d6ca5a15ec57abeaf413d31c8cdfa77` | 8 | 108 | 0.0503 | 0.0503 | +0.0003 | meaningful |  |
+| 2 | `0x750ca59fafbf837d939eca4cd241601a489c2fe3` | 1 | 8 | 0.0503 | 0.0503 | +0.0003 | prior-dominated |  |
+| 3 | `0xcb516a0c8b8ba2e42ff5c123e2f624d6cce6359d` | 1 | 6 | 0.0503 | 0.0503 | +0.0002 | prior-dominated |  |
+| 4 | `0x197040709ae61627d3685a8d6ce1f9e82e6b398d` | 2 | 5 | 0.0501 | 0.0501 | +0.0001 | prior-dominated |  |
+| 5 | `0xb06069838d9442d857593bdebeb454dc0e629572` | 3 | 9 | 0.0501 | 0.0501 | +0.0001 | prior-dominated |  |
+| 6 | `0xe598435df0cdf5d22bdd5082d557f75f9180a0a8` | 6 | 11 | 0.0501 | 0.0501 | +0.0001 | prior-dominated |  |
+| 7 | `0x99dfc271bc6883f4732e0eb84f059a7d22d67331` | 1 | 3 | 0.0501 | 0.0501 | +0.0000 | prior-dominated |  |
+| 8 | `0xd0b76cdf68b1cc03619455b92e196c72e339fa4b` | 1 | 1 | 0.0501 | 0.0501 | +0.0000 | prior-dominated |  |
+| 9 | `0xeb58e26e51169b71d00f3beface74ffe1ddd6fa5` | 1 | 1 | 0.0501 | 0.0501 | +0.0000 | prior-dominated |  |
+| 10 | `0x682c92615993fd1f75cdfe101efdc1a8adcb17ae` | 2 | 44 | 0.0501 | 0.0501 | +0.0000 | weak |  |
+| 3347 | `0x31a56e9e690c621ed21de08cb559e9524cdb8ed9` | 13 | 15 | 0.0500 | 0.0500 | -0.0000 | prior-dominated | **YES** |
 
 Anchor: handle `Burdensome-Mix`, pattern `^0x31a5[0-9a-fA-F]{32}8ed9$` (Complaint paragraphs 48, 57 (pattern); resolved to the full address by the reconstruction below.). 1 wallet(s) matched.
 
@@ -96,7 +94,7 @@ ARCHITECTURE.md 9.5 fixes the reliability thresholds for the per-wallet posterio
 
 The charging documents describe on the order of ten purchases in this cluster. That is an order of magnitude below the threshold at which this project's own wallet posterior means anything, so **the wallet ranking above is prior-dominated and is not the result of this case study.** The headline claim rests on the per-trade P(Z) timing evidence in the next section.
 
-**Headline claim.** No claim. This run was cold-started, so every P(Z) is the prior mean plus filter noise and neither the wallet ranking nor the per-trade timing carries information about the model. Re-run with `--warm-start <fitted VEM artifact>`.
+**Headline claim.** The anchored wallet's 13 in-window trade(s) carry a mean P(Z) of 0.050 against a cluster baseline of 0.050 (elevation -0.000, peak 0.050), all of it before the public announcement at 2026-01-03T09:21:00Z. The wallet ranking is NOT the claim: with 15 trades in total this wallet is prior-dominated against the ARCHITECTURE.md 9.5 thresholds, so its rank 3347 of 6110 is largely a restatement of the prior and is reported for completeness only.
 
 ## 5. Per-trade P(Z) timing evidence
 
@@ -104,21 +102,21 @@ Highest-scoring individual trades inside the analysis window. Every score is a f
 
 | timestamp (UTC) | market | wallet | P(Z) | anchored |
 |---|---|---|---:|---|
-| 2025-12-30T06:11:31Z | `us-forces-in-venezuela-by-january-31-2026` | `0x2b9edb595ea75c118077c7d2c17d4852b0770db0` | 0.0632 |  |
-| 2025-12-30T06:11:39Z | `us-forces-in-venezuela-by-january-31-2026` | `0xbf36df9171ba68b07334f024818df1d9bbef95ad` | 0.0610 |  |
-| 2025-12-30T02:24:43Z | `us-forces-in-venezuela-by-january-31-2026` | `0x0de61278e7467aba680659da5b40e122c16ddaa2` | 0.0591 |  |
-| 2025-12-26T09:01:39Z | `will-the-us-invade-venezuela-by-january-31-2026` | `0xfcc4e78ca3f229949b8106fb380bf14266853067` | 0.0585 |  |
-| 2026-01-03T07:39:41Z | `us-forces-in-venezuela-by-january-31-2026` | `0x2b366034b69b64a444406b2db7ec1ff7869c473b` | 0.0581 |  |
-| 2026-01-03T07:39:43Z | `us-forces-in-venezuela-by-january-31-2026` | `0x2b366034b69b64a444406b2db7ec1ff7869c473b` | 0.0580 |  |
-| 2026-01-03T07:48:03Z | `us-forces-in-venezuela-by-january-31-2026` | `0x2b366034b69b64a444406b2db7ec1ff7869c473b` | 0.0579 |  |
-| 2026-01-03T07:49:13Z | `us-forces-in-venezuela-by-january-31-2026` | `0x2b366034b69b64a444406b2db7ec1ff7869c473b` | 0.0578 |  |
-| 2026-01-03T07:49:13Z | `us-forces-in-venezuela-by-january-31-2026` | `0x2b366034b69b64a444406b2db7ec1ff7869c473b` | 0.0577 |  |
-| 2026-01-03T08:01:13Z | `us-forces-in-venezuela-by-january-31-2026` | `0x2b366034b69b64a444406b2db7ec1ff7869c473b` | 0.0576 |  |
-| 2025-12-28T23:16:03Z | `trump-invokes-war-powers-against-venezuela-by-january-31-134-583` | `0xd719eb46721f2618185c99c19d93ba609c01d8e5` | 0.0571 |  |
-| 2025-12-28T23:36:17Z | `trump-invokes-war-powers-against-venezuela-by-january-31-134-583` | `0x1a799c0af8a939ba4ed95df95188c2f357491ccb` | 0.0568 |  |
-| 2025-12-26T08:32:29Z | `will-the-us-invade-venezuela-by-january-31-2026` | `0xa8af4c7923857533b687df9bf02115156e3a325e` | 0.0562 |  |
-| 2026-01-03T06:15:19Z | `us-forces-in-venezuela-by-january-31-2026` | `0x2b366034b69b64a444406b2db7ec1ff7869c473b` | 0.0559 |  |
-| 2025-12-26T10:44:59Z | `us-forces-in-venezuela-by-january-31-2026` | `0xa4bd8f49695cf5d55924aca4cc2694952874e8a2` | 0.0559 |  |
+| 2025-12-26T02:12:13Z | `maduro-out-in-2025-411` | `0x7ab6ac0f0d6ca5a15ec57abeaf413d31c8cdfa77` | 0.0503 |  |
+| 2025-12-26T16:23:03Z | `maduro-out-in-2025-411` | `0x7ab6ac0f0d6ca5a15ec57abeaf413d31c8cdfa77` | 0.0503 |  |
+| 2025-12-26T16:35:53Z | `maduro-out-in-2025-411` | `0x7ab6ac0f0d6ca5a15ec57abeaf413d31c8cdfa77` | 0.0503 |  |
+| 2025-12-26T18:48:09Z | `maduro-out-in-2025-411` | `0x7ab6ac0f0d6ca5a15ec57abeaf413d31c8cdfa77` | 0.0503 |  |
+| 2025-12-26T22:04:45Z | `maduro-out-in-2025-411` | `0x7ab6ac0f0d6ca5a15ec57abeaf413d31c8cdfa77` | 0.0503 |  |
+| 2025-12-26T00:30:13Z | `maduro-out-in-2025-411` | `0x7ab6ac0f0d6ca5a15ec57abeaf413d31c8cdfa77` | 0.0503 |  |
+| 2025-12-27T00:01:21Z | `maduro-out-in-2025-411` | `0x7ab6ac0f0d6ca5a15ec57abeaf413d31c8cdfa77` | 0.0503 |  |
+| 2025-12-31T03:52:15Z | `maduro-out-in-2025-411` | `0x7ab6ac0f0d6ca5a15ec57abeaf413d31c8cdfa77` | 0.0503 |  |
+| 2026-01-03T08:07:43Z | `will-the-us-invade-venezuela-by-january-31-2026` | `0x750ca59fafbf837d939eca4cd241601a489c2fe3` | 0.0503 |  |
+| 2025-12-26T00:30:27Z | `maduro-out-in-2025-411` | `0xcb516a0c8b8ba2e42ff5c123e2f624d6cce6359d` | 0.0503 |  |
+| 2025-12-27T02:26:39Z | `maduro-out-in-2025-411` | `0x197040709ae61627d3685a8d6ce1f9e82e6b398d` | 0.0501 |  |
+| 2025-12-27T02:27:01Z | `maduro-out-in-2025-411` | `0x197040709ae61627d3685a8d6ce1f9e82e6b398d` | 0.0501 |  |
+| 2025-12-26T08:43:51Z | `maduro-out-by-january-31-2026-318` | `0xb06069838d9442d857593bdebeb454dc0e629572` | 0.0501 |  |
+| 2025-12-28T10:21:37Z | `maduro-out-by-january-31-2026-318` | `0xb06069838d9442d857593bdebeb454dc0e629572` | 0.0501 |  |
+| 2025-12-28T10:21:25Z | `maduro-out-in-2025-411` | `0xb06069838d9442d857593bdebeb454dc0e629572` | 0.0501 |  |
 
 ## 6. Charging-document timeline overlay
 
@@ -146,11 +144,10 @@ Every other pull in this repository uses --pre-resolution-days 7, because resolv
 
 scripts/pull_data.py writes the batch processed format (integer wallet ids), which the streaming scorer cannot replay. `python -m scripts.case_study --capture` writes the same markets in the stream_trades.py raw record shape (timestamp/price/size/wallet/transaction_hash/condition_id) so that `score_stream.py --replay` can consume them. Both walk the full history and neither applies a pre-resolution filter.
 
-Scores provenance: mode='replay', input='data/case_studies/van_dyke/trades.jsonl', warm_start=None.
+Scores provenance: mode='replay', input='data/case_studies/van_dyke/trades.jsonl', warm_start='results/plan5/warm_start_train.json'.
 
 ## 8. Caveats
 
-- **COLD START — THIS RUN IS NOT A RESULT.** The scores provenance records `warm_start: null`. `stream_scoring.cold_start` leaves `theta_w` empty and the logistic coefficients uninformative, and `--n-refresh` defaults to never refreshing them, so every P(Z) is the prior mean plus filter noise and any ranking over it is a ranking of noise. Re-run `score_stream.py --replay` with `--warm-start <fitted VEM artifact>` before reading anything below as evidence about the model.
 - **One case.** n = 1. Nothing here estimates a false-positive rate, a detection rate, or any quantity that generalizes. A score that lights up on the one labelled episode available is consistent with a useful detector and equally consistent with a detector that lights up often.
 - **Post-hoc identification.** The markets, the wallet pattern and the window all come from a charging document written after the fact. Nobody pointed this detector at Polymarket in December 2025 and got an alert. The no-lookahead guarantee inherited from replay scoring is about the *scorer's state*, not about how the cluster was chosen.
 - **No counterfactual.** There is no matched control episode — no market where the same news broke with no insider present — so the elevation reported here has no null it was tested against. The pre-registered permutation test lives in `src.analysis.event_study`; this module deliberately reports description, not a p-value.

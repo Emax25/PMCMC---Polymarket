@@ -230,125 +230,125 @@
   "n_trades_window": 15698,
   "n_wallets_total": 22892,
   "n_wallets_window": 6110,
-  "baseline_mean_p_z": 0.05002278774655703,
-  "window_mean_p_z": 0.05002144837171236,
+  "baseline_mean_p_z": 0.050026527040241055,
+  "window_mean_p_z": 0.049997189250380165,
   "markets_without_trades": [],
   "markets_off_manifest": [],
   "anchored_wallets": [
     "0x31a56e9e690c621ed21de08cb559e9524cdb8ed9"
   ],
   "anchored_ranks": {
-    "0x31a56e9e690c621ed21de08cb559e9524cdb8ed9": 1497
+    "0x31a56e9e690c621ed21de08cb559e9524cdb8ed9": 3347
   },
   "top_k": 10,
   "wallets": [
     {
-      "wallet": "0x2b9edb595ea75c118077c7d2c17d4852b0770db0",
+      "wallet": "0x7ab6ac0f0d6ca5a15ec57abeaf413d31c8cdfa77",
+      "n_window": 8,
+      "n_total": 108,
+      "mean_p_z": 0.050312567244905446,
+      "max_p_z": 0.05031865189891979,
+      "elevation": 0.0002860402046643909,
+      "anchored": false,
+      "sufficiency": "meaningful"
+    },
+    {
+      "wallet": "0x750ca59fafbf837d939eca4cd241601a489c2fe3",
       "n_window": 1,
-      "n_total": 4,
-      "mean_p_z": 0.06323433333828,
-      "max_p_z": 0.06323433333828,
-      "elevation": 0.013211545591722974,
+      "n_total": 8,
+      "mean_p_z": 0.050291541723607586,
+      "max_p_z": 0.050291541723607586,
+      "elevation": 0.00026501468336653095,
       "anchored": false,
       "sufficiency": "prior-dominated"
     },
     {
-      "wallet": "0xfcc4e78ca3f229949b8106fb380bf14266853067",
+      "wallet": "0xcb516a0c8b8ba2e42ff5c123e2f624d6cce6359d",
       "n_window": 1,
-      "n_total": 1,
-      "mean_p_z": 0.05845537825498569,
-      "max_p_z": 0.05845537825498569,
-      "elevation": 0.008432590508428657,
+      "n_total": 6,
+      "mean_p_z": 0.050253662124807384,
+      "max_p_z": 0.050253662124807384,
+      "elevation": 0.00022713508456632947,
       "anchored": false,
       "sufficiency": "prior-dominated"
     },
     {
-      "wallet": "0xa5c5d420674488b0a11c114627c0f13c564bd8ee",
-      "n_window": 1,
-      "n_total": 1,
-      "mean_p_z": 0.05530308143837302,
-      "max_p_z": 0.05530308143837302,
-      "elevation": 0.005280293691815992,
-      "anchored": false,
-      "sufficiency": "prior-dominated"
-    },
-    {
-      "wallet": "0x50781ba59a7386fea3ad360a7b62d70ef8a3dd86",
-      "n_window": 1,
-      "n_total": 1,
-      "mean_p_z": 0.05511629067736439,
-      "max_p_z": 0.05511629067736439,
-      "elevation": 0.0050935029308073615,
-      "anchored": false,
-      "sufficiency": "prior-dominated"
-    },
-    {
-      "wallet": "0x202d2b8ed386228fc928dac406d1a888739a9890",
-      "n_window": 1,
-      "n_total": 1,
-      "mean_p_z": 0.055048510109912775,
-      "max_p_z": 0.055048510109912775,
-      "elevation": 0.005025722363355745,
-      "anchored": false,
-      "sufficiency": "prior-dominated"
-    },
-    {
-      "wallet": "0xa347cd256d8d962715c6bffd4e5f541b2de0ba0c",
-      "n_window": 1,
-      "n_total": 1,
-      "mean_p_z": 0.05492777837263981,
-      "max_p_z": 0.05492777837263981,
-      "elevation": 0.004904990626082781,
-      "anchored": false,
-      "sufficiency": "prior-dominated"
-    },
-    {
-      "wallet": "0x1a799c0af8a939ba4ed95df95188c2f357491ccb",
+      "wallet": "0x197040709ae61627d3685a8d6ce1f9e82e6b398d",
       "n_window": 2,
-      "n_total": 2,
-      "mean_p_z": 0.05458318264899359,
-      "max_p_z": 0.05675661496611819,
-      "elevation": 0.004560394902436558,
+      "n_total": 5,
+      "mean_p_z": 0.05014187699394107,
+      "max_p_z": 0.05014228351827904,
+      "elevation": 0.0001153499537000155,
       "anchored": false,
       "sufficiency": "prior-dominated"
     },
     {
-      "wallet": "0xa2cc453e5d2869d480accf8e71d6328c33391857",
+      "wallet": "0xb06069838d9442d857593bdebeb454dc0e629572",
+      "n_window": 3,
+      "n_total": 9,
+      "mean_p_z": 0.05009055689333231,
+      "max_p_z": 0.05009137932401758,
+      "elevation": 6.402985309125753e-05,
+      "anchored": false,
+      "sufficiency": "prior-dominated"
+    },
+    {
+      "wallet": "0xe598435df0cdf5d22bdd5082d557f75f9180a0a8",
+      "n_window": 6,
+      "n_total": 11,
+      "mean_p_z": 0.050081632810889204,
+      "max_p_z": 0.050082391522457956,
+      "elevation": 5.51057706481492e-05,
+      "anchored": false,
+      "sufficiency": "prior-dominated"
+    },
+    {
+      "wallet": "0x99dfc271bc6883f4732e0eb84f059a7d22d67331",
+      "n_window": 1,
+      "n_total": 3,
+      "mean_p_z": 0.050072024098469704,
+      "max_p_z": 0.050072024098469704,
+      "elevation": 4.549705822864958e-05,
+      "anchored": false,
+      "sufficiency": "prior-dominated"
+    },
+    {
+      "wallet": "0xd0b76cdf68b1cc03619455b92e196c72e339fa4b",
       "n_window": 1,
       "n_total": 1,
-      "mean_p_z": 0.054577395357086805,
-      "max_p_z": 0.054577395357086805,
-      "elevation": 0.004554607610529775,
+      "mean_p_z": 0.05007191700181003,
+      "max_p_z": 0.05007191700181003,
+      "elevation": 4.5389961568977066e-05,
       "anchored": false,
       "sufficiency": "prior-dominated"
     },
     {
-      "wallet": "0x7b76ff3a1acd99622af06aeaec49562f0fbb5960",
+      "wallet": "0xeb58e26e51169b71d00f3beface74ffe1ddd6fa5",
       "n_window": 1,
       "n_total": 1,
-      "mean_p_z": 0.054160422119443705,
-      "max_p_z": 0.054160422119443705,
-      "elevation": 0.004137634372886674,
+      "mean_p_z": 0.050069839539522334,
+      "max_p_z": 0.050069839539522334,
+      "elevation": 4.3312499281279726e-05,
       "anchored": false,
       "sufficiency": "prior-dominated"
     },
     {
-      "wallet": "0xd719eb46721f2618185c99c19d93ba609c01d8e5",
+      "wallet": "0x682c92615993fd1f75cdfe101efdc1a8adcb17ae",
       "n_window": 2,
-      "n_total": 2,
-      "mean_p_z": 0.05371021974974506,
-      "max_p_z": 0.057081639299287265,
-      "elevation": 0.0036874320031880306,
+      "n_total": 44,
+      "mean_p_z": 0.050058216655613975,
+      "max_p_z": 0.05006504635244846,
+      "elevation": 3.16896153729207e-05,
       "anchored": false,
-      "sufficiency": "prior-dominated"
+      "sufficiency": "weak"
     },
     {
       "wallet": "0x31a56e9e690c621ed21de08cb559e9524cdb8ed9",
       "n_window": 13,
       "n_total": 15,
-      "mean_p_z": 0.05000001711090722,
-      "max_p_z": 0.05000625363342891,
-      "elevation": -2.2770635649808912e-05,
+      "mean_p_z": 0.050000000000441316,
+      "max_p_z": 0.05000000002509332,
+      "elevation": -2.6527039799738306e-05,
       "anchored": true,
       "sufficiency": "prior-dominated"
     }
@@ -368,130 +368,129 @@
   },
   "top_trades": [
     {
-      "ts": 1767075091.0,
-      "iso": "2025-12-30T06:11:31Z",
-      "market": "0xbb8bfdef9052b2709557a6f8f28b23551e3134bfb86eca800211e2191703ee65",
-      "wallet": "0x2b9edb595ea75c118077c7d2c17d4852b0770db0",
-      "p_z": 0.06323433333828,
+      "ts": 1766715133.0,
+      "iso": "2025-12-26T02:12:13Z",
+      "market": "0xafc235557ace53ff0b0d2e93392314a7c3f3daab26a79050e985c11282f66df7",
+      "wallet": "0x7ab6ac0f0d6ca5a15ec57abeaf413d31c8cdfa77",
+      "p_z": 0.05031865189891979,
       "anchored": false
     },
     {
-      "ts": 1767075099.0,
-      "iso": "2025-12-30T06:11:39Z",
-      "market": "0xbb8bfdef9052b2709557a6f8f28b23551e3134bfb86eca800211e2191703ee65",
-      "wallet": "0xbf36df9171ba68b07334f024818df1d9bbef95ad",
-      "p_z": 0.06097069493941506,
+      "ts": 1766766183.0,
+      "iso": "2025-12-26T16:23:03Z",
+      "market": "0xafc235557ace53ff0b0d2e93392314a7c3f3daab26a79050e985c11282f66df7",
+      "wallet": "0x7ab6ac0f0d6ca5a15ec57abeaf413d31c8cdfa77",
+      "p_z": 0.05031718681155112,
       "anchored": false
     },
     {
-      "ts": 1767061483.0,
-      "iso": "2025-12-30T02:24:43Z",
-      "market": "0xbb8bfdef9052b2709557a6f8f28b23551e3134bfb86eca800211e2191703ee65",
-      "wallet": "0x0de61278e7467aba680659da5b40e122c16ddaa2",
-      "p_z": 0.059094873062165314,
+      "ts": 1766766953.0,
+      "iso": "2025-12-26T16:35:53Z",
+      "market": "0xafc235557ace53ff0b0d2e93392314a7c3f3daab26a79050e985c11282f66df7",
+      "wallet": "0x7ab6ac0f0d6ca5a15ec57abeaf413d31c8cdfa77",
+      "p_z": 0.05031511374328662,
       "anchored": false
     },
     {
-      "ts": 1766739699.0,
-      "iso": "2025-12-26T09:01:39Z",
+      "ts": 1766774889.0,
+      "iso": "2025-12-26T18:48:09Z",
+      "market": "0xafc235557ace53ff0b0d2e93392314a7c3f3daab26a79050e985c11282f66df7",
+      "wallet": "0x7ab6ac0f0d6ca5a15ec57abeaf413d31c8cdfa77",
+      "p_z": 0.05031306012890126,
+      "anchored": false
+    },
+    {
+      "ts": 1766786685.0,
+      "iso": "2025-12-26T22:04:45Z",
+      "market": "0xafc235557ace53ff0b0d2e93392314a7c3f3daab26a79050e985c11282f66df7",
+      "wallet": "0x7ab6ac0f0d6ca5a15ec57abeaf413d31c8cdfa77",
+      "p_z": 0.05031102561441679,
+      "anchored": false
+    },
+    {
+      "ts": 1766709013.0,
+      "iso": "2025-12-26T00:30:13Z",
+      "market": "0xafc235557ace53ff0b0d2e93392314a7c3f3daab26a79050e985c11282f66df7",
+      "wallet": "0x7ab6ac0f0d6ca5a15ec57abeaf413d31c8cdfa77",
+      "p_z": 0.050309477382543946,
+      "anchored": false
+    },
+    {
+      "ts": 1766793681.0,
+      "iso": "2025-12-27T00:01:21Z",
+      "market": "0xafc235557ace53ff0b0d2e93392314a7c3f3daab26a79050e985c11282f66df7",
+      "wallet": "0x7ab6ac0f0d6ca5a15ec57abeaf413d31c8cdfa77",
+      "p_z": 0.050309009856682935,
+      "anchored": false
+    },
+    {
+      "ts": 1767153135.0,
+      "iso": "2025-12-31T03:52:15Z",
+      "market": "0xafc235557ace53ff0b0d2e93392314a7c3f3daab26a79050e985c11282f66df7",
+      "wallet": "0x7ab6ac0f0d6ca5a15ec57abeaf413d31c8cdfa77",
+      "p_z": 0.05030701252294107,
+      "anchored": false
+    },
+    {
+      "ts": 1767427663.0,
+      "iso": "2026-01-03T08:07:43Z",
       "market": "0x7f3c6b9029a1a4a932509c147a2cc0762e1116b7a4568cde472908b29dd4889d",
-      "wallet": "0xfcc4e78ca3f229949b8106fb380bf14266853067",
-      "p_z": 0.05845537825498569,
+      "wallet": "0x750ca59fafbf837d939eca4cd241601a489c2fe3",
+      "p_z": 0.050291541723607586,
       "anchored": false
     },
     {
-      "ts": 1767425981.0,
-      "iso": "2026-01-03T07:39:41Z",
-      "market": "0xbb8bfdef9052b2709557a6f8f28b23551e3134bfb86eca800211e2191703ee65",
-      "wallet": "0x2b366034b69b64a444406b2db7ec1ff7869c473b",
-      "p_z": 0.05809640027196586,
+      "ts": 1766709027.0,
+      "iso": "2025-12-26T00:30:27Z",
+      "market": "0xafc235557ace53ff0b0d2e93392314a7c3f3daab26a79050e985c11282f66df7",
+      "wallet": "0xcb516a0c8b8ba2e42ff5c123e2f624d6cce6359d",
+      "p_z": 0.050253662124807384,
       "anchored": false
     },
     {
-      "ts": 1767425983.0,
-      "iso": "2026-01-03T07:39:43Z",
-      "market": "0xbb8bfdef9052b2709557a6f8f28b23551e3134bfb86eca800211e2191703ee65",
-      "wallet": "0x2b366034b69b64a444406b2db7ec1ff7869c473b",
-      "p_z": 0.05803517188967005,
+      "ts": 1766802399.0,
+      "iso": "2025-12-27T02:26:39Z",
+      "market": "0xafc235557ace53ff0b0d2e93392314a7c3f3daab26a79050e985c11282f66df7",
+      "wallet": "0x197040709ae61627d3685a8d6ce1f9e82e6b398d",
+      "p_z": 0.05014228351827904,
       "anchored": false
     },
     {
-      "ts": 1767426483.0,
-      "iso": "2026-01-03T07:48:03Z",
-      "market": "0xbb8bfdef9052b2709557a6f8f28b23551e3134bfb86eca800211e2191703ee65",
-      "wallet": "0x2b366034b69b64a444406b2db7ec1ff7869c473b",
-      "p_z": 0.05789465167526732,
+      "ts": 1766802421.0,
+      "iso": "2025-12-27T02:27:01Z",
+      "market": "0xafc235557ace53ff0b0d2e93392314a7c3f3daab26a79050e985c11282f66df7",
+      "wallet": "0x197040709ae61627d3685a8d6ce1f9e82e6b398d",
+      "p_z": 0.0501414704696031,
       "anchored": false
     },
     {
-      "ts": 1767426553.0,
-      "iso": "2026-01-03T07:49:13Z",
-      "market": "0xbb8bfdef9052b2709557a6f8f28b23551e3134bfb86eca800211e2191703ee65",
-      "wallet": "0x2b366034b69b64a444406b2db7ec1ff7869c473b",
-      "p_z": 0.05777033585007042,
+      "ts": 1766738631.0,
+      "iso": "2025-12-26T08:43:51Z",
+      "market": "0x580adc1327de9bf7c179ef5aaffa3377bb5cb252b7d6390b027172d43fd6f993",
+      "wallet": "0xb06069838d9442d857593bdebeb454dc0e629572",
+      "p_z": 0.05009137932401758,
       "anchored": false
     },
     {
-      "ts": 1767426553.0,
-      "iso": "2026-01-03T07:49:13Z",
-      "market": "0xbb8bfdef9052b2709557a6f8f28b23551e3134bfb86eca800211e2191703ee65",
-      "wallet": "0x2b366034b69b64a444406b2db7ec1ff7869c473b",
-      "p_z": 0.057692019202068595,
+      "ts": 1766917297.0,
+      "iso": "2025-12-28T10:21:37Z",
+      "market": "0x580adc1327de9bf7c179ef5aaffa3377bb5cb252b7d6390b027172d43fd6f993",
+      "wallet": "0xb06069838d9442d857593bdebeb454dc0e629572",
+      "p_z": 0.050090864862100584,
       "anchored": false
     },
     {
-      "ts": 1767427273.0,
-      "iso": "2026-01-03T08:01:13Z",
-      "market": "0xbb8bfdef9052b2709557a6f8f28b23551e3134bfb86eca800211e2191703ee65",
-      "wallet": "0x2b366034b69b64a444406b2db7ec1ff7869c473b",
-      "p_z": 0.05759898430777704,
-      "anchored": false
-    },
-    {
-      "ts": 1766963763.0,
-      "iso": "2025-12-28T23:16:03Z",
-      "market": "0x79801a0feefbc4c35df8f35d33583eef8ff2bd7a514c619929ac62e23c2cf93d",
-      "wallet": "0xd719eb46721f2618185c99c19d93ba609c01d8e5",
-      "p_z": 0.057081639299287265,
-      "anchored": false
-    },
-    {
-      "ts": 1766964977.0,
-      "iso": "2025-12-28T23:36:17Z",
-      "market": "0x79801a0feefbc4c35df8f35d33583eef8ff2bd7a514c619929ac62e23c2cf93d",
-      "wallet": "0x1a799c0af8a939ba4ed95df95188c2f357491ccb",
-      "p_z": 0.05675661496611819,
-      "anchored": false
-    },
-    {
-      "ts": 1766737949.0,
-      "iso": "2025-12-26T08:32:29Z",
-      "market": "0x7f3c6b9029a1a4a932509c147a2cc0762e1116b7a4568cde472908b29dd4889d",
-      "wallet": "0xa8af4c7923857533b687df9bf02115156e3a325e",
-      "p_z": 0.05619004417187069,
-      "anchored": false
-    },
-    {
-      "ts": 1767420919.0,
-      "iso": "2026-01-03T06:15:19Z",
-      "market": "0xbb8bfdef9052b2709557a6f8f28b23551e3134bfb86eca800211e2191703ee65",
-      "wallet": "0x2b366034b69b64a444406b2db7ec1ff7869c473b",
-      "p_z": 0.05586516963518466,
-      "anchored": false
-    },
-    {
-      "ts": 1766745899.0,
-      "iso": "2025-12-26T10:44:59Z",
-      "market": "0xbb8bfdef9052b2709557a6f8f28b23551e3134bfb86eca800211e2191703ee65",
-      "wallet": "0xa4bd8f49695cf5d55924aca4cc2694952874e8a2",
-      "p_z": 0.055854622878671115,
+      "ts": 1766917285.0,
+      "iso": "2025-12-28T10:21:25Z",
+      "market": "0xafc235557ace53ff0b0d2e93392314a7c3f3daab26a79050e985c11282f66df7",
+      "wallet": "0xb06069838d9442d857593bdebeb454dc0e629572",
+      "p_z": 0.05008942649387878,
       "anchored": false
     }
   ],
-  "cold_start": true,
-  "headline_claim": "No claim. This run was cold-started, so every P(Z) is the prior mean plus filter noise and neither the wallet ranking nor the per-trade timing carries information about the model. Re-run with `--warm-start <fitted VEM artifact>`.",
+  "cold_start": false,
+  "headline_claim": "The anchored wallet's 13 in-window trade(s) carry a mean P(Z) of 0.050 against a cluster baseline of 0.050 (elevation -0.000, peak 0.050), all of it before the public announcement at 2026-01-03T09:21:00Z. The wallet ranking is NOT the claim: with 15 trades in total this wallet is prior-dominated against the ARCHITECTURE.md 9.5 thresholds, so its rank 3347 of 6110 is largely a restatement of the prior and is reported for completeness only.",
   "caveats": [
-    "**COLD START \u2014 THIS RUN IS NOT A RESULT.** The scores provenance records `warm_start: null`. `stream_scoring.cold_start` leaves `theta_w` empty and the logistic coefficients uninformative, and `--n-refresh` defaults to never refreshing them, so every P(Z) is the prior mean plus filter noise and any ranking over it is a ranking of noise. Re-run `score_stream.py --replay` with `--warm-start <fitted VEM artifact>` before reading anything below as evidence about the model.",
     "**One case.** n = 1. Nothing here estimates a false-positive rate, a detection rate, or any quantity that generalizes. A score that lights up on the one labelled episode available is consistent with a useful detector and equally consistent with a detector that lights up often.",
     "**Post-hoc identification.** The markets, the wallet pattern and the window all come from a charging document written after the fact. Nobody pointed this detector at Polymarket in December 2025 and got an alert. The no-lookahead guarantee inherited from replay scoring is about the *scorer's state*, not about how the cluster was chosen.",
     "**No counterfactual.** There is no matched control episode \u2014 no market where the same news broke with no insider present \u2014 so the elevation reported here has no null it was tested against. The pre-registered permutation test lives in `src.analysis.event_study`; this module deliberately reports description, not a p-value.",
@@ -504,8 +503,8 @@
     "mode": "replay",
     "n_refresh": null,
     "output": "results/case_studies/van_dyke/scores.jsonl",
-    "wallet_index": null,
-    "warm_start": null
+    "wallet_index": "data/processed/wallet_index.json",
+    "warm_start": "results/plan5/warm_start_train.json"
   },
   "scores": "results/case_studies/van_dyke/scores.jsonl",
   "report": "results/case_studies/van_dyke/report.md",

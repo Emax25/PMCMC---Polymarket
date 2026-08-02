@@ -1,0 +1,45 @@
+16:25:11  INFO  validate_vem K=5 n_wallets=15528 restarts=1 psis_draws=100 n_jobs=1
+16:25:11  INFO  restart seed=42 …
+16:25:16  INFO  best restart: index=0 seed=42
+16:25:42  INFO  wrote results/plan5/warm_start_train.json
+=== VEM validation suite ===
+Markets K=5  n_wallets=15528  synthetic=False
+Restarts: 1  (seeds [42])
+estimate_betas=False
+
+Convergence: converged=True  1/1 restarts met tol=0.0001  0 hit the 50-iteration cap
+
+Per-restart:
+  seed=42: elbo=-34037.9140  iters=27  converged=True  rel_delta=8.63e-05  auc=n/a  beta_S_orig=0.0000  beta_Z_orig=0.0000
+
+Stability (max - min across restarts):
+  terminal_elbo : spread=0  mean=-34037.9  sd=0
+  pooled_auc    : spread=nan  mean=nan  sd=nan
+  beta_S_orig   : spread=0  mean=0  sd=0
+  beta_Z_orig   : spread=0  mean=0  sd=0
+  top-1553 wallet Jaccard (mean pairwise): nan
+  pooled-AUC spread threshold 0.05 -> unstable=False
+
+Held-out predictive LL (h=0.2, best restart seed=42):
+  pooled: total=-7235.1635  n=2000  mean=-3.6176
+    market 0: total=-1427.6215  n=400  mean=-3.5691
+    market 1: total=-1248.6452  n=400  mean=-3.1216
+    market 2: total=-1851.8644  n=400  mean=-4.6297
+    market 3: total=-1233.6605  n=400  mean=-3.0842
+    market 4: total=-1473.3720  n=400  mean=-3.6834
+
+PSIS (100 draws): psis_khat_laplace_vs_adf = 10.0729
+  bad (khat > 0.7): the importance weights have unbounded variance — the Laplace proposal does not cover this target. Read that as a statement about the proposal, not about the richness of the variational family: khat is only a family-adequacy measure once the proposal is centred at a mode of its own target, because a richer family centred at the same non-mode with the same curvature scores the same khat. Read `phi_centring_gradient` before concluding anything about the family.
+  scope: The target is the ADF-implied CONDITIONAL posterior p(phi | Y, theta_w_hat): theta_w is pinned at its fitted value for every draw, so nothing here integrates over wallet propensities and the diagnostic says nothing about theta_w uncertainty. Within that conditional, khat measures Laplace-shape adequacy for the ADF surface, not ADF's fidelity to the true posterior: q and the target are built on the same ADF surface, so any bias ADF itself carries is invisible here. khat is a statement about the variational family only once the proposal is centred at a mode of that conditional target — check `phi_centring_gradient` first, since a mis-centred proposal gives the same khat however rich the family is. A good khat is expected and is a necessary-not-sufficient check; simulation-based calibration (plan 2026-07-23-003) is the actual faithfulness test.
+
+Proposal centring (log-target gradient at the Laplace centre, in Laplace sds):
+    sigma2_0 : -31.627
+    sigma2_1 : -7.739
+    q_01     : +0.040
+    q_10     : -0.163
+    beta_S   : -2.552
+    beta_Z   : +0.014
+    tau2_0   : +3.951
+    tau2_1   : -0.395
+  worst: sigma2_0 at 31.627 sd  (a mode gives ~0; Gradient of the log PSIS target at the proposal centre, in units of nats per Laplace sd. The Laplace Gaussian is by construction stationary at its own centre, so the proposal is centred at a mode of its target only if every entry here is ~0. A large entry means khat is diagnosing the centring of the proposal, not the adequacy of the variational family.)
+  NOTE: Laplace curvature fallback used for ['beta_S', 'beta_Z']
