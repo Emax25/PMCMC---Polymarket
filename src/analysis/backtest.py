@@ -48,6 +48,19 @@ the variance is small, and the honest deflator is small too. Substituting a
 count-only deflator would inflate ``SR0`` and understate the strategy, which is
 the standard failure mode of this correction.
 
+Read the limit of that argument honestly, though. When the trial Sharpes are
+*identical* — which happens whenever every threshold on the grid selects the
+same trades, as it did on the first smoke run — the variance is exactly 0, so
+``SR0 = 0`` and ``DSR == PSR``. The correction has then not operated at all:
+the effective number of distinct trials was one, and no multiple-testing
+adjustment was applied. That is arithmetically right and it is *not* evidence
+that the strategy survived a multiplicity correction, so `DeflatedSharpe`
+carries ``trial_variance`` and the caller is expected to report a zero as
+"deflator inactive", never as "deflated and still significant". Note also that
+only the threshold is swept: the cost model, the hold rule, the embargo and the
+window were all chosen outside the trial family and are uncorrected by
+construction, so the disclosed trial count is a floor on the real search.
+
 **No lookahead** is inherited, not re-derived: every score consumed here comes
 from `scripts/score_stream.py --replay`, and `read_replay_provenance` (reused
 from `src.analysis.event_study`) refuses any score file whose sidecar does not

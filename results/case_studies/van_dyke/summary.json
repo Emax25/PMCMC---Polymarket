@@ -248,7 +248,9 @@
       "n_total": 108,
       "mean_p_z": 0.050312567244905446,
       "max_p_z": 0.05031865189891979,
+      "min_p_z": 0.05030701252294107,
       "elevation": 0.0002860402046643909,
+      "flat": false,
       "anchored": false,
       "sufficiency": "meaningful"
     },
@@ -258,7 +260,9 @@
       "n_total": 8,
       "mean_p_z": 0.050291541723607586,
       "max_p_z": 0.050291541723607586,
+      "min_p_z": 0.050291541723607586,
       "elevation": 0.00026501468336653095,
+      "flat": true,
       "anchored": false,
       "sufficiency": "prior-dominated"
     },
@@ -268,7 +272,9 @@
       "n_total": 6,
       "mean_p_z": 0.050253662124807384,
       "max_p_z": 0.050253662124807384,
+      "min_p_z": 0.050253662124807384,
       "elevation": 0.00022713508456632947,
+      "flat": true,
       "anchored": false,
       "sufficiency": "prior-dominated"
     },
@@ -278,7 +284,9 @@
       "n_total": 5,
       "mean_p_z": 0.05014187699394107,
       "max_p_z": 0.05014228351827904,
+      "min_p_z": 0.0501414704696031,
       "elevation": 0.0001153499537000155,
+      "flat": true,
       "anchored": false,
       "sufficiency": "prior-dominated"
     },
@@ -288,7 +296,9 @@
       "n_total": 9,
       "mean_p_z": 0.05009055689333231,
       "max_p_z": 0.05009137932401758,
+      "min_p_z": 0.05008942649387878,
       "elevation": 6.402985309125753e-05,
+      "flat": false,
       "anchored": false,
       "sufficiency": "prior-dominated"
     },
@@ -298,7 +308,9 @@
       "n_total": 11,
       "mean_p_z": 0.050081632810889204,
       "max_p_z": 0.050082391522457956,
+      "min_p_z": 0.050080738697616776,
       "elevation": 5.51057706481492e-05,
+      "flat": false,
       "anchored": false,
       "sufficiency": "prior-dominated"
     },
@@ -308,7 +320,9 @@
       "n_total": 3,
       "mean_p_z": 0.050072024098469704,
       "max_p_z": 0.050072024098469704,
+      "min_p_z": 0.050072024098469704,
       "elevation": 4.549705822864958e-05,
+      "flat": true,
       "anchored": false,
       "sufficiency": "prior-dominated"
     },
@@ -318,7 +332,9 @@
       "n_total": 1,
       "mean_p_z": 0.05007191700181003,
       "max_p_z": 0.05007191700181003,
+      "min_p_z": 0.05007191700181003,
       "elevation": 4.5389961568977066e-05,
+      "flat": true,
       "anchored": false,
       "sufficiency": "prior-dominated"
     },
@@ -328,7 +344,9 @@
       "n_total": 1,
       "mean_p_z": 0.050069839539522334,
       "max_p_z": 0.050069839539522334,
+      "min_p_z": 0.050069839539522334,
       "elevation": 4.3312499281279726e-05,
+      "flat": true,
       "anchored": false,
       "sufficiency": "prior-dominated"
     },
@@ -338,7 +356,9 @@
       "n_total": 44,
       "mean_p_z": 0.050058216655613975,
       "max_p_z": 0.05006504635244846,
+      "min_p_z": 0.05005138695877949,
       "elevation": 3.16896153729207e-05,
+      "flat": false,
       "anchored": false,
       "sufficiency": "weak"
     },
@@ -348,7 +368,9 @@
       "n_total": 15,
       "mean_p_z": 0.050000000000441316,
       "max_p_z": 0.05000000002509332,
+      "min_p_z": 0.04999999995247062,
       "elevation": -2.6527039799738306e-05,
+      "flat": true,
       "anchored": true,
       "sufficiency": "prior-dominated"
     }
@@ -489,13 +511,16 @@
     }
   ],
   "cold_start": false,
-  "headline_claim": "The anchored wallet's 13 in-window trade(s) carry a mean P(Z) of 0.050 against a cluster baseline of 0.050 (elevation -0.000, peak 0.050), all of it before the public announcement at 2026-01-03T09:21:00Z. The wallet ranking is NOT the claim: with 15 trades in total this wallet is prior-dominated against the ARCHITECTURE.md 9.5 thresholds, so its rank 3347 of 6110 is largely a restatement of the prior and is reported for completeness only.",
+  "anchor_untested": true,
+  "headline_claim": "No evidence either way. The anchored wallet's 13 in-window trade(s) all score P(Z) = 0.050000, a constant \u2014 the series spread is 7.26e-11, below the 1e-6 flatness tolerance. A constant cannot be elevated or unelevated, so this run does not show that the model fails to detect this trader; it shows that this configuration never gave the model a channel to detect them through. Check the warm-start artifact's `beta_S`, `beta_Z` and `estimate_betas`, and whether the wallet appears in the training wallet index, then re-run before drawing any conclusion about the detector.",
   "caveats": [
+    "**THE ANCHORED WALLET WAS NOT TESTED BY THIS RUN.** Its in-window P(Z) series is constant to within 1e-6, so no elevation computed from it is a measurement in either direction. Check the warm-start artifact before reading the ranking below: if it was fitted with `estimate_betas: false` then beta_S = beta_Z = 0 and the only per-trade channel left is `theta_w`, which sits at the prior mean for any wallet absent from the training index \u2014 a constant. This run therefore reports **no evidence either way** about whether the model detects this trader.",
     "**One case.** n = 1. Nothing here estimates a false-positive rate, a detection rate, or any quantity that generalizes. A score that lights up on the one labelled episode available is consistent with a useful detector and equally consistent with a detector that lights up often.",
     "**Post-hoc identification.** The markets, the wallet pattern and the window all come from a charging document written after the fact. Nobody pointed this detector at Polymarket in December 2025 and got an alert. The no-lookahead guarantee inherited from replay scoring is about the *scorer's state*, not about how the cluster was chosen.",
     "**No counterfactual.** There is no matched control episode \u2014 no market where the same news broke with no insider present \u2014 so the elevation reported here has no null it was tested against. The pre-registered permutation test lives in `src.analysis.event_study`; this module deliberately reports description, not a p-value.",
     "**Resolution-period contamination is not filtered.** The pull that feeds this study sets `--pre-resolution-days 0` (see the pull section), so the known over-flagging near resolution (ARCHITECTURE.md 9.5) is present in the data. Trades after the public announcement are outside the analysis window for exactly this reason, but the contamination is real and the in-window scores are not immune to a market already drifting toward its resolution.",
-    "**The anchor is a redacted pattern.** The complaint gives four leading and four trailing hex characters of the wallet address. A match is strong evidence but not a certified identification, and a run that matches zero or several wallets is inconclusive rather than negative."
+    "**The anchor is a redacted pattern.** The complaint gives four leading and four trailing hex characters of the wallet address. A match is strong evidence but not a certified identification, and a run that matches zero or several wallets is inconclusive rather than negative.",
+    "**Every score inherits the warm start's fit quality.** The scores are only as good as the VEM artifact named in the provenance section, and that fit's own diagnostics are not re-checked here. Read them at source: a fit with the betas not estimated, with the sigma2 order constraint binding, with a failed PSIS k-hat, or from a single un-jittered restart carries an initialization sensitivity that this case study reports nothing about and cannot correct for."
   ],
   "provenance": {
     "forgetting": 0.98,

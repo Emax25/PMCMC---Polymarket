@@ -84,6 +84,35 @@ _COLD_START_WARNING = (
     "before reading anything below as evidence about the model."
 )
 
+# Below this spread, an in-window score series is one value plus float noise.
+# 1e-6 is far above float64 accumulation error over a few thousand filter steps
+# and far below any P(Z) difference this project would ever call a signal, so
+# the two failure directions cannot both bite.
+_FLAT_SCORE_TOL = 1e-6
+
+# A warm start can be present and still leave the anchored wallet structurally
+# unscoreable. That is what the first warm-started run of this case study hit:
+# the fitted artifact had `estimate_betas: false` (so beta_S = beta_Z = 0, which
+# deletes the size and persistence channels) and sigma2_0 == sigma2_1 to machine
+# precision (the P10 order-constraint bind, confirmed on real data), while the
+# anchored wallet was absent from the training wallet index and so held theta_w
+# at the Beta(1, 19) prior mean. logit(pi_Z) was then a constant and every one
+# of its trades scored 0.050000. The run cannot distinguish "the model looked
+# and saw nothing" from "the model was never able to look", so the report must
+# not report the first. This is a *different* failure from a cold start — the
+# provenance looks healthy — which is why it is detected from the scores
+# themselves rather than from the presence of a warm-start path.
+_UNTESTED_ANCHOR_WARNING = (
+    "**THE ANCHORED WALLET WAS NOT TESTED BY THIS RUN.** Its in-window P(Z) "
+    "series is constant to within 1e-6, so no elevation computed from it is a "
+    "measurement in either direction. Check the warm-start artifact before "
+    "reading the ranking below: if it was fitted with `estimate_betas: false` "
+    "then beta_S = beta_Z = 0 and the only per-trade channel left is "
+    "`theta_w`, which sits at the prior mean for any wallet absent from the "
+    "training index — a constant. This run therefore reports **no evidence "
+    "either way** about whether the model detects this trader."
+)
+
 _CAVEATS = (
     "**One case.** n = 1. Nothing here estimates a false-positive rate, a "
     "detection rate, or any quantity that generalizes. A score that lights up "
@@ -110,6 +139,13 @@ _CAVEATS = (
     "and four trailing hex characters of the wallet address. A match is "
     "strong evidence but not a certified identification, and a run that "
     "matches zero or several wallets is inconclusive rather than negative.",
+    "**Every score inherits the warm start's fit quality.** The scores are "
+    "only as good as the VEM artifact named in the provenance section, and "
+    "that fit's own diagnostics are not re-checked here. Read them at source: "
+    "a fit with the betas not estimated, with the sigma2 order constraint "
+    "binding, with a failed PSIS k-hat, or from a single un-jittered restart "
+    "carries an initialization sensitivity that this case study reports "
+    "nothing about and cannot correct for.",
 )
 
 
@@ -700,6 +736,11 @@ class WalletRow:
             about total evidence, not about the window.
         mean_p_z: Mean ``P(Z)`` over the in-window trades.
         max_p_z: Largest in-window ``P(Z)``.
+        min_p_z: Smallest in-window ``P(Z)``. Carried alongside ``max_p_z`` so
+            the score *dispersion* is visible in the artifact: a wallet whose
+            scores never move is one the run measured nothing about, and that
+            has to be readable off the JSON rather than inferred (see
+            `WalletRow.is_flat` and `CaseStudySummary.anchor_is_untested`).
         elevation: ``mean_p_z`` minus the cluster-wide baseline mean, so a
             wallet is read against the cluster's own score level.
         anchored: Whether the manifest's wallet anchor matches this address.
@@ -711,9 +752,21 @@ class WalletRow:
     n_total: int
     mean_p_z: float
     max_p_z: float
+    min_p_z: float
     elevation: float
     anchored: bool
     sufficiency: str
+
+    @property
+    def is_flat(self) -> bool:
+        """Whether this wallet's in-window scores carry no dispersion at all.
+
+        The threshold is numerical, not statistical: scores this close together
+        are one value plus float noise. A flat series means the score never
+        responded to anything the wallet did, so no elevation computed from it
+        — in either direction — is a measurement.
+        """
+        return (self.max_p_z - self.min_p_z) < _FLAT_SCORE_TOL
 
     def to_dict(self) -> dict[str, Any]:
         """JSON-serializable view."""
@@ -723,7 +776,9 @@ class WalletRow:
             "n_total": self.n_total,
             "mean_p_z": self.mean_p_z,
             "max_p_z": self.max_p_z,
+            "min_p_z": self.min_p_z,
             "elevation": self.elevation,
+            "flat": self.is_flat,
             "anchored": self.anchored,
             "sufficiency": self.sufficiency,
         }
@@ -774,6 +829,7 @@ def _wallet_rows(
                 n_total=n_total,
                 mean_p_z=mean_p_z,
                 max_p_z=float(np.max(scores)),
+                min_p_z=float(np.min(scores)),
                 elevation=mean_p_z - baseline_mean,
                 anchored=manifest.anchor.matches(address),
                 sufficiency=sufficiency_label(n_total),
@@ -858,6 +914,40 @@ class CaseStudySummary:
         return self.provenance.get("warm_start") is None
 
     @property
+    def anchor_is_untested(self) -> bool:
+        """Whether the run carries no information about the anchored wallet.
+
+        True when exactly one wallet matched the anchor, it has in-window
+        trades, and those trades' scores are flat (`WalletRow.is_flat`). The
+        distinction this guards is the one the whole case study turns on: a
+        flat series means the model was never able to look, which is not the
+        same finding as the model looking and seeing nothing, and only the
+        second would be evidence about the detector.
+
+        Read off the scores rather than the warm-start artifact on purpose —
+        the degeneracy has several possible causes (betas not estimated, an
+        unseen wallet pinned at the theta_w prior, a bound sigma2 order
+        constraint) and the constant series is the one symptom common to all
+        of them.
+        """
+        return len(self.anchored_rows) == 1 and self.anchored_rows[0].is_flat
+
+    @property
+    def caveats(self) -> tuple[str, ...]:
+        """The caveat list, with any run-invalidating banner in front.
+
+        One source for the report and the JSON so the two cannot drift, and
+        ordered worst-first: a banner says the run is not a result, which a
+        reader has to see before the caveats that merely qualify one.
+        """
+        banners = []
+        if self.is_cold_start:
+            banners.append(_COLD_START_WARNING)
+        if self.anchor_is_untested:
+            banners.append(_UNTESTED_ANCHOR_WARNING)
+        return (*banners, *_CAVEATS)
+
+    @property
     def anchored_rows(self) -> tuple[WalletRow, ...]:
         """In-window rows for anchored wallets, in ranking order."""
         return tuple(row for row in self.wallets if row.anchored)
@@ -918,12 +1008,9 @@ class CaseStudySummary:
             },
             "top_trades": [dict(row) for row in self.top_trades],
             "cold_start": self.is_cold_start,
+            "anchor_untested": self.anchor_is_untested,
             "headline_claim": headline_claim(self),
-            "caveats": (
-                [_COLD_START_WARNING, *_CAVEATS]
-                if self.is_cold_start
-                else list(_CAVEATS)
-            ),
+            "caveats": list(self.caveats),
             "provenance": self.provenance,
         }
 
@@ -1005,6 +1092,20 @@ def headline_claim(summary: CaseStudySummary) -> str:
             "The anchored wallet traded the cluster but not inside the "
             "analysis window, so it carries no in-window score and this run "
             "supports no timing claim about it."
+        )
+    if row.is_flat:
+        return (
+            f"No evidence either way. The anchored wallet's {row.n_window} "
+            f"in-window trade(s) all score P(Z) = {row.mean_p_z:.6f}, a "
+            f"constant — the series spread is "
+            f"{row.max_p_z - row.min_p_z:.2e}, below the 1e-6 flatness "
+            "tolerance. A constant cannot be elevated or unelevated, so this "
+            "run does not show that the model fails to detect this trader; it "
+            "shows that this configuration never gave the model a channel to "
+            "detect them through. Check the warm-start artifact's `beta_S`, "
+            "`beta_Z` and `estimate_betas`, and whether the wallet appears in "
+            "the training wallet index, then re-run before drawing any "
+            "conclusion about the detector."
         )
     rank = summary.rank_of(row.wallet)
     lead = (
@@ -1350,8 +1451,21 @@ def _sufficiency_section(summary: CaseStudySummary) -> list[str]:
             "this cluster. That is an order of magnitude below the threshold "
             "at which this project's own wallet posterior means anything, so "
             "**the wallet ranking above is prior-dominated and is not the "
-            "result of this case study.** The headline claim rests on the "
-            "per-trade P(Z) timing evidence in the next section.",
+            "result of this case study.**",
+            "",
+            (
+                # Only promise the timing section when it can deliver. With a
+                # flat anchored series the next section shows a constant, and
+                # pointing at it as "the evidence" would dress up a structural
+                # zero as a finding.
+                "Nor does the per-trade timing section rescue it: the "
+                "anchored wallet's scores are constant (see the banner above), "
+                "so that section describes the cluster, not the charged "
+                "trader."
+                if summary.anchor_is_untested
+                else "The headline claim rests on the per-trade P(Z) timing "
+                "evidence in the next section."
+            ),
             "",
             f"**Headline claim.** {headline_claim(summary)}",
         ],
@@ -1433,11 +1547,12 @@ def _pull_section(summary: CaseStudySummary) -> list[str]:
 
 
 def _caveats_section(summary: CaseStudySummary) -> list[str]:
-    """Build the honest-caveats section, cold-start warning first when it applies."""
-    caveats = (
-        (_COLD_START_WARNING, *_CAVEATS) if summary.is_cold_start else _CAVEATS
-    )
-    return [SECTION_CAVEATS, "", *(f"- {caveat}" for caveat in caveats)]
+    """Build the honest-caveats section, run-invalidating banners first."""
+    return [
+        SECTION_CAVEATS,
+        "",
+        *(f"- {caveat}" for caveat in summary.caveats),
+    ]
 
 
 def format_report(summary: CaseStudySummary) -> str:
@@ -1465,6 +1580,8 @@ def format_report(summary: CaseStudySummary) -> str:
     ]
     if summary.is_cold_start:
         lines.extend([_COLD_START_WARNING, ""])
+    if summary.anchor_is_untested:
+        lines.extend([_UNTESTED_ANCHOR_WARNING, ""])
     for section in (
         _case_section(summary),
         _markets_section(summary),

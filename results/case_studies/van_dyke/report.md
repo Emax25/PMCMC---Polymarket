@@ -4,6 +4,8 @@ An externally labelled insider episode — the only kind of ground truth this pr
 
 Manifest: `results/case_studies/van_dyke/markets.json` (schema v1)
 
+**THE ANCHORED WALLET WAS NOT TESTED BY THIS RUN.** Its in-window P(Z) series is constant to within 1e-6, so no elevation computed from it is a measurement in either direction. Check the warm-start artifact before reading the ranking below: if it was fitted with `estimate_betas: false` then beta_S = beta_Z = 0 and the only per-trade channel left is `theta_w`, which sits at the prior mean for any wallet absent from the training index — a constant. This run therefore reports **no evidence either way** about whether the model detects this trader.
+
 ## 1. Case and sources
 
 **U.S. v. Gannon Ken Van Dyke**
@@ -92,9 +94,11 @@ ARCHITECTURE.md 9.5 fixes the reliability thresholds for the per-wallet posterio
 
 - Anchored wallet `0x31a56e9e690c621ed21de08cb559e9524cdb8ed9`: 15 trade(s) total, 13 in window -> **prior-dominated**.
 
-The charging documents describe on the order of ten purchases in this cluster. That is an order of magnitude below the threshold at which this project's own wallet posterior means anything, so **the wallet ranking above is prior-dominated and is not the result of this case study.** The headline claim rests on the per-trade P(Z) timing evidence in the next section.
+The charging documents describe on the order of ten purchases in this cluster. That is an order of magnitude below the threshold at which this project's own wallet posterior means anything, so **the wallet ranking above is prior-dominated and is not the result of this case study.**
 
-**Headline claim.** The anchored wallet's 13 in-window trade(s) carry a mean P(Z) of 0.050 against a cluster baseline of 0.050 (elevation -0.000, peak 0.050), all of it before the public announcement at 2026-01-03T09:21:00Z. The wallet ranking is NOT the claim: with 15 trades in total this wallet is prior-dominated against the ARCHITECTURE.md 9.5 thresholds, so its rank 3347 of 6110 is largely a restatement of the prior and is reported for completeness only.
+Nor does the per-trade timing section rescue it: the anchored wallet's scores are constant (see the banner above), so that section describes the cluster, not the charged trader.
+
+**Headline claim.** No evidence either way. The anchored wallet's 13 in-window trade(s) all score P(Z) = 0.050000, a constant — the series spread is 7.26e-11, below the 1e-6 flatness tolerance. A constant cannot be elevated or unelevated, so this run does not show that the model fails to detect this trader; it shows that this configuration never gave the model a channel to detect them through. Check the warm-start artifact's `beta_S`, `beta_Z` and `estimate_betas`, and whether the wallet appears in the training wallet index, then re-run before drawing any conclusion about the detector.
 
 ## 5. Per-trade P(Z) timing evidence
 
@@ -148,8 +152,10 @@ Scores provenance: mode='replay', input='data/case_studies/van_dyke/trades.jsonl
 
 ## 8. Caveats
 
+- **THE ANCHORED WALLET WAS NOT TESTED BY THIS RUN.** Its in-window P(Z) series is constant to within 1e-6, so no elevation computed from it is a measurement in either direction. Check the warm-start artifact before reading the ranking below: if it was fitted with `estimate_betas: false` then beta_S = beta_Z = 0 and the only per-trade channel left is `theta_w`, which sits at the prior mean for any wallet absent from the training index — a constant. This run therefore reports **no evidence either way** about whether the model detects this trader.
 - **One case.** n = 1. Nothing here estimates a false-positive rate, a detection rate, or any quantity that generalizes. A score that lights up on the one labelled episode available is consistent with a useful detector and equally consistent with a detector that lights up often.
 - **Post-hoc identification.** The markets, the wallet pattern and the window all come from a charging document written after the fact. Nobody pointed this detector at Polymarket in December 2025 and got an alert. The no-lookahead guarantee inherited from replay scoring is about the *scorer's state*, not about how the cluster was chosen.
 - **No counterfactual.** There is no matched control episode — no market where the same news broke with no insider present — so the elevation reported here has no null it was tested against. The pre-registered permutation test lives in `src.analysis.event_study`; this module deliberately reports description, not a p-value.
 - **Resolution-period contamination is not filtered.** The pull that feeds this study sets `--pre-resolution-days 0` (see the pull section), so the known over-flagging near resolution (ARCHITECTURE.md 9.5) is present in the data. Trades after the public announcement are outside the analysis window for exactly this reason, but the contamination is real and the in-window scores are not immune to a market already drifting toward its resolution.
 - **The anchor is a redacted pattern.** The complaint gives four leading and four trailing hex characters of the wallet address. A match is strong evidence but not a certified identification, and a run that matches zero or several wallets is inconclusive rather than negative.
+- **Every score inherits the warm start's fit quality.** The scores are only as good as the VEM artifact named in the provenance section, and that fit's own diagnostics are not re-checked here. Read them at source: a fit with the betas not estimated, with the sigma2 order constraint binding, with a failed PSIS k-hat, or from a single un-jittered restart carries an initialization sensitivity that this case study reports nothing about and cannot correct for.

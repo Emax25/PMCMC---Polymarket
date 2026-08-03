@@ -260,6 +260,16 @@ def _run_report(manifest: CaseManifest, args: argparse.Namespace) -> int:
             args.scores,
         )
 
+    if summary.anchor_is_untested:
+        log.warning(
+            "the anchored wallet's in-window P(Z) is CONSTANT, so %s tests "
+            "nothing about it: a constant cannot be elevated or unelevated. "
+            "This is not a negative result. Check the warm start's beta_S / "
+            "beta_Z / estimate_betas and whether the wallet is in the "
+            "training wallet index.",
+            args.scores,
+        )
+
     figures: list[str] = []
     if not args.no_figures:
         figures = save_figures(summary, directory=args.out_dir / FIGURE_SUBDIR)

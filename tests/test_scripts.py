@@ -2454,6 +2454,89 @@ def test_case_study_headline_leans_on_timing_not_rank_when_warm_started(tmp_path
     assert claim.index("elevation") < claim.index("rank")
 
 
+def _flat_anchor_trades(manifest, *, p_z: float = 0.05) -> object:
+    """Scored cluster trades whose anchored wallet never moves off ``p_z``.
+
+    Reproduces the degeneracy the real 2026-08-02 warm start hit: the anchored
+    wallet is unseen by the fit, so its ``theta_w`` sits at the prior mean, and
+    with ``estimate_betas: false`` there is no other per-trade channel. The
+    other wallets vary, so a flat *cluster* is not what is being detected.
+    """
+    n = 40
+    ts = np.array([_CASE_T0 + _CASE_STEP * i for i in range(n)], dtype=float)
+    anchored = {10, 12, 14, 16}
+    wallet = np.array(
+        [
+            _CASE_ANCHOR_WALLET if i in anchored else _CASE_WALLETS[i % 3]
+            for i in range(n)
+        ]
+    )
+    scores = np.array(
+        [p_z if i in anchored else p_z + 0.01 * ((i % 5) + 1) for i in range(n)]
+    )
+    return case_study_lib.ScoredTrades(
+        ts=ts,
+        p_z=scores,
+        market=np.array([_CASE_MARKET] * n),
+        wallet=wallet,
+    )
+
+
+def test_case_study_refuses_a_negative_result_when_the_anchor_never_moves(tmp_path):
+    """A constant anchored series is 'no evidence', never 'the model missed it'.
+
+    The distinction this pins is the one the case study exists to make. A flat
+    P(Z) means no data configuration could have moved the score, so reading it
+    as a failed detection would report a structural zero as a measurement.
+    """
+    manifest = case_study_lib.load_manifest(_write_case_manifest(tmp_path))
+
+    summary = case_study_lib.run_case_study(
+        _flat_anchor_trades(manifest),
+        manifest,
+        provenance={"mode": "replay", "warm_start": "results/warm_start.json"},
+    )
+
+    assert summary.is_cold_start is False, "the degeneracy must not need a cold start"
+    assert summary.anchor_is_untested is True
+    row = summary.anchored_rows[0]
+    assert row.is_flat is True
+    assert row.to_dict()["flat"] is True
+
+    claim = case_study_lib.headline_claim(summary)
+    assert claim.startswith("No evidence either way.")
+    assert "does not show that the model fails to detect" in claim
+
+    payload = summary.to_dict()
+    assert payload["anchor_untested"] is True
+    assert "NOT TESTED" in payload["caveats"][0]
+    report = case_study_lib.format_report(summary)
+    assert "THE ANCHORED WALLET WAS NOT TESTED" in report
+    # The promise of timing evidence must be withdrawn, not left dangling.
+    assert "The headline claim rests on the per-trade" not in report
+
+
+def test_case_study_keeps_the_normal_headline_when_the_anchor_does_move(tmp_path):
+    """Guard the flatness check against firing on a wallet that really varies."""
+    manifest = case_study_lib.load_manifest(_write_case_manifest(tmp_path))
+    trades = _flat_anchor_trades(manifest)
+    # One anchored trade moves by far more than the 1e-6 tolerance.
+    anchored = trades.wallet == _CASE_ANCHOR_WALLET
+    trades.p_z[np.flatnonzero(anchored)[0]] = 0.4
+
+    summary = case_study_lib.run_case_study(
+        trades,
+        manifest,
+        provenance={"mode": "replay", "warm_start": "results/warm_start.json"},
+    )
+
+    assert summary.anchor_is_untested is False
+    assert summary.anchored_rows[0].is_flat is False
+    claim = case_study_lib.headline_claim(summary)
+    assert not claim.startswith("No evidence either way.")
+    assert "NOT TESTED" not in case_study_lib.format_report(summary)
+
+
 def test_case_study_reports_a_manifest_market_with_no_trades(tmp_path):
     """A documented market the pull missed is named, not silently dropped."""
     manifest = _write_case_manifest(tmp_path)

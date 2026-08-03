@@ -112,13 +112,30 @@ REPLAY_MODE = "replay"
 #
 # Detection saturates at W >= 4 d, once the window is at least as long as the
 # burst; below that the window averages too few insider trades to clear the
-# null's tail. Size stays nominal out to 7 d and inflates at 10 d, where the
+# null's tail. Size stays nominal out to 7 d and is highest at 10 d, where the
 # window is a third of the market's history and the time-shift null has almost
 # no room left to place a comparison window. 5 d is chosen in the *interior* of
 # the [4 d, 7 d] plateau rather than at an edge, so a real burst somewhat
 # shorter or longer than the synthetic one still lands inside it. At the locked
 # setting the null arm rejected 2/60 (binomial p = 0.77 against the nominal
 # 0.05) and its p-values are indistinguishable from uniform (KS p = 0.16).
+#
+# Two limits on how hard this table can be read, both of which cut toward
+# keeping the choice conservative rather than overturning it:
+#
+#   1. 60 replicates per arm gives SE ~ 0.028 on a size estimate, so 0.033,
+#      0.050 and 0.117 are not separated by this sweep. The 10 d row is
+#      nominally p = 0.030 one-sided, but across the six windows swept that is
+#      ~0.18 Bonferroni-adjusted — suggestive, not established. Since detection
+#      is 1.000 for every W in {4, 5, 7, 10}, picking 5 d is really a judgement
+#      about plausible burst duration (4.2 d synthetic), not a calibrated
+#      optimum, and the plateau language should be read that way.
+#   2. Power here is an *oracle-regime* number. `_calibration_params` uses
+#      beta_S = 0.6, beta_Z = 1.0 and tau2_1/tau2_0 = 0.1 with an oracle warm
+#      start — a Z channel far stronger than any fit yet obtained on real data
+#      (the 2026-08-02 warm start came back with beta_S = beta_Z = 0). Real-data
+#      power at W = 5 d is therefore unmeasured, and "detection 1.000" must not
+#      be quoted as a property of the detector on real markets.
 LOCKED_WINDOW_S = 5.0 * DAY_SECONDS
 LOCKED_EMBARGO_S = 1.0 * DAY_SECONDS
 
