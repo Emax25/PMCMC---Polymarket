@@ -207,6 +207,14 @@ $\phi = (\sigma^2_0, \sigma^2_1, q_{01}, q_{10}, \beta_S, \beta_Z, \tau^2_0, \ta
 
 **Spec vs. implementation:** the VEM M-step centers/standardizes the logistic covariates internally (Gelman et al. 2008) and reports coefficients on the original scale — the model spec above is unchanged by this. Priors on $\phi$ live in one place: `PhiPrior` in `config/default_params.py` (shared by the M-step, the Laplace layer and PSIS).
 
+**Anonymous-venue mode (2026-08-03).** `ModelParams.anonymous` replaces the per-wallet offset with one estimated market-level intercept $\alpha$, for venues with no persistent account key (Kalshi — §9.6):
+
+```
+logit(π^Z_i) = α + β_S log(S/S̄) + β_Z 1{Z_{i-1}=1}
+```
+
+$\theta_w$ plays no role there. One flag, four consumers (`synthetic.py`, `variational_em.py`, `adf_filter.py`, `online_scorer.py`); the single switch is `config/default_params.z_logit_level()`, and `warm_start(anonymous=True)` seeds it. Prior: `PhiPrior.alpha_cauchy_scale = 10.0` — Cauchy(0, 10) kept after a 24-seed oracle-$q(Z)$ recovery sweep (α bias −0.161 / −0.043 / +0.012 at $T$ = 200 / 1000 / 3000; KTD2). Wallet mode stays the default and is bit-identical (pinned fixture + frozen-limit regression).
+
 ### 5.4 Outputs
 
 1. $\mathbb{P}(Z_i=1 \mid \mathcal{D})$ — anomaly / trading signal
@@ -297,15 +305,17 @@ ranking, `theta_w` Spearman). Run before/after hot-path changes. NB: cProfile
 config/default_params.py      # presets + PhiPrior (single authoritative prior spec)
 src/utils/transforms.py
 src/data/polymarket_api.py    # Gamma + Data API (historical); + fetch_trades_windowed
+src/data/kalshi_api.py        # Kalshi public GetTrades (no auth); wallet = None (§9.6)
 src/data/rtds.py              # RTDS websocket live trade adapter
 src/data/trade_stream.py      # trade-stream ordering / corruption policy
 src/data/preprocess.py
 src/data/synthetic.py         # + params_from_prior / prior-predictive generator mode
 src/inference/{kalman,smc,csmc,particle_gibbs,ipmcmc,variational_em,laplace,parameter_updates,diagnostics}.py
 src/inference/{adf_filter,online_scorer,stream_scoring}.py
-src/analysis/{prefilter,results,plots,validation,sbc}.py
+src/analysis/{prefilter,results,plots,validation,sbc,event_study,case_study,backtest}.py
 scripts/{_shortlist,_runner,pull_data,run_pg,run_ipmcmc,benchmark,validate_vem,pareto,eval_c4,make_figures}.py
 scripts/{stream_trades,score_stream,sbc}.py
+scripts/{pull_kalshi,event_study,case_study,backtest}.py
 tests/
 Monte_Carlo_Simulation/       # LaTeX paper
 agent_reference/              # ARCHITECTURE.md + STATUS.md + CODE_QUALITY.md
@@ -335,7 +345,12 @@ class MarketData:
 - `src/data/rtds.py` — RTDS websocket live adapter (§9)
 - `src/data/trade_stream.py` — ordering/corruption policy for trade streams: `iter_jsonl`, `read_replay`, `tail_live`, `OutOfOrderTradeError`
 - `src/analysis/sbc.py` — SBC replicate harness + rank-uniformity/coverage analysis; JSONL store, **schema v2 with an `(L, size, prior)` regime guard** (cross-regime stores are refused, not merged)
-- `variational_em.update_beta_irls` — **PUBLIC** (cross-module contract with `online_scorer`); do not re-privatize
+- `variational_em.update_beta_irls` — **PUBLIC** (cross-module contract with `online_scorer`); do not re-privatize. Returns an `IRLSFit` NamedTuple; the design gains a third (intercept) column in anonymous mode, and the fitted level surfaces as `VEMOutput.alpha_orig`
+- `OnlineScorer.step_trade` — anonymous-mode scorer seam, `{ts, p, S, side}`, no wallet: the documented import point for the external Kalshi trading system (§17)
+- `src/data/kalshi_api.py` — Kalshi public `GetTrades` client + normalization to the `RawTrade` schema with `wallet = None` (§9.6). `RawTrade.wallet` is now `str | None`; `clean_trades(require_wallet=…)` gates it
+- `src/analysis/event_study.py` — no-lookahead event study: one pre-registered primary statistic (mean `P(Z)` elevation over `[t_close − W, t_close − w]`) against a within-market time-shifted-window permutation null; `WindowSpec.is_locked` marks any non-locked window "NOT LOCKED - EXPLORATORY". Max-elevation and cross-market shuffle are labeled robustness only. Permutation RNG keyed on a blake2b digest of the market id
+- `src/analysis/case_study.py` — manifest-driven labeled-case report (`results/case_studies/van_dyke/markets.json`). `WalletRow.min_p_z` / `is_flat` and `CaseStudySummary.anchor_is_untested` detect a constant `logit π^Z` so a flat score is never read as a negative result (§14)
+- `src/analysis/backtest.py` — threshold-entry PoC backtest: spread + Kalshi fee at cent granularity, purged + embargoed walk-forward, deflated Sharpe from the empirical variance across trial Sharpes (Bailey & López de Prado 2014)
 
 ---
 
@@ -346,6 +361,7 @@ class MarketData:
 | Gamma | Metadata, slug → conditionId |
 | Data | **Sole HISTORICAL / backfill trade source** (`data-api.polymarket.com/trades`) |
 | RTDS | **Live counterpart** — `wss://ws-live-data.polymarket.com`, `activity/trades` topic, no auth; `src/data/rtds.py`. First-party Polymarket feed, so resolved decision #9 (Data API only, no Goldsky/CLOB) is unchanged in spirit |
+| Kalshi | **Anonymous-venue trade source** — public `GetTrades`, no auth; `src/data/kalshi_api.py` (§9.6) |
 
 **Backfill:** `fetch_trades_windowed` walks timestamp windows to get full history past the
 server offset ceiling — dedupe on `transaction_hash`, offset reset per window. Exposed as
@@ -387,6 +403,17 @@ keepalives, not malformed messages.
 
 - **Resolution-period over-flagging:** Resolved markets pin at 0/1; model assigns low density → inflated $P(Z=1)$ near close. P1 adds pre-resolution filter; until then, interpret tail trades cautiously.
 - **Wallet posteriors:** Meaningful when `n_trades` ≥ ~100; prior-dominated below ~20. Filter rankings via `wallet_ranking()` output.
+- **VPIN (`prefilter.py`) is a gating signal only**, never a detector (filter-only ablation GATE FAIL, AUC 0.524). `vpin_scores(..., sides=)` uses the native taker side when present with a per-trade fallback to the price-change proxy; `vpin_robustness` reports both classifications. The Andersen–Bondarenko caveat applies, and any analysis using VPIN controls for volume (`volume_controlled_scores`, OLS residualization on log volume). Default behavior is golden-locked at rtol=0/atol=0.
+
+### 9.6 Kalshi adapter (public `GetTrades`) — added 2026-08-03
+
+`src/data/kalshi_api.py` + `scripts/pull_kalshi.py`; public and unauthenticated, normalizing to the same `RawTrade` schema as the Polymarket path.
+
+- **No identity (TESTED INVARIANT).** Kalshi's public feed carries no account key, so every normalized row has `wallet = None`. Wallet-nullability is the anonymous-mode signal at load time (KTD3): `RawTrade.wallet: str | None`, `clean_trades(require_wallet=…)`, explicit CLI override.
+- **Pagination:** opaque `cursor`; an **empty-string cursor means exhausted** (not a missing key). 429/5xx backoff mirrors `polymarket_api.py`.
+- **Live schema ≠ documented schema (VERIFIED live 2026-08-01):** `yes_price_dollars` / `no_price_dollars` are decimal-string **DOLLARS**, not integer cents; `count_fp` is a fractional-contract string; `created_time` is RFC-3339 with sub-second precision, not UNIX seconds. The parser prefers the live fields and falls back to the legacy cents/integer form.
+- **Taker fee:** `ceil(0.07 · C · p · (1 − p))` in **CENTS** (C = contracts) — the cost model consumed by `backtest.py`.
+- Sample pull: `KXZELENSKYYOUT-26JUL01`, 40 raw → 29 rows.
 
 ---
 
@@ -408,6 +435,10 @@ python -m scripts.stream_trades --markets <cond_id>          # live RTDS capture
 python -m scripts.score_stream --replay trades.jsonl \
   --warm-start results/warm_start.json --output scores.jsonl # per-trade P(Z|D<=i)
 python -m scripts.sbc --n-sims 200 --n-jobs 8                 # SBC replicates (blocked — P8/P11)
+python -m scripts.pull_kalshi --tickers KXZELENSKYYOUT-26JUL01 # Kalshi public trades → normalized schema
+python -m scripts.event_study --scores scores.jsonl           # no-lookahead P(Z)-elevation test
+python -m scripts.case_study --manifest results/case_studies/van_dyke/markets.json
+python -m scripts.backtest --scores scores.jsonl              # costed deflated-Sharpe PoC
 python -m pytest tests/ -q
 ```
 
@@ -428,6 +459,10 @@ python -m pytest tests/ -q
 - `stream_trades.py` — live RTDS capture. `--markets` (condition IDs), `--parquet-every N` (rolling Parquet flush), `--max-trades N`, `--stale-after S` (reconnect on a silent socket); clean SIGINT shutdown that flushes before exit.
 - `score_stream.py` — streaming insider scorer over `StreamScorer`. `--replay FILE` / `--live` (mutually exclusive), `--warm-start` (batch VEM artifact), `--forgetting` (`rho` decay), `--n-refresh` (M-step refresh cadence). Writes a scores JSONL plus a **deterministic `<output>.meta.json` sidecar**; in live mode it pre-seeds the dedupe set from an existing output so a restart skips already-scored trades.
 - `sbc.py` — SBC replicate harness. `--n-sims`, `--n-jobs` (joblib), `--resume` (append to the JSONL store), `--analyze` (rank-uniformity + coverage tables and figures). **Refuses cross-regime stores** (schema-v2 `(L, size, prior)` guard). The coverage table prints Wilson-CI verdicts including `pass (underpowered)`. Currently non-executable end to end: `default_sbc_prior()` fails fast on the improper `tau2` prior (STATUS P8/P11).
+- `pull_kalshi.py` — Kalshi public `GetTrades` pull, mirroring `pull_data` conventions (tickers, output dir, pre-resolution filter); every output row carries `wallet = None` (§9.6).
+- `event_study.py` — pre-registered mean-`P(Z)`-elevation test vs the within-market time-shift permutation null. Window **W = 5 d / w = 1 d is LOCKED** (locked on synthetic before any real run); any other window is reported "NOT LOCKED - EXPLORATORY". Refuses score files whose `score_stream` sidecar is not replay-mode.
+- `case_study.py` — manifest → pull → replay → report for the labeled Van Dyke / Maduro cluster. Warns when the anchored wallet's `logit π^Z` is flat, i.e. the case is untested rather than negative (§14).
+- `backtest.py` — costed threshold-entry backtest with purged + embargoed walk-forward and deflated Sharpe. Detection PoC framing is mandatory in all outputs; the deflator can be inactive (§14).
 
 ---
 
@@ -522,6 +557,12 @@ The PSIS target is **conditional on `theta_w_hat`** (held fixed across draws) �
 | Online scorer + streaming ingestion | P14 | DONE — `adf_filter.py` / `online_scorer.py` / `stream_scoring.py`, RTDS + replay (§17) |
 | SBC / coverage harness | P15 | DONE (code) — **evidence runs open**, blocked on P8/P11; acceptance semantics in §12.1 |
 | Unvisited `V` regime online | P14 caveat | Open limitation — if a regime is never visited in the stream, its `sigma2` stays prior/seed-dominated; it is not a data-driven fit and must not be read as one |
+| Anonymous variant + Kalshi adapter + signal evaluation | P16/P17 | DONE as **code** (plan 5 U1–U6, 2026-08-03); the real-data evaluation leg is BLOCKED — see the rows below |
+| Real-data warm start unvalidated | P19 | **Blocker on the whole real-data leg.** Single un-jittered restart (seed 42, `restarts=1`), PSIS k̂ = 10.07, `sigma2` order constraint binding (P10, now confirmed on REAL data), betas not estimated. Every real-data score inherits it |
+| Van Dyke anchored wallet **UNTESTED**, not a negative result | P17 | The warm start has `estimate_betas: false` (β_S = β_Z = 0), `sigma2_0 == sigma2_1` to machine precision, and the anchored wallet is absent from the training wallet index (`theta_w` = Beta(1,19) prior mean) → `logit π^Z` constant; the 13 in-window trades all score 0.050000, spread 7.26e-11. **NO TEST / no evidence either way**; the "model does not detect the labeled insider" claim in commit 80678ee is RETRACTED (a105253). Detected in code: `WalletRow.min_p_z`/`is_flat`, `CaseStudySummary.anchor_is_untested`, report banner, CLI warning |
+| Real event study NOT RUN | P18 | Needs market close timestamps: only 2 of 5 cluster markets have a verified Gamma `closedTime` (placeholder `endDate`s + rate limiting). A broader real panel also needs a raw-capture entrypoint for arbitrary historical markets — `pull_data` writes the batch shape, which `score_stream` cannot replay, and the only capture path today is manifest-bound. U4's evidence is the committed **synthetic** calibration |
+| Event-study calibration limits | P17 caveat | 60 replicates/arm → SE ≈ 0.028, so the size rows are not separated; the W = 10 d size inflation is ~0.18 Bonferroni-adjusted across the six swept windows — suggestive, not established; W = 5 d is a judgement about plausible burst duration, not a calibrated optimum. Power is an **ORACLE-regime** number (β_S = 0.6, β_Z = 1.0, oracle warm start) — "detection 1.000" must never be quoted as real-data performance |
+| Deflated-Sharpe deflator inactive | P17 caveat | On the smoke run every trial selected the same trades → trial variance 0, `SR0 = 0`, `DSR == PSR` (effective trials = 1). Report as "deflator inactive", never as surviving multiplicity. Only the threshold is swept; cost model, hold rule, embargo and window were chosen outside the trial family |
 
 ---
 
@@ -545,6 +586,9 @@ The PSIS target is **conditional on `theta_w_hat`** (held fixed across draws) �
 | `test_online_scorer.py` | Cappé–Moulines online EM, `rho` schedules, sum-scale statistics |
 | `test_rtds.py` | RTDS websocket adapter, keepalives, reconnect |
 | `test_sbc.py` | SBC harness, JSONL resume, regime guard, rank/coverage analysis |
+| `test_kalshi_api.py` | Kalshi client: cursor pagination, live/legacy price parsing, `wallet = None` invariant, 429 backoff |
+| `test_event_study.py` | Primary statistic, permutation null, window-lock flag, replay-provenance refusal |
+| `test_backtest.py` | Cost model at cent granularity, purge/embargo splits, deflated Sharpe |
 
 `pytest.ini` registers the `slow` marker (2026-07-28).
 
@@ -586,6 +630,7 @@ Shipped shape:
 - `scripts/stream_trades.py` captures; `scripts/score_stream.py` scores (`--replay` / `--live`, §10).
 - Warm start from a batch VEM fit (`stream_scoring.warm_start_payload`); a wallet with no history cold-starts at the **Beta(a, b) prior mean**.
 - **Replay mode is plan 5's no-lookahead evaluation substrate.** Scores use a *causal expanding* $\bar S$, so replay scores **deliberately differ** from batch filtered marginals — this is not a regression.
+- **Scorer seam for the external trading system (2026-08-03):** `OnlineScorer.step_trade({ts, p, S, side})` takes a wallet-free trade dict and no Polymarket-specific types — this is the documented import point for the separate Kalshi trading system, used with anonymous mode (§5, §9.6). Wallet mode still requires a wallet and errors clearly without one. Execution/order logic stays in that repo.
 - **CAVEAT:** if a `V` regime is never visited in the stream, its `sigma2` remains prior/seed-dominated rather than a data-driven fit (§14).
 
 ---
