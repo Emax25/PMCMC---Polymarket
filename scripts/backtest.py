@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import sys
 from pathlib import Path
 
@@ -171,7 +172,7 @@ _DSR_READING = (
 
 def _fmt(value: float, width: int = 8, digits: int = 4) -> str:
     """Fixed-width float, printing NaN as ``n/a`` rather than as a number."""
-    if value != value:  # NaN
+    if math.isnan(value):
         return f"{'n/a':>{width}}"
     return f"{value:>{width}.{digits}f}"
 
@@ -186,10 +187,13 @@ def _format_report(summary: BacktestSummary) -> str:
     """
     deflated = summary.deflated
     returns = summary.returns
+    # `to_dict` serializes every fold and every position, so build it once and
+    # reuse the framing note for both the opening and closing block.
+    framing = summary.to_dict()["framing"]
     lines = [
         _HEADER,
         "",
-        summary.to_dict()["framing"],
+        framing,
         "",
         f"Markets: {summary.n_markets} scored, {summary.panels} tradeable, "
         f"{len(summary.excluded)} excluded",
@@ -262,7 +266,7 @@ def _format_report(summary: BacktestSummary) -> str:
             "",
             _DSR_READING,
             "",
-            summary.to_dict()["framing"],
+            framing,
         ],
     )
     return "\n".join(lines)

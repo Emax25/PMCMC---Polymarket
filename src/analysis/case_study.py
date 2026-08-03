@@ -405,11 +405,6 @@ class CaseManifest:
         """Cluster condition ids, in manifest order."""
         return tuple(m.condition_id for m in self.markets)
 
-    @property
-    def slugs(self) -> tuple[str, ...]:
-        """Cluster slugs, in manifest order."""
-        return tuple(m.slug for m in self.markets)
-
     def market_by_id(self, condition_id: str) -> CaseMarket | None:
         """Look a cluster market up by condition id, or None if absent."""
         for market in self.markets:
@@ -661,9 +656,10 @@ def load_scored_trades(
             market.append(condition_id)
             wallet.append(str(record.get("wallet", "")))
 
-    order = np.argsort(np.asarray(ts, dtype=float), kind="stable")
+    ts_arr = np.asarray(ts, dtype=float)
+    order = np.argsort(ts_arr, kind="stable")
     return ScoredTrades(
-        ts=np.asarray(ts, dtype=float)[order],
+        ts=ts_arr[order],
         p_z=np.asarray(p_z, dtype=float)[order],
         market=np.asarray(market, dtype=object)[order],
         wallet=np.asarray(wallet, dtype=object)[order],
@@ -764,19 +760,25 @@ def _wallet_rows(
     for address, score in zip(trades.wallet[in_window], trades.p_z[in_window]):
         grouped.setdefault(address, []).append(float(score))
 
-    rows = [
-        WalletRow(
-            wallet=address,
-            n_window=len(scores),
-            n_total=totals.get(address, len(scores)),
-            mean_p_z=float(np.mean(scores)),
-            max_p_z=float(np.max(scores)),
-            elevation=float(np.mean(scores)) - baseline_mean,
-            anchored=manifest.anchor.matches(address),
-            sufficiency=sufficiency_label(totals.get(address, len(scores))),
+    rows = []
+    for address, scores in grouped.items():
+        # `totals` is built over every trade, so the in-window `grouped` keys are
+        # a subset of it; the `len(scores)` default is only a floor for the
+        # impossible case, and it feeds both `n_total` and its sufficiency label.
+        n_total = totals.get(address, len(scores))
+        mean_p_z = float(np.mean(scores))
+        rows.append(
+            WalletRow(
+                wallet=address,
+                n_window=len(scores),
+                n_total=n_total,
+                mean_p_z=mean_p_z,
+                max_p_z=float(np.max(scores)),
+                elevation=mean_p_z - baseline_mean,
+                anchored=manifest.anchor.matches(address),
+                sufficiency=sufficiency_label(n_total),
+            )
         )
-        for address, scores in grouped.items()
-    ]
     return tuple(sorted(rows, key=lambda row: (-row.mean_p_z, row.wallet)))
 
 
@@ -1060,6 +1062,10 @@ def run_case_study(
     in_window = manifest.window.mask(trades.ts)
     n_window = int(in_window.sum())
     seen_markets = set(trades.market.tolist())
+    # Distinct wallets, materialized once: the anchor is a regex, so matching it
+    # per distinct address rather than per trade is the difference between one
+    # `re.fullmatch` per wallet and one per trade on a cluster-sized feed.
+    distinct_wallets = set(trades.wallet.tolist())
     wallets = _wallet_rows(trades, manifest, baseline_mean=baseline)
 
     missing = tuple(
@@ -1074,11 +1080,7 @@ def run_case_study(
 
     anchored = tuple(
         sorted(
-            {
-                address
-                for address in trades.wallet.tolist()
-                if manifest.anchor.matches(address)
-            },
+            address for address in distinct_wallets if manifest.anchor.matches(address)
         ),
     )
     if not anchored:
@@ -1098,7 +1100,7 @@ def run_case_study(
             float(trades.p_z[in_window].mean()) if n_window else math.nan
         ),
         n_trades_window=n_window,
-        n_wallets_total=len(set(trades.wallet.tolist())),
+        n_wallets_total=len(distinct_wallets),
         markets_without_trades=missing,
         markets_off_manifest=tuple(sorted(seen_markets - set(manifest.condition_ids))),
         anchored_wallets=anchored,

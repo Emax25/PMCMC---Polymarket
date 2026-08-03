@@ -79,8 +79,6 @@ _STREAM_PRIMARY = 0
 _STREAM_CROSS = 1
 _STREAM_SIMULATE = 2
 _STREAM_CALIBRATE = 3
-_ARM_PLANTED = 0
-_ARM_NULL = 1
 
 # `score_stream.py` writes `<output>.meta.json` with a "mode" field that is
 # either "replay" or "live". Both names are read verbatim from

@@ -67,11 +67,20 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 from scipy.stats import kurtosis, norm, skew
 
-# `_market_id_from_record` is reached for deliberately: it is the repo's one
-# rule for "which field names a market in a metadata record", and a second copy
-# here could disagree with the event study about a market's identity — the two
-# analyses would then silently be about different market sets.
-from src.analysis.event_study import DAY_SECONDS, _market_id_from_record
+# The event study owns the shared vocabulary the two analyses must not disagree
+# on: `_market_id_from_record` is the repo's one rule for "which field names a
+# market in a metadata record" (a second copy here could silently make the two
+# analyses be about different market sets), `PROVENANCE_SUFFIX` is the sidecar
+# name `scripts/score_stream.py` writes, and the exclusion vocabulary
+# (`ExcludedMarket` plus its reason strings) is what both reports print verbatim.
+from src.analysis.event_study import (
+    DAY_SECONDS,
+    PROVENANCE_SUFFIX,
+    REASON_NO_RESOLUTION,
+    REASON_NO_TRADES_BEFORE_CLOSE,
+    ExcludedMarket,
+    _market_id_from_record,
+)
 
 log = logging.getLogger(__name__)
 
@@ -138,10 +147,10 @@ _SPLIT_NOTE = (
     "it, is dropped. Thresholds are selected on training blocks only."
 )
 
-# Exclusion reasons, named so the module, the CLI and the tests agree.
-REASON_NO_RESOLUTION = "no resolution metadata"
+# Exclusion reasons, named so the module, the CLI and the tests agree. The two
+# reasons shared with the event study are imported above; only "resolved but with
+# no outcome to trade against" is specific to the backtest.
 REASON_NO_OUTCOME = "no resolved outcome"
-REASON_NO_TRADES_BEFORE_CLOSE = "no scored trades at or before t_close"
 
 
 # ---------------- Cost model ----------------
@@ -288,23 +297,6 @@ class MarketPanel:
         return float(self.ts[0])
 
 
-@dataclass(frozen=True)
-class ExcludedMarket:
-    """One market that carries scores but cannot be traded.
-
-    Attributes:
-        market: Market id.
-        reason: Why it was dropped, in words a report can print verbatim.
-    """
-
-    market: str
-    reason: str
-
-    def to_dict(self) -> dict[str, Any]:
-        """JSON-serializable view."""
-        return {"market": self.market, "reason": self.reason}
-
-
 def build_panels(
     scores_by_market: Mapping[str, Any],
     close_by_market: Mapping[str, float],
@@ -383,15 +375,14 @@ def _iter_metadata_records(path: Path) -> list[tuple[str, Any]]:
     """
     if not path.exists():
         raise FileNotFoundError(f"outcome metadata not found: {path}")
-    suffix = ".meta.json"
     records: list[tuple[str, Any]] = []
     if path.is_dir():
-        for sidecar in sorted(path.glob(f"*{suffix}")):
+        for sidecar in sorted(path.glob(f"*{PROVENANCE_SUFFIX}")):
             try:
                 payload = json.loads(sidecar.read_text(encoding="utf-8"))
             except json.JSONDecodeError as exc:
                 raise ValueError(f"{sidecar}: malformed JSON ({exc})") from exc
-            records.append((sidecar.name[: -len(suffix)], payload))
+            records.append((sidecar.name[: -len(PROVENANCE_SUFFIX)], payload))
         return records
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
